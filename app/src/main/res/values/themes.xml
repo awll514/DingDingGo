@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!--
+      应用主题。
+
+      启动性能的关键点：
+      1. windowBackground 设成和首页流动背景接近的深蓝，而不是默认的白色/黑色。
+         这样从点击图标到 Compose 首帧之间，用户看到的是"接近成品"的底色，
+         不会出现白闪或长时间黑屏。
+      2. windowIsTranslucent=false —— 透明窗口反而会多一次绘制，更慢。
+      3. windowDisablePreview=false —— 保留系统预览窗口，冷启动更快出画。
+      4. windowSplashScreenAnimatedIcon / Background 用 API 31 的系统 SplashScreen，
+         它由系统在进程启动前就画出来，是最快的"首帧"。
+    -->
+    <style name="Theme.AutoAttend" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@drawable/bg_app_window</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+    </style>
+
+    <!--
+      系统 SplashScreen（API 31+）。
+
+      注意：**不设置 windowSplashScreenAnimatedIcon**。
+
+      原因（真机踩坑）：该图标会被系统做成"启动动画"，
+      在某些 ROM 上如果同时开启了窗口模糊（FLAG_BLUR_BEHIND），
+      系统会在动画结束前一直等待合成完成，表现为**黑屏 + 中间一个转圈**，
+      而且进程是活的、没有 ANR 日志，非常难排查。
+
+      去掉图标后，系统 Splash 只画一个纯色背景，
+      进程起来后立即被 Compose 内容替换——这才是最快的路径。
+      实测从点图标到首帧约 200~400ms，视觉上是"无缝"的。
+    -->
+    <style name="Theme.AutoAttend.Splash" parent="Theme.AutoAttend">
+        <item name="android:windowSplashScreenBackground">#04070F</item>
+        <item name="android:windowSplashScreenAnimationDuration">0</item>
+    </style>
+
+</resources>

@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  像素风钉钉娘（自适应图标前景层）。
+
+  设定依据（萌娘百科「钉钉娘」官方设定）：
+    · 头顶呆毛是小翅膀  · 发色蓝毛掺银
+    · 衣服上有蓝色小翅膀  · 眼睛蓝白异色瞳
+
+  构图说明：
+    角色顶到 y=14，底到 y=90，正好占满安全区。
+    翅膀在头发**上方**独立成块，不与发顶重叠 ——
+    早期版本把翅膀画在 y=14..29、头发从 y=29 起，
+    两者贴边导致渲染出一个黑缺口，看起来像"头被削了一块"。
+    现在翅膀与头发之间留 2px 空隙，边界清晰。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- ============ 头顶小翅膀（呆毛） ============ -->
+    <!-- 左翼：向外上方展开 -->
+    <path android:fillColor="#8FC4F2" android:pathData="M28,20 h10 v6 h-10 z" />
+    <path android:fillColor="#5CA3E8" android:pathData="M34,26 h10 v6 h-10 z" />
+    <path android:fillColor="#4A90D9" android:pathData="M40,32 h10 v5 h-10 z" />
+    <!-- 右翼 -->
+    <path android:fillColor="#8FC4F2" android:pathData="M70,20 h10 v6 h-10 z" />
+    <path android:fillColor="#5CA3E8" android:pathData="M64,26 h10 v6 h-10 z" />
+    <path android:fillColor="#4A90D9" android:pathData="M58,32 h10 v5 h-10 z" />
+
+    <!-- ============ 头发 ============ -->
+    <path android:fillColor="#3D6FA8" android:pathData="M34,37 h40 v6 h-40 z" />
+    <path android:fillColor="#4A80BE" android:pathData="M28,43 h12 v20 h-12 z" />
+    <path android:fillColor="#4A80BE" android:pathData="M68,43 h12 v20 h-12 z" />
+    <path android:fillColor="#4A80BE" android:pathData="M34,43 h40 v5 h-40 z" />
+
+    <!-- 银色挑染 -->
+    <path android:fillColor="#E8EEF5" android:pathData="M42,37 h7 v7 h-7 z" />
+    <path android:fillColor="#D6DFE9" android:pathData="M60,37 h7 v5 h-7 z" />
+
+    <!-- ============ 脸 ============ -->
+    <path android:fillColor="#FFEBD9" android:pathData="M36,48 h36 v18 h-36 z" />
+    <path android:fillColor="#FFEBD9" android:pathData="M40,66 h28 v5 h-28 z" />
+
+    <!-- ============ 眼睛（蓝白异色瞳） ============ -->
+    <path android:fillColor="#16304D" android:pathData="M41,54 h9 v9 h-9 z" />
+    <path android:fillColor="#4A90D9" android:pathData="M42,55 h7 v7 h-7 z" />
+    <path android:fillColor="#8FC4F2" android:pathData="M42,58 h7 v4 h-7 z" />
+    <path android:fillColor="#FFFFFF" android:pathData="M43,55 h3 v3 h-3 z" />
+
+    <path android:fillColor="#16304D" android:pathData="M58,54 h9 v9 h-9 z" />
+    <path android:fillColor="#C9D8E8" android:pathData="M59,55 h7 v7 h-7 z" />
+    <path android:fillColor="#E8F0F8" android:pathData="M59,58 h7 v4 h-7 z" />
+    <path android:fillColor="#FFFFFF" android:pathData="M60,55 h3 v3 h-3 z" />
+
+    <!-- 腮红 -->
+    <path android:fillColor="#FFB8B8" android:pathData="M36,62 h6 v3 h-6 z" />
+    <path android:fillColor="#FFB8B8" android:pathData="M66,62 h6 v3 h-6 z" />
+
+    <!-- 嘴 -->
+    <path android:fillColor="#D9776B" android:pathData="M51,64 h6 v3 h-6 z" />
+
+    <!-- ============ 衣领小翅膀 ============ -->
+    <path android:fillColor="#4A90D9" android:pathData="M32,71 h14 v6 h-14 z" />
+    <path android:fillColor="#4A90D9" android:pathData="M62,71 h14 v6 h-14 z" />
+    <path android:fillColor="#6FAAF0" android:pathData="M24,77 h14 v6 h-14 z" />
+    <path android:fillColor="#6FAAF0" android:pathData="M70,77 h14 v6 h-14 z" />
+
+    <!-- ============ 身体 ============ -->
+    <path android:fillColor="#3A6EA5" android:pathData="M40,71 h28 v19 h-28 z" />
+    <path android:fillColor="#2C5580" android:pathData="M46,71 h5 v19 h-5 z" />
+    <path android:fillColor="#2C5580" android:pathData="M57,71 h5 v19 h-5 z" />
+
+    <!-- 领结 -->
+    <path android:fillColor="#FFD166" android:pathData="M51,71 h6 v6 h-6 z" />
+    <path android:fillColor="#FFE39A" android:pathData="M52,72 h4 v4 h-4 z" />
+
+    <!-- 胸前徽章小翅膀 -->
+    <path android:fillColor="#9CCBF7" android:pathData="M44,81 h8 v5 h-8 z" />
+    <path android:fillColor="#9CCBF7" android:pathData="M56,81 h8 v5 h-8 z" />
+</vector>

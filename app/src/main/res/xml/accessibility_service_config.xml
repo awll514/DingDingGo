@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  只监听钉钉包名，不监听其它应用：
+  1. 降低隐私争议——本服务不读取任何其它 App 的界面内容；
+  2. 降低功耗——不需要为每一个界面刷新都回调。
+
+  canRetrieveWindowContent 必须为 true，否则读不到界面文本，
+  也就无法做"以界面真实反馈判定成功"（验收标准 3）。
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewClicked|typeViewTextChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews"
+    android:canPerformGestures="true"
+    android:canRetrieveWindowContent="true"
+    android:description="@string/accessibility_description"
+    android:notificationTimeout="150"
+    android:packageNames="com.alibaba.android.rimet" />

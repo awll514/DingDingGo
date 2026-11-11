@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  打卡结果通知的自定义布局。
+
+  设计原则（这是用户抱怨"太丑"直接针对的东西）：
+  1. **信息分层**：标题大而清晰，时间用等宽字体突出，技术细节降到最小字号；
+  2. **留白**：四周 16dp 内边距，行间距 4~6dp，不要挤成一块；
+  3. **圆角深色底**：和 App 的液态玻璃呼应，但用不透明度更高的底保证可读；
+  4. **左侧状态条**：一条 3dp 的竖线，颜色表达成功/失败，比图标更克制；
+  5. **不用 emoji 做主要视觉**（emoji 在不同 ROM 上渲染差异大，且显廉价）。
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="horizontal"
+    android:paddingStart="14dp"
+    android:paddingEnd="14dp"
+    android:paddingTop="13dp"
+    android:paddingBottom="13dp"
+    android:background="@drawable/bg_notification_glass">
+
+    <!-- 左侧状态条 -->
+    <View
+        android:id="@+id/status_bar"
+        android:layout_width="3dp"
+        android:layout_height="match_parent"
+        android:background="#4ADE80" />
+
+    <LinearLayout
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:layout_marginStart="12dp"
+        android:orientation="vertical">
+
+        <!-- 标题：什么事 -->
+        <TextView
+            android:id="@+id/title"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textColor="#F4F7FC"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:maxLines="1"
+            android:ellipsize="end"
+            android:text="上班打卡成功" />
+
+        <!-- 时间：最重要的信息，用等宽字体 -->
+        <TextView
+            android:id="@+id/time"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="5dp"
+            android:textColor="#7CC4FF"
+            android:textSize="20sp"
+            android:fontFamily="monospace"
+            android:letterSpacing="0.02"
+            android:text="09:30:12" />
+
+        <!-- 副标题：失败原因 / 补充说明 -->
+        <TextView
+            android:id="@+id/subtitle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:textColor="#B8F4F7FC"
+            android:textSize="12sp"
+            android:lineSpacingExtra="2dp"
+            android:maxLines="2"
+            android:ellipsize="end"
+            android:visibility="gone" />
+
+    </LinearLayout>
+
+</LinearLayout>

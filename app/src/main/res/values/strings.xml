@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 应用名：钉钉GO -->
+    <string name="app_name">钉钉GO</string>
+    <string name="accessibility_label">钉钉GO · 界面操作</string>
+    <string name="accessibility_description">用于在设定时间自动完成钉钉考勤打卡。本服务仅监听钉钉（com.alibaba.android.rimet）的界面，不读取其它应用内容。</string>
+</resources>

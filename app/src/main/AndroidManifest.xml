@@ -1,0 +1,163 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- 唤醒锁：执行打卡时保持 CPU 运行 -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- 精确闹钟 -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+    <!-- 开机自启 -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- 前台服务 -->
+    <!--
+      系统悬浮窗权限。
+
+      打卡提示必须能在**钉钉界面之上**显示 —— 那时我们的 Activity
+      在后台，应用内的 Composable 是看不见的。
+      只有 TYPE_APPLICATION_OVERLAY 才能盖在别的应用上层。
+    -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- 通知 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 忽略电池优化 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- 查询包是否安装（钉钉检测） -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
+
+    <!-- 需要看到钉钉的包，才能拉起它 -->
+    <queries>
+        <package android:name="com.alibaba.android.rimet" />
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.AutoAttend"
+        tools:targetApi="36">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:configChanges="orientation|screenSize|uiMode"
+            android:theme="@style/Theme.AutoAttend.Splash">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 闹钟触发的接收器：静态注册，进程被杀也能唤起 -->
+        <receiver
+            android:name=".exec.PunchAlarmReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.redmi.autoattend.action.PREWARM" />
+                <action android:name="com.redmi.autoattend.action.FIRE" />
+                <action android:name="com.redmi.autoattend.action.RETRY" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 开机等系统事件 -->
+        <receiver
+            android:name=".exec.BootReceiver"
+            android:exported="true"
+            android:directBootAware="false">
+            <intent-filter android:priority="1000">
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <action android:name="android.intent.action.TIME_SET" />
+                <action android:name="android.intent.action.TIMEZONE_CHANGED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 打卡执行前台服务 -->
+        <!--
+          后台自拉起：JobScheduler 周期任务。
+
+          jobScheduler 的 setPersisted(true) 需要 RECEIVE_BOOT_COMPLETED 权限，
+          已在上方声明。
+        -->
+        <service
+            android:name=".exec.ResurrectionService"
+            android:exported="false"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
+
+        <!--
+          心跳接收器。
+
+          exported=true 是为了让 adb 能发 TEST_ISLAND 做真机验证；
+          同时它只响应两个自定义 action，没有数据泄露风险
+          （不接收系统敏感广播，也不导出任何数据）。
+
+          心跳闹钟由 AlarmManager 直接投递 PendingIntent，
+          即使 exported=false 也能收到 —— 这里是纯粹的测试便利。
+        -->
+        <receiver
+            android:name=".exec.HeartbeatReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.redmi.autoattend.action.HEARTBEAT" />
+            </intent-filter>
+        </receiver>
+
+        <!--
+          常驻保活服务。
+
+          foregroundServiceType 继续用 specialUse（唯一零前置条件 + 无时长上限
+          + 无 BOOT 限制的类型），和打卡服务保持一致。
+
+          startForeground 在 onStartCommand 里立即调用，满足系统 5 秒要求。
+        -->
+        <service
+            android:name=".exec.KeepAliveService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="自动打卡后台保活：维持闹钟有效性与常驻状态显示" />
+        </service>
+
+        <service
+            android:name=".exec.PunchForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse"
+            android:stopWithTask="false">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="在用户预设的通勤时间点执行一次钉钉打卡自动化，属于用户显式授权的定时任务" />
+        </service>
+
+        <!-- 无障碍执行通道 -->
+        <service
+            android:name=".exec.PunchAccessibilityService"
+            android:exported="true"
+            android:label="@string/accessibility_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
+    </application>
+</manifest>
