@@ -46,6 +46,21 @@ android {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
     }
+
+    /**
+     * 单元测试配置。
+     *
+     * AGP 9.x 默认把单元测试跑在精简的运行时里，
+     * 测试类不在默认 classpath 上（表现为 ClassNotFoundException）。
+     * 显式打开 isIncludeAndroidResources 并允许返回默认值，
+     * 让测试能正常加载编译产物。
+     */
+    testOptions {
+        unitTests {
+            isIncludeAndroidResources = true
+            isReturnDefaultValues = true
+        }
+    }
 }
 
 kotlin {
