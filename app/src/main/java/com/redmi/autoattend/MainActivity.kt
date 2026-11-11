@@ -872,6 +872,29 @@ private fun AppRoot() {
                         //
                         // 指示器跟手由 GlassTabBar 内部的同步 state 完成（dragFrac），
                         // 这里不再需要任何拖拽回调 —— 那样只会引入协程调度丢帧。
+                        // 按下：让 pager 平滑滑到手指所在 tab。
+                        // 指示器跟随 liveOffset，因此会连着一起滑过去 ——
+                        // 这就是「长按时指示器滑过来」的实现。
+                        onPressTab = { idx ->
+                            pagerScope.launch {
+                                runCatching {
+                                    pagerState.animateScrollToPage(
+                                        page = idx,
+                                        animationSpec = androidx.compose.animation.core.tween(
+                                            durationMillis = 520,
+                                            easing = androidx.compose.animation.core
+                                                .CubicBezierEasing(0.32f, 0.72f, 0f, 1f),
+                                        ),
+                                    )
+                                }
+                            }
+                        },
+                        // 拖拽：同步把位移喂给 pager。
+                        // dispatchRawDelta 是非挂起函数，逐帧调用不会排队、不丢帧，
+                        // pager 因此真正跟手 → liveOffset 连续 → 指示器跟手。
+                        onRawDelta = { dx ->
+                            runCatching { pagerState.dispatchRawDelta(dx) }
+                        },
                         onBarWidth = { barWidthPxForDrag = it },
                         modifier = Modifier.fillMaxWidth(),
                     )
