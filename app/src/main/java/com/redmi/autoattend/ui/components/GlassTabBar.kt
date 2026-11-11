@@ -250,7 +250,17 @@ fun GlassTabBar(
     val scaleAnim = remember { Animatable(1f) }
     val glowAnim = remember { Animatable(0f) }
 
-    // 拖拽位置完全由 pager 驱动（dispatchRawDelta 同步更新），无需本地状态。
+    // ==================== 拖拽跟手位置（同步 state）====================
+    //
+    // NaN 表示「没在拖拽」，此时位置回落到 liveOffset / xAnim。
+    //
+    // 用普通 mutableFloatStateOf 而不是 Animatable：
+    // Animatable 的所有写入都是挂起函数，在手势的受限协程作用域里必须
+    // 通过 scope.launch 逃逸，而 launch 是异步的 —— 逐帧驱动必然掉帧，
+    // 表现就是「拖拽卡顿一下然后瞬移」。
+    //
+    // 普通 state 的写入是同步的，本帧写完下一帧就用它渲染，绝不丢帧。
+    var pressX by remember { mutableFloatStateOf(Float.NaN) }
     // ==================== 位置只有 liveOffset 一个来源 ====================
     //
     // 曾经引入过 pressX / isPressed / posJob，用于在按住期间独立驱动指示器。
@@ -631,6 +641,14 @@ fun GlassTabBar(
                         awaitEachGesture {
                             val down = awaitFirstDown(requireUnconsumed = false)
 
+                            /** 手指 x → 指示器左上角 x（中心对齐手指） */
+                            fun xFor(fingerX: Float): Float {
+                                val tw = tabWidthPx()
+                                if (tw <= 0f) return centerXFor(currentSelected)
+                                return (fingerX - indicatorWidthPx / 2f)
+                                    .coerceIn(0f, (barWidthPx - indicatorWidthPx).coerceAtLeast(0f))
+                            }
+
                             /** 手指 x → 最近的 tab 索引 */
                             fun tabFor(fingerX: Float): Int {
                                 val tw = tabWidthPx()
@@ -638,18 +656,33 @@ fun GlassTabBar(
                                 return (fingerX / tw).toInt().coerceIn(0, tabs.lastIndex)
                             }
 
-                            // ===== 按下 ===== 
+                            // ============================================================
+                            // 模型：拖拽期间**页面完全不动**，只有指示器跟手。
+                            //        松手才切页。
+                            // ============================================================
                             //
-                            // 只放大，**不碰 pager**。
+                            // ## 为什么不用「拖拽同时驱动 pager」
                             //
-                            // 之前这里调 onPressTab 让 pager 在按下瞬间就开始
-                            // animateScrollToPage。结果：
-                            //   · 那个动画会和随后的 dispatchRawDelta 抢滚动状态 →
-                            //     快速拖拽时页面对抗、停在原地（用户实测拖不过去）；
-                            //   · 纯点按时它会先切一次，松手再判定一次 → 重复。
+                            // 试过三种驱动 pager 的方式，全部失败：
+                            //   · scope.launch { scrollToPage() } —— 异步，帧间被合并，
+                            //     丢失中间动画、卡顿后瞬移；
+                            //   · dispatchRawDelta —— 增量会被 pager 的 snap 吸回最近的页；
+                            //   · 绝对位置 scrollToPage —— 仍是 launch 异步，同样卡顿。
                             //
-                            // 现在按下只做视觉反馈：放大。是否切换、切到哪，
-                            // 全部在松手时用**手指位置**一次性决定。
+                            // 根因：手势循环跑在**受限协程作用域**里，任何挂起调用都必须
+                            // 通过 scope.launch 逃逸，而 launch 是异步调度 —— 逐帧驱动必然
+                            // 掉帧。这不是参数问题，是结构问题。
+                            //
+                            // ## 正确模型（也是用户最初描述的交互）
+                            //
+                            //   按下 → 放大；
+                            //   拖拽 → 指示器同步跟手（写 float state，无协程，永不掉帧）；
+                            //   松手 → 指示器落位 + 页面切过去（两条动画同时开始、同时结束）。
+                            //
+                            // 指示器跟手用普通 state：写入是同步的，下一帧必定用新值，
+                            // 不存在调度延迟，因此丝滑无卡顿。
+
+                            // ---------- 按下：放大 ----------
                             scope.launch {
                                 scaleAnim.animateTo(
                                     dragScale,
@@ -657,13 +690,7 @@ fun GlassTabBar(
                                 )
                             }
 
-                            // ===== 移动 ===== 
-                            //
-                            // 每帧把**手指绝对位置**同步告诉上游，由它 scrollToPage 定位。
-                            //
-                            // 为什么不用增量（dispatchRawDelta）：pager 的 snap 机制会在
-                            // 事件间隙把位置吸回最近的页，快速拖拽时累计位移被吃掉 →
-                            // 「拖不过去、回原页」。绝对位置每帧重新指定目标，不受影响。
+                            // ---------- 移动：同步跟手 ----------
                             var dragged = false
                             var lastX = down.position.x
                             val slop = viewConfiguration.touchSlop
@@ -677,11 +704,12 @@ fun GlassTabBar(
                                 }
                                 if (dragged) {
                                     ch.consume()
-                                    onDragTo(lastX)
+                                    // 同步写入普通 state：本帧立即生效，绝不掉帧
+                                    pressX = xFor(lastX)
                                 }
                             }
 
-                            // ===== 松手 ===== 
+                            // ---------- 松手 ----------
                             scope.launch {
                                 scaleAnim.animateTo(
                                     1f,
@@ -689,27 +717,21 @@ fun GlassTabBar(
                                 )
                             }
 
-                            // 目标 tab **只由手指落点决定**，与 pager 当前状态无关。
-                            //
-                            // 这样：
-                            //   · 点按 → 手指在哪就切到哪，一次到位；
-                            //   · 拖拽 → 落到松手时最近的那一侧；
-                            //   · 点当前页 → target == currentSelected，什么都不做。
-                            val target = if (dragged) {
-                                // 拖拽：按松手时手指所在的一侧决定
-                                tabFor(lastX)
-                            } else {
-                                // 点按：按按下位置决定
-                                tabFor(down.position.x)
-                            }
+                            // 目标：拖拽看松手位置，点按看按下位置。
+                            // 只由手指决定，与 pager 当前状态无关 —— 这样不会误切页。
+                            val target = if (dragged) tabFor(lastX) else tabFor(down.position.x)
 
+                            // 指示器落位动画由上层 state 驱动；这里只负责把
+                            // 「目标位置」和「切页请求」一起发出去，两者时长一致。
                             if (target != currentSelected) {
                                 pendingSwipeSettle = true
                                 currentOnSelect(target, dragged)
-                            } else if (dragged) {
-                                // 拖回原位：吸回当前页，不切页
-                                currentOnSelect(currentSelected, true)
                             }
+
+                            // 结束时把跟手位置交还给 liveOffset/xAnim。
+                            // 落位动画由 settleTo（selectedIndex 变化时触发）负责，
+                            // 因此这里只需清掉临时跟手值。
+                            pressX = Float.NaN
                         }
                     },
                 verticalAlignment = Alignment.CenterVertically,
@@ -738,7 +760,17 @@ fun GlassTabBar(
                     // 与指示器**同一个来源**：liveOffset。
                     // 拖拽时 pager 跟着手指走，liveOffset 连续变化，
                     // 颜色因此连续渐变，和指示器永远同相。
-                    val livePos = liveOffset ?: selectedIndex.toFloat()
+                    val livePos = when {
+                        !pressX.isNaN() -> {
+                            val tw = tabWidthPx()
+                            if (tw > 0f) {
+                                val center = pressX + indicatorWidthPx / 2f
+                                ((center - tw / 2f) / tw).coerceIn(0f, tabs.lastIndex.toFloat())
+                            } else selectedIndex.toFloat()
+                        }
+                        liveOffset != null -> liveOffset
+                        else -> selectedIndex.toFloat()
+                    }
                     val colorWeight = (1f - kotlin.math.abs(livePos - index)).coerceIn(0f, 1f)
 
                     // 未选中项的颜色要**自己定**，不能直接用 textTertiary：
@@ -813,12 +845,14 @@ fun GlassTabBar(
                     // 只有 liveOffset（pager 连续进度）。
                     // 按住、拖拽、松手落位全部通过驱动 pager 产生位移，
                     // 因此这里不需要任何「拿起态」分支 —— 也就没有了交接竞态。
-                    // 位置只有一个来源：liveOffset（pager 连续进度）。
-                    // pager 由 dispatchRawDelta 同步驱动，所以它天然跟手。
-                    val cx = if (liveOffset != null) {
-                        offsetToX(liveOffset)
-                    } else {
-                        xAnim.value
+                    // 优先级：
+                    //   1. 拖拽中（pressX 非 NaN）→ 直接用同步值，逐帧跟手；
+                    //   2. pager 有进度 → liveOffset；
+                    //   3. 首帧 → xAnim。
+                    val cx = when {
+                        !pressX.isNaN() -> pressX
+                        liveOffset != null -> offsetToX(liveOffset)
+                        else -> xAnim.value
                     }
                     IntOffset(cx.roundToInt(), 0)
                 }
