@@ -1,6 +1,94 @@
 # 钉钉GO · 交接文档
 
 > 生成时间：2026-11-11 · 设备：Redmi K90 至尊版（M332BF / warsaw / HyperOS V816 / Android 16 / API 36）
+>
+> **最后更新：2026-11-11 14:05（第二轮真机迭代，详见 §0）**
+
+---
+
+## 0. 第二轮真机迭代的成果（本机实测）
+
+### 0.1 修复的 6 个用户反馈问题
+
+| # | 问题 | 修复方式 | 验证 |
+|---|------|---------|------|
+| 1 | 底栏指示器停住后又拉伸一下 | `settleTo` 加 `stretch` 分流 + `xAnim` 跟踪 pager 位置 | 录屏逐帧：动画后完全静止 ✅ |
+| 2 | 手动打卡后没替换自动节点 | 新增 `CompletedSlot`，`nextSlot` 跳过已完成班次 | 11 个单元测试 ✅ |
+| 3 | 极速打卡识别不出成功 | 抽出 `judgeResult()` 纯函数，加「状态翻转」判定 | 13 个单元测试 ✅ |
+| 4 | 操控屏幕时悬浮窗不出现 | 线程修正 + 不再静默失败 + 加「测试悬浮窗」入口 | **真机截图确认 ✅** |
+| 5 | 锁屏密码无法配置 | `securePrefs()` 自愈（清损坏 key 重建）+ `commit` 回读校验 | **真机配置成功 ✅** |
+| 6 | 幽灵触控点到「跳过今天」 | **查明是 GKD 第三方工具误触**，非代码 bug | 用户已加排除规则 ✅ |
+
+### 0.2 幽灵触控的真相（重要）
+
+排查过程发现，用户设备上装了 **GKD**（一个自动点击工具），
+它的无障碍服务在运行，规则匹配到了「跳过今天的自动打卡」这行文字，
+用无障碍接口点击了它 —— **完全是外部工具行为，不是本 App 的 bug**。
+
+证据链：
+- 事件坐标恒为控件中心（`x=640`），非手指位置
+- 「藏在底栏下面也能点中」→ 无障碍不看视觉遮挡
+- 「切到设置页就不触发」→ 那页没有匹配文字
+- `enabled_accessibility_services` 里有 `li.songe.gkd`
+
+**保留的防护**：`MainActivity.dispatchTouchEvent` 的孤立 UP 拦截
+（处理「按着屏幕切后台，UP 永远不来导致状态卡死」的边界场景）。
+
+### 0.3 玻璃渲染的 10 轮排查（最重要的技术债已清）
+
+**问题现象**：无论怎么调 `blurRadius`（16→32→52dp），画面毫无变化。
+
+**根因**：`LiquidGlassPanel` 里有一段「冷启动首帧降级」逻辑：
+
+```kotlin
+var agslReady by remember { mutableStateOf(false) }
+LaunchedEffect(Unit) { withFrameNanos {}; withFrameNanos {}; agslReady = true }
+val agsl = ... && agslReady      // ← 永远 false
+```
+
+`withFrameNanos` 在面板频繁重组时被反复取消，`agslReady` 永远来不及置 true。
+**所有面板（卡片、底栏）永久停在 `FrostedPanel` 降级路径** ——
+而那条路只有半透明填充，**没有模糊、没有折射**。
+
+诊断日志（`GlassDiag`）证实：
+```
+path=FROSTED降级 | agslSupport=true degrade=false ready=false
+```
+
+**修复**：移除首帧降级，直接 `val agsl = isAGSLShaderSupported() && !shouldDegrade`。
+代价是冷启动多 30~50ms，换取正确的玻璃质感。
+
+### 0.4 弹窗背景真模糊（8 次尝试后成功）
+
+AGSL 的 `blurRadius` 只能模糊**它采集的 GraphicsLayer**。
+弹窗打开后主界面被遮挡、录制层冻结 → 参数完全无效。
+
+**正解**：`Window.setBackgroundBlurRadius()`（系统合成器真模糊）。
+
+**卡了 8 次的地方**：取 Window 的方式。
+
+```kotlin
+// ✗ view.parent / view.rootView.mAttachInfo → 永远是 Activity 窗口
+// ✓ 枚举 WindowManagerGlobal.mViews，按 type == TYPE_APPLICATION 筛选
+```
+
+`dumpsys window windows` 证实：弹窗是 `type=2` 的独立窗口，
+而主窗口是 `type=1` —— 前 8 次都在改主窗口，所以毫无效果。
+
+另外 `dimAmount` 默认 ~0.6 会把模糊结果压暗，需要降到 0.06。
+
+### 0.5 配色的最终方案
+
+**核心规律：`tint` 必须是彩色的，白色 tint 无论 alpha 多少都会推向灰色。**
+
+| tint | alpha | 实测结果 | 判定 |
+|------|-------|---------|------|
+| `0xFFF0FAFF`（G高） | 0.036 | RGB(136,202,244) 203° | 青绿 ✗ |
+| `0xFFFFFFFF`（白） | 0.036 | 灰 | ✗ |
+| 白 | 0.20/0.23/0.42 | RGB(197~211, 恒等, 恒等) | 全灰 ✗ |
+| **`0xFFA0CFFF`（蓝）** | **0.09** | **RGB(145,191,250)** | **✓** |
+
+参考目标是设置页卡片 `RGB(160,198,247)`，最终差值 R=15 / G=7 / B=3。
 
 ---
 
@@ -9,9 +97,10 @@
 | 项目 | 状态 |
 |------|------|
 | 编译 | ✅ `BUILD SUCCESSFUL` |
-| 单元测试 | ✅ **60 / 60 全绿** |
+| 单元测试 | ✅ **84 / 84 全绿**（新增 24 个） |
 | 真机运行 | ✅ 无崩溃（`logcat AndroidRuntime:E` 空） |
-| 冷启动 | ⚠️ 2125ms（见 §6 待优化） |
+| 冷启动 | ⚠️ ~1966ms（首帧降级已移除，见 §0.3） |
+| 玻璃渲染 | ✅ AGSL 全管线正常运行 |
 | 包名 | `com.redmi.autoattend`（debug 后缀 `.debug`） |
 
 ---
@@ -329,9 +418,22 @@ app/src/main/java/com/redmi/autoattend/
 | `SafetyGateTest` | 21 | 迟到/下班安全闸门（红线） |
 | `UiHierarchyTest` | 14 | 界面节点定位 |
 | `PunchScheduleTest` | 12 | 下一次打卡计算 |
+| **`PunchResultJudgeTest`** | **13** | **打卡结果判定（含极速打卡、失败优先、最坏情况防护）** |
+| **`CompletedSlotTest`** | **11** | **已完成班次跳过（手动打卡后不重复触发）** |
 | `DayLabelTest` | 8 | 今天/明天/周几/日期文案 |
 | `SkipDateTest` | 5 | 跳过某天后下次打卡顺延 |
-| **合计** | **60** | |
+| **合计** | **84** | |
+
+> ⚠️ **AGP 9.3.1 在 Windows 下 `testDebugUnitTest` 会报 ClassNotFoundException**，
+> 但测试类其实编译成功了（在 `intermediates/built_in_kotlinc/` 下）。
+> 绕过方式：直接用 JUnitCore 跑，classpath 需要包含 kotlin-stdlib：
+>
+> ```powershell
+> $cp = "...\built_in_kotlinc\debugUnitTest\compileDebugUnitTestKotlin\classes;" +
+>       "...\built_in_kotlinc\debug\compileDebugKotlin\classes;" +
+>       "junit-4.13.2.jar;hamcrest-core-1.3.jar;kotlin-stdlib-2.4.0.jar"
+> & "$jdk\bin\java.exe" -cp $cp org.junit.runner.JUnitCore com.redmi.autoattend.SafetyGateTest
+> ```
 
 ---
 
@@ -377,16 +479,52 @@ app/src/main/java/com/redmi/autoattend/
 | 项 | 值 |
 |----|-----|
 | 设备序列号 | `d65730c5` |
-| adb | `E:\dev\android-sdk\platform-tools\adb.exe` |
-| JDK | `E:\dev\jdk21\jdk-21.0.2` |
-| SDK | `E:\dev\android-sdk` |
+| **adb（当前机器）** | `C:\AndroidTools\platform-tools\adb.exe` |
+| **JDK（当前机器）** | `C:\Program Files\Microsoft\jdk-17.0.21.21-hotspot` |
+| **SDK（当前机器）** | `C:\AndroidTools\sdk` |
 | 屏幕 | 1280×2772 @ density 520（≈3.25x） |
 | 截图缩放 | 预览 860×1860，换算系数 1.4884 |
 | 锁屏密码 | 已存于 EncryptedSharedPreferences，**源码中不得硬编码** |
 
+### 当前机器的构建命令
+
+```powershell
+$env:JAVA_HOME = 'C:\Program Files\Microsoft\jdk-17.0.21.21-hotspot'
+$env:ANDROID_HOME = 'C:\AndroidTools\sdk'
+$env:ANDROID_SDK_ROOT = 'C:\AndroidTools\sdk'
+$env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
+Set-Location 'F:\徐事\dsh\dingding-go'
+.\gradlew.bat assembleDebug --console=plain
+```
+
+**注意**：项目路径含中文（`F:\徐事\dsh\dingding-go`），
+`gradle.properties` 里已加 `android.overridePathCheck=true` 才能构建。
+
+### 装机后的固定流程（每次 install -r 之后必须做）
+
+```powershell
+$adb = 'C:\AndroidTools\platform-tools\adb.exe'
+$pkg = 'com.redmi.autoattend.debug'
+
+# 1. 重绑无障碍（install -r 会解绑）
+$svc = "$pkg/com.redmi.autoattend.exec.PunchAccessibilityService"
+$base = "li.songe.gkd/com.google.android.accessibility.selecttospeak.SelectToSpeakService:io.github.ccch1mneyyy.dsh_app/.phone.a11y.PhoneA11yService"
+& $adb -s d65730c5 shell ("settings put secure enabled_accessibility_services " + [char]39 + $base + [char]58 + $svc + [char]39)
+& $adb -s d65730c5 shell "settings put secure accessibility_enabled 1"
+
+# 2. 悬浮窗权限（appops 设置不持久，重装会重置）
+& $adb -s d65730c5 shell "appops set $pkg SYSTEM_ALERT_WINDOW allow"
+```
+
+> ⚠️ **MIUI/HyperOS 的坑**：系统权限页会显示「已开启」，
+> 但 `appops get` 可能是 `ignore`，此时 `canDrawOverlays()` 返回 false，
+> 悬浮窗永远不显示。**必须用系统界面把开关关一次再打开**才真正生效。
+
 ---
 
-## 11. 本轮踩过的坑（给后来者）
+## 11. 踩过的坑（给后来者）
+
+### 第一轮
 
 1. **Kotlin 闭包捕获旧值** —— `pointerInput` 里读 `selectedIndex` 必须用 `rememberUpdatedState`
 2. **多个 Animatable 写入源** —— 同一个动画量只能有一个驱动者
@@ -396,3 +534,32 @@ app/src/main/java/com/redmi/autoattend/
 6. **纯色背景上的玻璃是假的** —— 必须采样真实内容
 7. **`install -r` 会解绑无障碍** —— 每次安装后必须重新写入
 8. **截图预览是缩放过的** —— 物理坐标要乘 1.4884
+
+### 第二轮（本次）
+
+9. **`withFrameNanos` 做首帧降级会让 AGSL 永久失效** ——
+   面板重组时协程被反复取消，`agslReady` 永远是 false。**不要用这种方式优化冷启动。**
+
+10. **调 UI 参数前先确认渲染路径** —— 我在错误的 `FrostedPanel` 路径上
+    调了 6 轮 `blurRadius`/`tint`/`折射`，全都没生效。加一行 `Log.i` 就能省下这些。
+
+11. **Compose Dialog 是 subcomposition** —— 它会继承父级 `CompositionLocal`。
+    想给它不同的采样源必须用**新的 CompositionLocal**（`LocalDialogBackdrop`）显式覆盖。
+
+12. **主界面卡片不能采样内容层** —— 那是正在录制的内容本身，会无限递归崩溃。
+
+13. **`view.parent` / `rootView.mAttachInfo` 拿不到 Dialog 的 Window** ——
+    它们永远返回 Activity 窗口。必须枚举 `WindowManagerGlobal.mViews` 按 `lp.type` 筛选。
+
+14. **白色 tint 会把玻璃推向灰色** —— 无论 alpha 多少。
+    因为 `PrismalGlassSurface` 是采样后合成，白色相当于对采样值做平均。
+    要彩色就必须给彩色 tint。
+
+15. **测颜色必须确认取样点在元素内** —— 我用 `y=1600` 采样健康度卡片
+    （实际范围 900~1250），连续 3 次测到背景色，还误判成"tint 没生效"。
+
+16. **`dimAmount` 默认值会把系统模糊压暗** —— Dialog 默认 ~0.6，
+    叠在模糊结果上整片发黑，看起来像"模糊没生效"。降到 0.06。
+
+17. **第三方无障碍工具会干扰 UI 测试** —— 用户设备上的 GKD 会自动点击
+    匹配到的文字（如「跳过今天」），排查时先确认有没有这类工具在跑。

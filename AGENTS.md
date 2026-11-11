@@ -126,19 +126,74 @@
 - 切换 tab 时指示器做**液滴拉伸**：宽 ↑ 高 ↓（面积近似守恒），两端保持半圆
 - 松手吸附用 `spring(dampingRatio = 0.70, stiffness = 420)`
 
-### 动效规格
+### 动效规格（iOS 18 标准 · 强制）
 
-| 场景 | 时长 | 曲线 |
-|------|------|------|
-| 页面切换 | 340ms | `slideInHorizontally(tween(340)) { it / 7 }` + fade |
-| 底栏指示器位移 | spring | dampingRatio 0.70 / stiffness 420 |
-| 液滴拉伸 | 130ms 拉伸 → spring 收回 | `FastOutSlowInEasing` |
-| 按钮按压 | 90ms 按下 / spring 弹起 | 缩放 0.97 |
-| 弹层入场 | 280ms | 缩放 0.90→1.0 + 淡入 |
-| 悬浮提示展开 | 520ms（**不要更快**） | `FastOutSlowInEasing` |
-| 悬浮提示收回 | 420ms | — |
+> **总原则：全应用禁用 `spring()`，一律使用「非线性慢速」动画。**
+> 用户原话：「把整个动画速率放慢，现在太快了，并不优雅，
+> 界面所有的动画都保持非线性慢速动画（iOS18 标准）」。
 
-**用户明确要求**：展开/收回"动画速率不要太快"，520ms 是刻意放慢的。
+#### 为什么禁用 spring
+
+Spring 的物理回弹适合「拖拽跟手」这类**无明确终点**的交互，
+但在**明确的目标切换**（点 tab、开弹层）里会显得毛躁、廉价。
+iOS 18 在这些场景用的是一条**快速起步、极缓收尾**的减速曲线，
+落点稳、无多余弹跳。
+
+#### 标准缓动曲线
+
+```kotlin
+// 主曲线：接近 CSS cubic-bezier(0.32, 0.72, 0, 1)
+// Apple 在 sheet / tab 切换 / 控制中心里反复使用同一条
+val IosEaseOut   = CubicBezierEasing(0.32f, 0.72f, 0f, 1f)
+
+// 双向平滑：用于「回到原位」这类两头都要柔和的运动
+val IosEaseInOut = CubicBezierEasing(0.42f, 0f, 0.58f, 1f)
+```
+
+#### 时长表
+
+| 场景 | 时长 | 曲线 | 备注 |
+|------|------|------|------|
+| 底栏指示器位移 | **420ms** | `IosEaseOut` | 点击切换 |
+| 液滴拉伸（抻开） | **260ms** | `IosEaseOut` | |
+| 液滴拉伸（收回） | **460ms** | `IosEaseInOut` | 收得比抻开慢，显「黏稠」 |
+| 发光脉冲淡出 | **520ms** | `IosEaseInOut` | |
+| 按下放大 | **180ms** | `IosEaseOut` | |
+| 松手回落 | **340ms** | `IosEaseOut` | |
+| tab 文字变色 | **380ms** | `IosEaseInOut` | |
+| 页面切换 | **460ms** | `IosEaseOut` | `animateScrollToPage` |
+| 弹层入场 | **280ms** | `IosEaseOut` | 缩放 0.90→1.0 + 淡入 |
+| 悬浮提示展开 | **520ms** | `IosEaseOut` | **不要更快** |
+| 悬浮提示收回 | **420ms** | `IosEaseInOut` | |
+
+#### 拖拽 vs 点击：两条不同路径（真机踩坑）
+
+**用户原话**：「我都拖拽过去了它还是重复一遍点击的动作」。
+
+拖拽松手后**绝不能**再播完整的翻页动画 —— 页面已经跟着手指挪了一大半，
+再从头播一遍就是「重复动作」。
+
+```kotlin
+onSelect = { target, fromDrag ->
+    if (fromDrag) {
+        pagerState.scrollToPage(target)       // 零动画，跟手结束即到位
+    } else {
+        pagerState.animateScrollToPage(...)   // 完整翻页动画
+    }
+}
+```
+
+同理，指示器的 `settleTo()` 也分流：
+
+```kotlin
+settleTo(index, fromX, stretch = !bySwipe)
+// bySwipe=true → snapTo 静默归位，不拉伸
+// bySwipe=false → 播放液滴拉伸
+```
+
+**状态传递必须用普通 `var`，不能用 `mutableStateOf`** ——
+写 `mutableStateOf` 会触发重组，但 `LaunchedEffect` 的 key 此刻还没变
+就不会重启，等 key 真变了标记可能已被覆盖。这是实测过的时序竞争。
 
 ### 按钮：液态玻璃交互材质
 
@@ -175,6 +230,92 @@
 - 玻璃面板必须**采样背后真实内容**（流动背景 / 可滚动内容），不能是静态半透明
 - AGSL 面数量上限 3 的旧约束**已解除** —— 用户明确"不用考虑性能消耗"
 - 但保留 `GlassPerfGuard` 降级路径作为兜底（设备过热/降频时自动退到磨砂）
+
+#### ⚠️ 采样源的三条铁律（真机血泪）
+
+**1. 主界面卡片绝不能采样 `contentLayer`**
+
+`contentLayer` 是正在录制的主界面内容本身。卡片如果采样它，就形成
+「录制 → 渲染进录制层 → 重新录制」的无限递归，**必崩**（已实测）。
+
+```kotlin
+// 主界面：只能用只含背景的 backdropLayer
+CompositionLocalProvider(LocalBackdropLayer provides backdropLayer) { ... }
+
+// 弹窗：用 LocalDialogBackdrop 显式传入 contentLayer（弹窗不在内容层里）
+CompositionLocalProvider(LocalDialogBackdrop provides SharedBackdrop.contentLayer) { ... }
+```
+
+**2. Compose Dialog 是 subcomposition，会继承父级 CompositionLocal**
+
+弹窗里 `LocalBackdropLayer.current` **不是 null**，而是主窗口的背景层。
+那层只录了光斑、没有内容 → 弹窗玻璃背后一片纯色，看起来像塑料板。
+必须用 `LocalDialogBackdrop` 显式覆盖。
+
+**3. 首帧降级会让 AGSL 永久失效，不要用**
+
+```kotlin
+// ✗ 曾经这样写，结果所有面板永久停在 FrostedPanel
+var agslReady by remember { mutableStateOf(false) }
+LaunchedEffect(Unit) { withFrameNanos {}; withFrameNanos {}; agslReady = true }
+```
+
+`withFrameNanos` 在面板频繁重组时会被反复取消，`agslReady` 永远来不及置 true。
+实测所有卡片/底栏都在「FROSTED降级」路径，而那条路**没有模糊、没有折射** ——
+这正是「调 blurRadius 完全没效果」的原因。
+
+**冷启动多 30~50ms 换正确的玻璃质感，这个取舍是明确的。**
+
+#### tint 必须是「彩色」的，不能是白色
+
+**核心规律：白色 tint 无论 alpha 多少都会把面板推向灰色。**
+
+实测序列（浅色主题）：
+
+| tint | alpha | 结果 | 判定 |
+|------|-------|------|------|
+| `0xFFF0FAFF`（G高） | 0.036 | RGB(136,202,244) 203° | 青绿 ✗ |
+| `0xFFFFFFFF`（白） | 0.036 | 灰 | ✗ |
+| `0xFFEAF2FF`（B高） | 0.036 | 蓝但过浓 | ✗ |
+| 白 | 0.20/0.23/0.42 | RGB(197~211, 恒等, 恒等) | 全灰 ✗ |
+| **`0xFFA0CFFF`（蓝）** | **0.09** | **RGB(145,191,250)** | **✓** |
+
+目标参考是设置页卡片 `RGB(160,198,247)`（`FrostedPanel` 的淡雅蓝）。
+
+**为什么**：`PrismalGlassSurface` 会先采样图层再做合成，
+白色 tint 相当于对采样值做「向灰平均」；
+而 `FrostedPanel` 是 Canvas 半透明叠加，白色不会稀释底下的蓝。
+**两者对白色 tint 的响应完全不同，不能用同一个 alpha 去匹配。**
+
+#### 弹窗背景模糊必须走系统管线
+
+AGSL 的 `blurRadius` 只能模糊**它采集的 GraphicsLayer**。
+弹窗打开后主界面被遮挡、不再重绘，录制层冻结 →
+调 blurRadius 从 32dp 到 52dp 画面**毫无变化**（已实测 3 轮）。
+
+正确做法：`Window.setBackgroundBlurRadius()`（API 31+）。
+
+**取 Window 的正确方式**（踩了 8 次的坑）：
+
+```kotlin
+// ✗ view.parent / view.rootView.mAttachInfo 拿到的永远是 **Activity 窗口**
+// ✓ 枚举 WindowManagerGlobal.mViews，按 type == TYPE_APPLICATION 筛选
+val wmg = Class.forName("android.view.WindowManagerGlobal")
+    .getMethod("getInstance").invoke(null)
+val views = wmgClass.getDeclaredField("mViews").apply { isAccessible = true }.get(wmg) as List<View>
+for (v in views) {
+    val lp = v.layoutParams as WindowManager.LayoutParams
+    if (lp.type == TYPE_APPLICATION && lp.packageName.contains(我们的包名)) {
+        lp.flags = lp.flags or FLAG_BLUR_BEHIND
+        lp.setBlurBehindRadius(px)
+        lp.dimAmount = 0.06f      // 默认 ~0.6 会把模糊结果压暗
+        wm.updateViewLayout(v, lp)
+    }
+}
+```
+
+验证方式：`dumpsys window windows | grep blurBehindRadius`，
+确认它出现在 `type=2` 的窗口上，而不是主窗口。
 
 ### 后台零消耗红线
 
