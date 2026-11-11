@@ -475,6 +475,16 @@ fun GlassTabBar(
             fromX = xAnim.value,
             stretch = !drivenByPager && !byDrag,
         )
+
+        // ============ 交接：pressX → liveOffset ============
+        //
+        // selectedIndex 已经更新（说明 pager 也到位了），此时才把
+        // 拖拽用的临时位置清掉，让渲染改由 liveOffset 驱动。
+        //
+        // 必须在**这里**清而不是在手势松手时清：
+        // 松手时 pager 还在翻页，liveOffset 仍是旧值，
+        // 提前清会让指示器先跳回原页，再跟着翻过去。
+        pressX = Float.NaN
     }
 
     // 【已移除】常驻流光。
@@ -721,17 +731,25 @@ fun GlassTabBar(
                             // 只由手指决定，与 pager 当前状态无关 —— 这样不会误切页。
                             val target = if (dragged) tabFor(lastX) else tabFor(down.position.x)
 
-                            // 指示器落位动画由上层 state 驱动；这里只负责把
-                            // 「目标位置」和「切页请求」一起发出去，两者时长一致。
                             if (target != currentSelected) {
                                 pendingSwipeSettle = true
+                                // 【关键】先把指示器交给目标位置，再请求切页。
+                                //
+                                // 曾经在 onSelect 之后直接 pressX = NaN，结果：
+                                // pager 的翻页动画要跑几百毫秒，而 selectedIndex
+                                // 只在**停稳后**才回写。这期间渲染回落到 liveOffset，
+                                // 它还是旧值（首页）→ 指示器先跳回首页，然后才跟着
+                                // 翻转过去。用户看到的就是「瞬移回原页再播一遍动画」。
+                                //
+                                // 现在让 pressX 停在目标 tab 的中心，
+                                // 等 selectedIndex 真正更新后由 settleTo 接管
+                                // （见下面 LaunchedEffect）。交接时两边数值相同，无跳变。
+                                pressX = centerXFor(target)
                                 currentOnSelect(target, dragged)
+                            } else {
+                                // 目标就是当前页：直接把跟手值交还给 liveOffset。
+                                pressX = Float.NaN
                             }
-
-                            // 结束时把跟手位置交还给 liveOffset/xAnim。
-                            // 落位动画由 settleTo（selectedIndex 变化时触发）负责，
-                            // 因此这里只需清掉临时跟手值。
-                            pressX = Float.NaN
                         }
                     },
                 verticalAlignment = Alignment.CenterVertically,
