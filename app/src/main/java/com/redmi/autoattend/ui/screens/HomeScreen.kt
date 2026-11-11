@@ -27,6 +27,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.getValue
@@ -90,6 +91,7 @@ fun HomeScreen(
     // 两个不可逆操作都需要二次确认
     var showPunchConfirm by remember { mutableStateOf(false) }
     var showSkipConfirm by remember { mutableStateOf(false) }
+
 
     Column(
         modifier = modifier
@@ -237,7 +239,9 @@ fun HomeScreen(
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .ClickableNoRipple(onClick = { showSkipConfirm = true })
+                .ClickableNoRipple(
+                    onClick = { showSkipConfirm = true },
+                )
                 .padding(vertical = 8.dp),
             contentAlignment = Alignment.Center,
         ) {

@@ -1,8 +1,8 @@
 package com.redmi.autoattend.ui.components
 
-import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.animateDpAsState
-import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -192,11 +192,16 @@ fun GlassSwitch(
         else Color(0xFF2B3A4A).copy(alpha = 0.10f)
     }
 
+    // 【iOS 18 标准】不用 spring。
+    //
+    // spring 的过冲在开关这种"明确的两态切换"里显得毛躁：
+    // 圆点会先冲过头再回弹，看起来像在抖动。
+    // iOS 的开关是一条平滑减速曲线，落点稳。
     val thumbOffset by animateDpAsState(
         targetValue = if (checked) 20.dp else 3.dp,
-        animationSpec = spring(
-            dampingRatio = Spring.DampingRatioMediumBouncy,
-            stiffness = Spring.StiffnessMedium,
+        animationSpec = tween(
+            durationMillis = 300,
+            easing = CubicBezierEasing(0.32f, 0.72f, 0f, 1f),
         ),
         label = "thumb",
     )

@@ -2,6 +2,8 @@ package com.redmi.autoattend.ui.components
 
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.CubicBezierEasing
+import androidx.compose.animation.core.Easing
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
@@ -27,6 +29,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -94,7 +97,18 @@ import kotlin.math.sin
 fun GlassTabBar(
     tabs: List<String>,
     selectedIndex: Int,
-    onSelect: (Int) -> Unit,
+    /**
+     * 请求切到某个 tab。
+     *
+     * @param fromDrag true 表示这次切页来自**拖拽松手**，而不是点击。
+     *
+     * 两者的翻页动画应该不同：
+     *   · 点击 → 完整播放一次翻页动画（从当前页滑到目标页）
+     *   · 拖拽 → 页面其实已经跟着手指挪了一大半，此时再播完整翻页
+     *     就会"重复一遍点击的动作"（用户原话）。
+     *     所以拖拽时应该**直接落到目标页**，只留一点点收敛动画。
+     */
+    onSelect: (index: Int, fromDrag: Boolean) -> Unit,
     /**
      * 页面滑动的**连续进度**（例如 0.37 表示在首页与设置之间偏移 37%）。
      *
@@ -129,6 +143,40 @@ fun GlassTabBar(
     val indicatorWidth = 78.dp
     val indicatorHeight = 40.dp
 
+    // ---------- 动效规格（iOS 18 质感）----------
+    //
+    // 用户明确要求：「把整个动画速率放慢，现在太快了，并不优雅」。
+    // iOS 的控件动效普遍在 300~600ms，且几乎不用线性。
+    //
+    // 这里的缓动是"快速起步、极缓收尾"的减速曲线，
+    // 数学上接近 CSS 的 cubic-bezier(0.32, 0.72, 0, 1) ——
+    // Apple 在 sheet、tab 切换、控制中心里反复使用同一条曲线。
+    val IosEaseOut: Easing = CubicBezierEasing(0.32f, 0.72f, 0f, 1f)
+
+    /** 双向平滑，用于"回到原位"这类需要两头都柔和的运动 */
+    val IosEaseInOut: Easing = CubicBezierEasing(0.42f, 0f, 0.58f, 1f)
+
+    /** 指示器位移时长：iOS 的 tab 切换约 350~450ms */
+    val INDICATOR_MOVE_MS = 420
+
+    /** 液滴拉伸（抻开）时长 */
+    val STRETCH_MS = 260
+
+    /** 拉伸收回时长 —— 比抻开慢，收得越慢越显"黏稠" */
+    val SETTLE_MS = 460
+
+    /** 发光脉冲淡出 */
+    val GLOW_FADE_MS = 520
+
+    /** 按下放大 */
+    val PRESS_MS = 180
+
+    /** 松手回落 */
+    val RELEASE_MS = 340
+
+    /** tab 文字颜色过渡 */
+    val COLOR_MS = 380
+
     /**
      * 拖拽放大倍数。
      *
@@ -154,6 +202,21 @@ fun GlassTabBar(
 
     var isDragging by remember { mutableStateOf(false) }
     var dragX by remember { mutableFloatStateOf(0f) }
+
+    /**
+     * 本次 selectedIndex 变化是否来自**滑动/拖拽切页**。
+     *
+     * ## 为什么用普通 var 而不是 mutableStateOf
+     *
+     * 它只在 [LaunchedEffect] 内部被读一次，**不需要触发重组**。
+     * 用 Snapshot 状态会引入时序竞争：
+     * 写 true 后立即触发重组，但此时 selectedIndex 还没变，
+     * LaunchedEffect 的 key 不变就不会重启 ——
+     * 等 selectedIndex 真变了，标记可能已经被消费或覆盖。
+     *
+     * 普通 var 写入是同步的，LaunchedEffect 重启时读到的必然是最新值。
+     */
+    var pendingSwipeSettle = false
 
     fun tabWidthPx(): Float = if (tabs.isEmpty()) 0f else barWidthPx.toFloat() / tabs.size
 
@@ -185,40 +248,81 @@ fun GlassTabBar(
     }
 
     /**
-     * 吸附到某个 tab，带液滴拉伸 + 发光脉冲。
+     * 吸附到某个 tab。
      *
-     * 拉伸量随位移增长，上限 62% 宽度；同时按面积守恒压扁高度 ——
-     * 这是"液体"的核心，单纯 scaleX 会像拉面。
+     * @param stretch 是否播放液滴拉伸。
+     *
+     * ## 为什么需要这个开关（真机踩坑）
+     *
+     * 滑动切页时，指示器由 [liveOffset] **直接跟手**，
+     * 而 xAnim 停在旧位置没更新。等页面吸附到位、selectedIndex
+     * 被回写后，这里会用 xAnim.value（旧位置）算出一段**整宽距离**，
+     * 于是明明已经停在正确的 tab 上，又额外拉伸出一次 ——
+     * 用户的原话是"界面停住了，最后还会往右边伸展一下，这没意义"。
+     *
+     * 所以：**滑动结束只做 snapTo 归位，不播放拉伸**；
+     * 只有点击切换（指示器确实要“跳”过去）才播放拉伸。
      */
-    fun settleTo(index: Int, fromX: Float) {
+    fun settleTo(index: Int, fromX: Float, stretch: Boolean = true) {
         val target = centerXFor(index)
         val distance = abs(target - fromX)
 
-        scope.launch {
-            xAnim.animateTo(target, spring(dampingRatio = 0.68f, stiffness = 380f))
+        if (!stretch) {
+            // 静默归位：滑动已经把手势带到目标位置了，
+            // 这里只把内部状态对齐，**不产生任何可见动画**。
+            // 用 snapTo 而不是极短的 animateTo：哪怕 1 帧的动画
+            // 也会被感知成"停住后又弹一下"。
+            scope.launch { xAnim.snapTo(target) }
+            scope.launch { wAnim.snapTo(indicatorWidthPx) }
+            scope.launch { hAnim.snapTo(indicatorHeightPx) }
+            scope.launch { glowAnim.snapTo(0f) }
+            return
         }
 
-        val maxExtra = indicatorWidthPx * 0.62f
-        val extra = (distance * 0.30f).coerceAtMost(maxExtra)
+        // ---------- 点击切换：iOS 18 质感的慢速位移 ----------
+        //
+        // 不用 spring：spring 的物理回弹在"点一下"这种**明确的
+        // 目标切换**里显得毛躁。Apple 的 tab 切换用的是一条
+        // 平滑减速曲线，落点稳、没有多余弹跳。
+        scope.launch {
+            xAnim.animateTo(
+                target,
+                animationSpec = tween(
+                    durationMillis = INDICATOR_MOVE_MS,
+                    easing = IosEaseOut,
+                ),
+            )
+        }
+
+        val maxExtra = indicatorWidthPx * 0.55f
+        val extra = (distance * 0.26f).coerceAtMost(maxExtra)
         if (extra > 2f) {
+            // 液滴拉伸：先缓慢抻开，再更缓慢地收回。
+            // 整个过程比之前慢一倍多 —— 用户明确要求"放慢，要优雅"。
             scope.launch {
                 wAnim.animateTo(
                     indicatorWidthPx + extra,
-                    tween(130, easing = FastOutSlowInEasing),
+                    tween(STRETCH_MS, easing = IosEaseOut),
                 )
-                wAnim.animateTo(indicatorWidthPx, spring(dampingRatio = 0.50f, stiffness = 400f))
+                wAnim.animateTo(
+                    indicatorWidthPx,
+                    tween(SETTLE_MS, easing = IosEaseInOut),
+                )
             }
             scope.launch {
-                val squash = 1f - (extra / (indicatorWidthPx + extra)) * 0.60f
+                val squash = 1f - (extra / (indicatorWidthPx + extra)) * 0.55f
                 hAnim.animateTo(
-                    (indicatorHeightPx * squash).coerceAtLeast(indicatorHeightPx * 0.66f),
-                    tween(130, easing = FastOutSlowInEasing),
+                    (indicatorHeightPx * squash).coerceAtLeast(indicatorHeightPx * 0.70f),
+                    tween(STRETCH_MS, easing = IosEaseOut),
                 )
-                hAnim.animateTo(indicatorHeightPx, spring(dampingRatio = 0.50f, stiffness = 400f))
+                hAnim.animateTo(
+                    indicatorHeightPx,
+                    tween(SETTLE_MS, easing = IosEaseInOut),
+                )
             }
             scope.launch {
-                glowAnim.animateTo(1f, tween(110))
-                glowAnim.animateTo(0f, tween(420, easing = FastOutSlowInEasing))
+                glowAnim.animateTo(0.9f, tween(STRETCH_MS, easing = IosEaseOut))
+                glowAnim.animateTo(0f, tween(GLOW_FADE_MS, easing = IosEaseInOut))
             }
         }
     }
@@ -227,10 +331,68 @@ fun GlassTabBar(
         if (barWidthPx > 0) xAnim.snapTo(centerXFor(selectedIndex))
     }
 
-    // 唯一驱动指示器动画的地方（点击切换与拖拽松手最终都走这里）
+    /**
+     * 【关键】让 xAnim 持续跟随 pager 的真实位置。
+     *
+     * 之前 xAnim 只在 settleTo 时才动，而滑动/点击翻页期间
+     * 指示器由 liveOffset 渲染 —— 两者脱节。
+     *
+     * 后果：翻页结束后 settleTo 用陈旧的 xAnim.value 算距离，
+     * 得出一个巨大的值，于是又拉一次。
+     *
+     * 现在把 xAnim 当成"内部记录的位置"，每帧跟 liveOffset 对齐。
+     * 这样任何后续计算里 fromX 都是真实位置，distance ≈ 0，
+     * 从根上消除了"二次拉伸"的可能。
+     */
+    LaunchedEffect(barWidthPx) {
+        if (barWidthPx == 0) return@LaunchedEffect
+        // 用 snapshotFlow 而不是 LaunchedEffect(liveOffset)：
+        // 后者每帧都会取消并重启协程，开销大且会打断 snapTo。
+        // snapshotFlow 只在一帧一次地把新值推给 collect。
+        snapshotFlow { liveOffset }
+            .collect { off ->
+                if (off == null) return@collect
+                // 用与渲染完全相同的公式把进度换算成像素位置
+                val lo = off.toInt()
+                val frac = off - lo
+                val p0 = centerXFor(lo)
+                val p1 = centerXFor(lo + 1)
+                xAnim.snapTo(p0 + (p1 - p0) * frac)
+            }
+    }
+
+    // 唯一驱动指示器动画的地方（点击切换与滑动切页最终都走这里）
     LaunchedEffect(selectedIndex, barWidthPx) {
         if (barWidthPx == 0) return@LaunchedEffect
-        settleTo(selectedIndex, xAnim.value)
+
+        // ========== 为什么这里几乎总是不该拉伸 ==========
+        //
+        // 指示器的**可见位置**有两套驱动源：
+        //   A. liveOffset（pager 连续进度）→ 拖拽、点击翻页动画期间都走这条
+        //   B. xAnim（settleTo 的动画目标）
+        //
+        // 只要 liveOffset != null，指示器就已经被 pager 连续驱动到位了。
+        // 此时再让 settleTo 播放拉伸，就会在"已经到位"之后
+        // **额外拉一次然后回缩** —— 正是用户反复反馈的：
+        //   「指示器已经完全横移过去了，最后收尾却会突然拉伸一下再回缩」
+        //
+        // 早期只在拖拽时置 pendingSwipeSettle=true，
+        // 点击 tab 时漏了 —— 而点击同样会启动 animateScrollToPage，
+        // 期间 liveOffset 一直在动，松手后 selectedIndex 才回写，
+        // 于是又触发一次拉伸。这是根因。
+        //
+        // 现在的规则：
+        //   · liveOffset 由 pager 提供（非 null）→ 永远静默归位
+        //   · 没有 pager 进度（纯本地切换）→ 才播放拉伸
+        val drivenByPager = liveOffset != null
+        val byDrag = pendingSwipeSettle
+        pendingSwipeSettle = false
+
+        settleTo(
+            index = selectedIndex,
+            fromX = xAnim.value,
+            stretch = !drivenByPager && !byDrag,
+        )
     }
 
     // 【已移除】常驻流光。
@@ -285,23 +447,34 @@ fun GlassTabBar(
             //   · 模糊 18dp —— 文字仍能辨认轮廓，但不会像隔着清水那么硬；
             //   · 折射/色散拉满 —— 边缘的透镜形变和红蓝分离提供"玻璃"的实感。
             // 单纯调模糊永远调不出玻璃感，材质感来自**边缘的折射形变**。
-            blurRadius = 18.dp,
-            // ---- 着色 ----
-            // 从 0x1A(10%) 提到 0x26(15%)：
-            // 10% 时太"空"，底下文字直接抢走 tab 文字的对比度；
-            // 15% 刚好让底栏有一层自己的"存在感"，同时文字仍能透出。
-            tint = if (colors.isDark) Color(0x14FFFFFF) else Color(0x26FFFFFF),
-            tintAlpha = if (colors.isDark) 0.018f else 0.062f,
-            // ---- 折射：这是"玻璃感"的真正来源 ----
+            // ---- 模糊 ----
             //
-            // 底栏高 52dp，透镜带 14dp 只占上下边缘小半圈，
-            // 中间留出清晰的观察区 —— 既能看到背后的字被推挤，又不至于全糊。
-            // 外推量 26dp 足够明显；再大就会出现难看的拉伸条纹。
-            refractionHeightOverride = 14.dp,
-            refractionAmountOverride = 26.dp,
-            // 色散提到 0.22：苹果的玻璃边缘确实有极淡的红蓝色边，
-            // 这是"厚度"的心理暗示，缺了它玻璃就永远是平的。
-            dispersionOverride = if (colors.isDark) 0.26f else 0.22f,
+            // 用户要求「底栏也需要同步加上液态玻璃那种模糊和折射」。
+            //
+            // 之前 18dp 模糊 + 14dp 透镜带，底栏看起来偏"清透的塑料条"，
+            // 缺少 iOS 26 那种厚重的玻璃体积感。
+            //
+            // iOS 26 底栏的观感特征：
+            //   1. 背后内容被明显模糊（但不是糊成一块色），
+            //      仍能看出"有东西在后面移动"；
+            //   2. 边缘有强烈的透镜形变 —— 内容在贴近边缘时被推开；
+            //   3. 上下边缘的高光描边定义了「厚度」。
+            //
+            // 所以：模糊加深、透镜带加宽、外推量加大。
+            // 底栏只有 52dp 高，透镜带不能宽到吞掉中间观察区，
+            // 24dp 是上限附近的值（中间仍留约 1/4 清晰区）。
+            blurRadius = 26.dp,
+            // ---- 着色 ----
+            // 降回 0x1A(10%)：既然模糊和折射都加强了，
+            // 着色再重就会变成"磨砂实心条"，把折射效果盖掉。
+            // 玻璃的通透感靠"折射 + 高光"，不是靠填充。
+            tint = if (colors.isDark) Color(0x0FFFFFFF) else Color(0x1AFFFFFF),
+            tintAlpha = if (colors.isDark) 0.014f else 0.048f,
+            // ---- 折射：玻璃感的真正来源 ----
+            refractionHeightOverride = 24.dp,
+            refractionAmountOverride = 44.dp,
+            // 色散保持较高：红蓝分离是"厚度"的心理暗示。
+            dispersionOverride = if (colors.isDark) 0.30f else 0.26f,
             sampleOffsetX = 0.5f,
             sampleOffsetY = 0.92f,
         ) {
@@ -367,7 +540,10 @@ fun GlassTabBar(
                             scope.launch {
                                 scaleAnim.animateTo(
                                     dragScale,
-                                    spring(dampingRatio = 0.50f, stiffness = 850f),
+                                    tween(
+                                        durationMillis = PRESS_MS,
+                                        easing = IosEaseOut,
+                                    ),
                                 )
                             }
                         },
@@ -383,26 +559,37 @@ fun GlassTabBar(
                             scope.launch {
                                 scaleAnim.animateTo(
                                     1f,
-                                    spring(dampingRatio = 0.40f, stiffness = 650f),
+                                    tween(
+                                        durationMillis = RELEASE_MS,
+                                        easing = IosEaseOut,
+                                    ),
                                 )
                             }
-                            // 把动画起点钉在松手位置
-                            scope.launch { xAnim.snapTo(dragX) }
 
                             if (nearest != currentSelected) {
-                                // 页面切换 + 指示器归位统一由 LaunchedEffect 负责
-                                currentOnSelect(nearest)
+                                // 【关键】先把 xAnim 对齐到松手位置，
+                                // 这样 LaunchedEffect 重算 distance 时是 0，
+                                // 不会因为读到旧位置而多拉一次。
+                                scope.launch { xAnim.snapTo(dragX) }
+                                pendingSwipeSettle = true
+                                currentOnSelect(nearest, true)
                             } else {
+                                // 拖回原位：只做一次轻微的拉伸回弹。
+                                scope.launch { xAnim.snapTo(dragX) }
                                 settleTo(nearest, dragX)
                             }
                         },
                         onDragCancel = {
                             isDragging = false
                             scope.launch {
-                                scaleAnim.animateTo(1f, spring(dampingRatio = 0.40f, stiffness = 650f))
+                                scaleAnim.animateTo(
+                                    1f,
+                                    tween(RELEASE_MS, easing = IosEaseOut),
+                                )
                             }
                             scope.launch { xAnim.snapTo(dragX) }
-                            settleTo(currentSelected, dragX)
+                            // 取消拖拽是回到原位，不需要拉伸。
+                            settleTo(currentSelected, dragX, stretch = false)
                         },
                     )
                 },
@@ -417,7 +604,7 @@ fun GlassTabBar(
                     } else {
                         if (colors.isDark) colors.textTertiary else Color(0xFF3A4049)
                     },
-                    animationSpec = tween(240),
+                    animationSpec = tween(COLOR_MS, easing = IosEaseInOut),
                     label = "tab-color",
                 )
 
@@ -426,7 +613,7 @@ fun GlassTabBar(
                         .weight(1f)
                         .height(barHeight)
                         .ClickableNoRipple {
-                            if (index != selectedIndex) onSelect(index)
+                            if (index != selectedIndex) onSelect(index, false)
                         },
                     contentAlignment = Alignment.Center,
                 ) {

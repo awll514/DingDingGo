@@ -349,6 +349,29 @@ fun SettingsScreen(
                 )
             }
 
+            // 【自检入口】不打卡也能验证悬浮窗能否显示。
+            //
+            // 用户反馈过"操控屏幕运行时没看见悬浮窗"，
+            // 但正常触发悬浮窗必须走一次真实打卡 —— 代价太高。
+            // 这个按钮只是把提示条显示 3 秒然后自动收起，不碰任何打卡逻辑。
+            SettingsDivider()
+            SettingsRow(
+                title = "测试悬浮窗",
+                subtitle = if (canOverlay) {
+                    "显示提示条 3 秒后自动收起，不会打卡"
+                } else {
+                    "需要先授予上面的悬浮窗权限"
+                },
+                danger = false,
+                onClick = {
+                    if (canOverlay) {
+                        com.redmi.autoattend.exec.ControlHudOverlay.showForTest(context)
+                    } else {
+                        openOverlaySettings(context)
+                    }
+                },
+            )
+
             SettingsDivider()
             // 常驻通知开关：
             // 关掉后保活服务仍然运行，只是通知栏不留那一行。
