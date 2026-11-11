@@ -14,6 +14,7 @@ import android.util.Log
 import com.redmi.autoattend.MainActivity
 import com.redmi.autoattend.core.AlarmScheduler
 import com.redmi.autoattend.core.AppConfig
+import com.redmi.autoattend.core.NextPunchSlot
 import com.redmi.autoattend.core.PunchSchedule
 import com.redmi.autoattend.data.db.AppDatabase
 import com.redmi.autoattend.data.db.PunchKind
@@ -142,6 +143,10 @@ class PunchForegroundService : Service() {
     /** 当前执行的协程，暂停时要取消它 */
     private var job: kotlinx.coroutines.Job? = null
 
+    /** 本次流程开始时屏幕是否本来就是灭的（决定收尾要不要灭屏） */
+    @Volatile
+    private var screenWasOffAtStart: Boolean = false
+
     /** 记住本次任务参数，恢复时要用 */
     private var pendingKind: PunchKind = PunchKind.CLOCK_IN
     private var pendingTargetAt: Long = 0L
@@ -157,6 +162,28 @@ class PunchForegroundService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action
+
+        // ==================== 【P0】null Intent 绝不能当成一次打卡 ====================
+        //
+        // 这是"半夜自己亮屏解锁点钉钉"的根因。
+        //
+        // Android 对 START_STICKY 的服务会返回 **null Intent** 来重启；
+        // 而旧代码在 intent == null 时用默认值兜底：
+        //     kindName ?: CLOCK_IN
+        //     targetAt  ?: 0L
+        //     prewarm   ?: false
+        // 于是变成了"立刻执行一次上班卡"。更糟的是上班卡的时间闸门
+        // 只有上界（now > target+55s 才拒绝）而没有下界 ——
+        // 凌晨 00:10 也会通过，然后点亮屏幕、解锁、拉起钉钉、点打卡。
+        //
+        // 正确语义：没有真实指令就没有任务。直接收尾退出。
+        if (action == null && intent == null) {
+            Log.w(TAG, "收到 null Intent（系统重启服务），没有可执行指令，直接退出")
+            cleanup()
+            running = false
+            stopSelf()
+            return START_NOT_STICKY
+        }
 
         if (action == ACTION_CANCEL) {
             Log.i(TAG, "收到取消指令")
@@ -221,11 +248,26 @@ class PunchForegroundService : Service() {
         // 必须在前 5 秒内 startForeground，否则系统会 ANR/杀进程
         startForeground(NOTIFICATION_ID, buildPreparingNotification())
 
-        val kindName = intent?.getStringExtra(PunchAlarmReceiver.EXTRA_KIND)
+        // 【P0】EXTRA_TARGET_AT 缺失同样不能默认成"现在就打"。
+        // 目标时刻是安全闸门的唯一依据（迟到边界 / 下班最早时刻都相对它计算），
+        // 没有它就等于让闸门拿 startOfDay + 设置分钟去硬算，
+        // 单日临时覆盖（Override）会被完全忽略。
+        // 走 null-Intent 守卫之后 intent 一定非空，Kotlin 智能转换已生效。
+        val intentNonNull = requireNotNull(intent)
+        val rawTargetAt = intentNonNull.getLongExtra(PunchAlarmReceiver.EXTRA_TARGET_AT, 0L)
+        if (rawTargetAt <= 0L) {
+            Log.w(TAG, "缺少 EXTRA_TARGET_AT，无法确定目标时刻，放弃本次执行")
+            cleanup()
+            running = false
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        val kindName = intentNonNull.getStringExtra(PunchAlarmReceiver.EXTRA_KIND)
             ?: PunchKind.CLOCK_IN.name
         val kind = runCatching { PunchKind.valueOf(kindName) }.getOrDefault(PunchKind.CLOCK_IN)
-        val targetAt = intent?.getLongExtra(PunchAlarmReceiver.EXTRA_TARGET_AT, 0L) ?: 0L
-        val prewarm = intent?.getBooleanExtra(EXTRA_PREWARM, false) ?: false
+        val targetAt = rawTargetAt
+        val prewarm = intentNonNull.getBooleanExtra(EXTRA_PREWARM, false)
 
         // 暂停已超时但服务还吊着（用户没点继续也没点取消）：
         // 让本次新请求接管，否则这一整天都打不了卡。
@@ -241,7 +283,7 @@ class PunchForegroundService : Service() {
         if (running) {
             // 【关键】不要 stopForeground！
             //
-            // PREWARM 在 target-75s 启动本服务并 delayUntilTarget 等到 target，
+            // PREWARM 在 target-75s 启动本服务并一路跑到考勤页等 target，
             // 而 FIRE 恰好在 target 触发 —— 此时 running==true，必然走进这个分支。
             //
             // 如果在这里 stopForeground(STOP_FOREGROUND_REMOVE)，撤掉的正是
@@ -262,6 +304,12 @@ class PunchForegroundService : Service() {
         pendingKind = kind
         pendingTargetAt = targetAt
 
+        // 记录"来之前屏幕是不是灭的"，收尾时决定要不要帮用户灭屏。
+        screenWasOffAtStart = runCatching {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            pm.isInteractive.not()
+        }.getOrDefault(false)
+
         startPunchFlow(kind, targetAt, prewarm)
 
         return START_NOT_STICKY
@@ -276,13 +324,15 @@ class PunchForegroundService : Service() {
     private fun startPunchFlow(kind: PunchKind, targetAt: Long, prewarm: Boolean = false) {
         job = scope.launch {
             try {
-                if (prewarm) {
-                    log("prewarm 阶段，等待目标时刻")
-                    // 预热闹钟只需把服务唤起来并持有唤醒锁；
-                    // 真正的执行交给 FIRE 闹钟，避免提前 75 秒就开始点界面。
-                    delayUntilTarget(targetAt)
-                }
-                runPunch(kind, targetAt)
+                // 【P0-4】预热不再"傻等 75 秒再全流程重跑"。
+                //
+                // 旧实现：prewarm 时 delayUntilTarget(targetAt) 干等，到点才
+                // 从点亮屏幕开始跑整个流程 —— 8 秒硬等 + 20 秒轮询 + 导航，
+                // 真机实测 27.7 秒才进考勤页，而上班卡合法窗口只有 55 秒。
+                //
+                // 现在：预热时直接把流程跑到"停在考勤页"，然后等目标时刻
+                // 再点击（见 PunchEngine 的 holdUntilTarget）。
+                runPunch(kind, targetAt, prewarm)
             } catch (c: kotlinx.coroutines.CancellationException) {
                 // 暂停/取消导致的中断不算异常，不要打错误日志
                 log("流程被中断（暂停或取消）")
@@ -305,32 +355,9 @@ class PunchForegroundService : Service() {
         }
     }
 
-    /**
-     * 等到目标时刻再执行。
-     *
-     * 用 kotlinx.coroutines.delay 而不是 Thread.sleep：
-     * 1. 它是挂起函数，不会占住 IO 线程池里的一个线程长达 75 秒；
-     * 2. 它可以被取消——如果用户在预热期间关掉开关，能立刻退出。
-     *
-     * 唤醒锁仍然由服务持有，所以进 Doze 也不会睡死。
-     */
-    private suspend fun delayUntilTarget(targetAt: Long) {
-        if (targetAt <= 0) return
-        val wait = targetAt - System.currentTimeMillis()
-        if (wait <= 0) return
-        // 分段等待，每段都检查一次是否还需要继续（可被取消）
-        var remaining = wait
-        while (remaining > 0) {
-            val slice = minOf(remaining, 1_000L)
-            kotlinx.coroutines.delay(slice)
-            remaining -= slice
-            currentCoroutineContext().ensureActive()
-        }
-    }
-
-    private suspend fun runPunch(kind: PunchKind, targetAt: Long) {
+    private suspend fun runPunch(kind: PunchKind, targetAt: Long, prewarm: Boolean = false) {
         val startedAt = System.currentTimeMillis()
-        log("开始执行 kind=" + kind.name)
+        log("开始执行 kind=" + kind.name + (if (prewarm) "（预热模式）" else ""))
 
         updateNotification(buildRunningNotification(kind))
         val kindLabel = when (kind) {
@@ -340,7 +367,13 @@ class PunchForegroundService : Service() {
         }
 
         val engine = PunchEngine(applicationContext)
-        val result = engine.execute(kind, wakeLock)
+
+        // 目标时刻从 Intent 一路传进引擎：安全闸门只做判定，
+        // 不再自己去 startOfDay + 设置分钟 硬算（那样看不到单日覆盖）。
+        //
+        // prewarm=true 时引擎会把流程跑到"停在考勤页"再等目标时刻，
+        // 把 8 秒硬等 + 导航开销挪到窗口之外。
+        val result = engine.execute(kind, wakeLock, targetAt, holdUntilTarget = prewarm)
 
         val finishedAt = System.currentTimeMillis()
         log("执行结束 success=" + result.success + " stage=" + result.stage.label)
@@ -377,6 +410,8 @@ class PunchForegroundService : Service() {
             finishedAt - targetAt >= 60_000L
 
         val hudTitle = when {
+            result.abandonedByGate && isLate -> "⏰ 上班打卡成功（迟到）"
+            result.abandonedByGate -> "⏭️ 本次已跳过"
             isLate -> "⏰ 上班打卡成功（迟到）"
             result.success && kind == PunchKind.CLOCK_IN -> "✅ 上班打卡成功"
             result.success && kind == PunchKind.CLOCK_OUT -> "✅ 下班打卡成功"
@@ -384,21 +419,26 @@ class PunchForegroundService : Service() {
             else -> "⚠️ 打卡失败"
         }
         val hudTone = when {
+            result.abandonedByGate -> ControlHudOverlay.Tone.LATE
             isLate -> ControlHudOverlay.Tone.LATE
             result.success -> ControlHudOverlay.Tone.SUCCESS
             else -> ControlHudOverlay.Tone.FAILURE
         }
-        val hudSubtitle = if (result.success) {
-            java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.CHINA).format(java.util.Date(finishedAt))
-        } else {
-            (result.stage.label + " · " + result.message).take(26)
+        val hudSubtitle = when {
+            result.abandonedByGate -> result.message.take(26)
+            result.success -> java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.CHINA)
+                .format(java.util.Date(finishedAt))
+            else -> (result.stage.label + " · " + result.message).take(26)
         }
-        ControlHudOverlay.showStatus(
-            context = applicationContext,
-            tone = hudTone,
-            title = hudTitle,
-            subtitle = hudSubtitle,
-        )
+        // 与 PunchEngine 的 show() 同一个开关：用户关掉"屏幕接管提示"就都不弹。
+        if (AppConfig.showControlHud.value) {
+            ControlHudOverlay.showStatus(
+                context = applicationContext,
+                tone = hudTone,
+                title = hudTitle,
+                subtitle = hudSubtitle,
+            )
+        }
 
         // 【关键】成功后立刻重排闹钟。
         //
@@ -407,10 +447,21 @@ class PunchForegroundService : Service() {
         // scheduleNext 现在会读"今天已成功的班次"，所以重排后
         // 刚打完的这一班会被跳过，下一次自动打卡自动顺延到下一班。
         // 不重排的话，已经注册的旧闹钟仍会按原时间触发。
-        if (result.success) {
-            runCatching { AlarmScheduler.scheduleNext(applicationContext) }
-                .onFailure { Log.w(TAG, "重排闹钟失败: " + it.javaClass.simpleName) }
-        }
+        // 【P0-1】重排统一在这里做，不再由闹钟接收器做。
+        //
+        // 成功 / 主动放弃（例如"已过迟到边界，为避免迟到记录跳过"）→ 标记本班已处理，
+        // 下一次自动顺延到下一班；
+        // 执行失败 → 不标记，让本班在补执行窗口内还能被 RETRY 再救一次。
+        val slot = NextPunchSlot(
+            triggerAtMillis = targetAt - PunchSchedule.PRE_WARM_SECONDS * 1000L,
+            targetAtMillis = targetAt,
+            kind = kind,
+        )
+        AlarmScheduler.onPunchFinished(
+            context = applicationContext,
+            slot = slot,
+            markFired = result.success || result.abandonedByGate,
+        )
     }
 
     /** 暂停状态的通知：告诉用户"已暂停，还能继续" */
@@ -463,7 +514,32 @@ class PunchForegroundService : Service() {
         wakeLock = null
     }
 
+    /**
+     * 收尾：灭屏 + 释放唤醒锁 + 撤掉常驻通知。
+     *
+     * ## 为什么要主动灭屏（F3.7 明确要求，之前完全没做）
+     *
+     * 打卡流程会把屏幕点亮、解锁、把钉钉拉到前台。打完之后如果不灭屏：
+     *   · 夜里打卡会把屏幕亮一整夜（耗电 + 隐私暴露）；
+     *   · 用户第二天早上看到的是钉钉页面，而不是自己的锁屏。
+     *
+     * RootShell.screenOff() 早就写好了，但**全库没有一个调用点**。
+     *
+     * 只在"是这次流程点亮的屏幕"时才灭：如果用户本来就在用手机，
+     * 我们无权把屏幕关掉。
+     */
+    private fun finishAndMaybeScreenOff() {
+        runCatching {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            if (pm.isInteractive && screenWasOffAtStart) {
+                RootShell.screenOff()
+                log("已灭屏收尾")
+            }
+        }
+    }
+
     private fun cleanup() {
+        finishAndMaybeScreenOff()
         releaseWakeLock()
         runCatching {
             stopForeground(STOP_FOREGROUND_REMOVE)

@@ -219,7 +219,24 @@ object AlarmScheduler {
             return null
         }
 
-        render(context, slot)
+        // 【关键】若上一轮闹钟正是同一个班次，说明本班还没真正结束
+        // （例如 RETRY 触发后又失败）。这时候直接复用，不要 cancel 再重排：
+        // cancel + 重新注册同一组 PendingIntent 会把已经过去的 PREWARM/FIRE
+        // 的时间钳到 now，等于立刻再触发一次 —— 又是一条自激路径。
+        val previous = readLastScheduled(context)
+        if (previous != null &&
+            previous.targetAtMillis == slot.targetAtMillis &&
+            previous.kind == slot.kind
+        ) {
+            Log.i(
+                TAG,
+                "同一班次仍在处理中，保持既有闹钟 target=" +
+                    PunchSchedule.formatTime(slot.targetAtMillis),
+            )
+            return slot
+        }
+
+        render(context, slot, previous)
         return slot
     }
 
@@ -260,7 +277,7 @@ object AlarmScheduler {
      * - FIRE 在目标时刻，是真正的打卡执行点（若 PREWARM 已成功预热，这里只做点击）；
      * - RETRY 在目标时间 + RETRY_WINDOW_SECONDS，作为最后的兜底。
      */
-    private fun render(context: Context, slot: NextPunchSlot) {
+    private fun render(context: Context, slot: NextPunchSlot, previous: NextPunchSlot?) {
         // 【关键】先取消上一轮的三段闹钟，再注册新的。
         //
         // 早先的实现每次都只注册不取消，于是：
@@ -270,9 +287,9 @@ object AlarmScheduler {
         //    lastScheduled == null，直接 return，什么也没取消。
         //
         // 现在 lastScheduled 持久化到 prefs，冷进程也能读回来取消。
-        readLastScheduled(context)?.let { previous ->
-            cancelAll(context, previous)
-            Log.i(TAG, "已取消上一轮闹钟 target=" + PunchSchedule.formatTime(previous.targetAtMillis))
+        previous?.let { prev ->
+            cancelAll(context, prev)
+            Log.i(TAG, "已取消上一轮闹钟 target=" + PunchSchedule.formatTime(prev.targetAtMillis))
         }
 
         val am = alarmManager(context)
@@ -288,15 +305,52 @@ object AlarmScheduler {
         val prewarmAt = slot.triggerAtMillis
         val retryAt = target + PunchSchedule.RETRY_WINDOW_SECONDS * 1000L
 
-        setExact(am, exact, prewarmAt, prewarmPi, context)
-        setExact(am, exact, maxOf(slot.targetAtMillis, System.currentTimeMillis() + 1000), firePi, context)
-        setExact(am, exact, retryAt, retryPi, context)
+        // 【关键】已经过去的时间点**不能再注册**。
+        //
+        // 旧代码用 maxOf(at, now + 500/1000) 把过去的时间钳到"立刻"，
+        // 于是每重排一次就立刻再触发一次 —— 这是另一条自激路径，也是
+        // 为什么之前 dumpsys alarm 里会看到 PREWARM/FIRE/RETRY 各有两份。
+        //
+        // 语义上"已经过去的那一段"本来就不该再触发：
+        //   · PREWARM 已过 → 预热窗口没了，服务由 FIRE 拉起即可；
+        //   · FIRE 已过但还在补执行窗口 → 用"立即"触发是合理的（补执行）；
+        //   · RETRY 已过 → 这一班彻底结束，不注册。
+        val now = System.currentTimeMillis()
+        val registerNow = now + 500L
+
+        if (prewarmAt > now) {
+            setExact(am, exact, prewarmAt, prewarmPi, context)
+        } else {
+            // 预热闹钟时间已过：不必再注册，避免"钳到立刻"造成的重复执行
+            runCatching { am.cancel(prewarmPi) }
+        }
+
+        // FIRE：本班目标时刻还没到 → 按目标时刻排；
+        // 已经过了但仍在补执行窗口内 → 允许立刻补一次（这是补执行的语义）。
+        val fireAt = when {
+            slot.targetAtMillis > now -> slot.targetAtMillis
+            now - slot.targetAtMillis <= PunchSchedule.RETRY_WINDOW_SECONDS * 1000L -> registerNow
+            else -> 0L
+        }
+        if (fireAt > 0L) {
+            setExact(am, exact, fireAt, firePi, context)
+        } else {
+            runCatching { am.cancel(firePi) }
+        }
+
+        if (retryAt > now) {
+            setExact(am, exact, retryAt, retryPi, context)
+        } else {
+            runCatching { am.cancel(retryPi) }
+        }
 
         Log.i(
             TAG,
             "scheduled kind=" + kindName +
                 " target=" + PunchSchedule.formatTime(target) +
                 " prewarmAt=" + PunchSchedule.formatTime(prewarmAt) +
+                " fire=" + (if (fireAt > 0) PunchSchedule.formatTime(fireAt) else "skip") +
+                " retry=" + (if (retryAt > now) PunchSchedule.formatTime(retryAt) else "skip") +
                 " exact=" + exact,
         )
 
@@ -333,6 +387,32 @@ object AlarmScheduler {
 
     @Volatile
     private var justFiredKind: String? = null
+
+    /**
+     * 打卡流程结束后统一重排下一班（P0-1 修复的配套）。
+     *
+     * ## 为什么重排从接收器搬到这里
+     *
+     * 旧实现在 [PunchAlarmReceiver.onReceive] 里重排，PREWARM 一触发就把
+     * 本班的 FIRE / RETRY 取消了（详见 AlarmScheduler 顶部注释与
+     * PunchAlarmReceiver 的说明），兜底链路直接断掉。
+     *
+     * 现在改成：接收器只拉服务，**服务执行完毕**（成功/失败/取消）后调这里。
+     * 语义上"本班已经结束"才是重排下一班的正确时机。
+     *
+     * @param markFired 是否把"刚跑完的这一班"标记成已处理。
+     *        成功/主动放弃传 true（下次要跳到下一班）；
+     *        执行失败传 false，让 nextSlot 在补执行窗口内仍能排回本班，
+     *        这样 RETRY 还有机会救一次。
+     */
+    fun onPunchFinished(context: Context, slot: NextPunchSlot?, markFired: Boolean) {
+        runCatching {
+            if (markFired && slot != null) {
+                markJustFired(slot.targetAtMillis, slot.kind)
+            }
+            scheduleNext(context)
+        }.onFailure { Log.w(TAG, "onPunchFinished 重排失败: " + it.javaClass.simpleName) }
+    }
 
     /**
      * 标记某个槽位刚刚被触发。

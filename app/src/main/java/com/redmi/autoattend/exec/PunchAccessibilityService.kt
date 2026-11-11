@@ -23,6 +23,9 @@ import kotlinx.coroutines.flow.asStateFlow
 class PunchAccessibilityService : AccessibilityService() {
 
     companion object {
+        /** 历史事件缓存的容量上限 */
+        private const val MAX_RECENT = 32
+
         @Volatile
         private var instance: PunchAccessibilityService? = null
 
@@ -37,8 +40,21 @@ class PunchAccessibilityService : AccessibilityService() {
     private val _lastScreenText = MutableStateFlow("")
     val lastScreenText: StateFlow<String> = _lastScreenText.asStateFlow()
 
-    /** 最近捕获到的与应用相关的文本，环形保留一小段，便于判定"打卡成功" */
-    private val recentTexts = ArrayDeque<String>(32)
+    /**
+     * 最近捕获到的与应用相关的文本，环形保留一小段，便于判定"打卡成功"。
+     *
+     * ## 必须线程安全
+     *
+     * 写方是 onAccessibilityEvent（主线程），读方是 PunchEngine 的
+     * verifyResult / readCurrentPageText（Dispatchers.IO 协程）。
+     * 原来是裸 ArrayDeque，跨线程读写会 ConcurrentModificationException，
+     * 而那个异常会被 PunchEngine 的 catch(Throwable) 吞成"执行异常"，
+     * 表现为"莫名其妙打卡失败"。
+     *
+     * CopyOnWriteArrayList 在这个量级（<=32 条、写入频率是 UI 事件）
+     * 完全够用，读路径零锁。
+     */
+    private val recentTexts = java.util.concurrent.CopyOnWriteArrayList<String>()
 
     private val _currentPackage = MutableStateFlow<String?>(null)
     val currentPackage: StateFlow<String?> = _currentPackage.asStateFlow()
@@ -78,8 +94,8 @@ class PunchAccessibilityService : AccessibilityService() {
         val snapshot = builder.toString().trim()
         if (snapshot.isNotEmpty()) {
             _lastScreenText.value = snapshot
-            recentTexts.addLast(snapshot)
-            while (recentTexts.size > 32) recentTexts.removeFirst()
+            recentTexts.add(snapshot)
+            while (recentTexts.size > MAX_RECENT) recentTexts.removeAt(0)
         }
     }
 
@@ -90,6 +106,16 @@ class PunchAccessibilityService : AccessibilityService() {
     fun resetTextHistory() {
         recentTexts.clear()
         _lastScreenText.value = ""
+    }
+
+    /**
+     * 只清"历史事件缓存"，保留当前窗口文本。
+     *
+     * verifyResult 在点击之后调用它：点击之前的界面事件（可能是上一页残留的
+     * "网络异常" / "打卡成功"）不该参与本次判定，但当前窗口仍然要能读到。
+     */
+    fun resetEventHistoryOnly() {
+        recentTexts.clear()
     }
 
     // ---------- 节点查找与操作 ----------
@@ -254,6 +280,64 @@ class PunchAccessibilityService : AccessibilityService() {
         val sb = StringBuilder()
         collectText(root, sb, 0)
         return sb.toString()
+    }
+
+    /**
+     * 按**行**读取当前窗口文本：每一行节点单独成段，行内用空格连接。
+     *
+     * ## 为什么需要它（解决"上下班状态串味"）
+     *
+     * readAllText() 是把整棵树的文本平铺拼成一个长串。真实考勤页的状态卡
+     * 是**两栏并排**的：
+     *
+     *     ┌──────────────┬───────────────────────────┐
+     *     │ 上班09:30    │ 下班18:30                 │
+     *     │ 09:19已打卡  │ 18:30已打卡  更新打卡     │
+     *     └──────────────┴───────────────────────────┘
+     *
+     * 平铺之后可能变成：
+     *
+     *     "上班 09:30 下班 18:30 09:19已打卡 18:30已打卡 更新打卡"
+     *
+     * 这时用"上班"往后 90 字符找"已打卡"，会跨到**下班**那一栏去，
+     * 把下班的完成状态误算成上班的（反之亦然）。
+     *
+     * 按行读取后再按行匹配，「上班」那一行的「已打卡」与「下班」那一行的
+     * 天然分开，不需要任何窗口大小猜测。
+     *
+     * @return 每一行一个元素；行内文本用空格连接
+     */
+    fun readTextLines(): List<String> {
+        val root = rootNodeOrNull() ?: return emptyList()
+        val lines = ArrayList<String>()
+        collectLines(root, lines, 0)
+        return lines.filter { it.isNotBlank() }
+    }
+
+    /**
+     * 收集文本行。
+     *
+     * 判定"一行"的口径：以**叶子容器**为单位 ——
+     * 一个节点如果有子节点，就继续往下走；只有没有子节点的节点才贡献文本。
+     * 同一次遍历里，位于同一父节点下的兄弟文本合并成一行。
+     */
+    private fun collectLines(node: AccessibilityNodeInfo?, out: MutableList<String>, depth: Int) {
+        if (node == null || depth > 40) return
+
+        if (node.childCount == 0) {
+            val t = runCatching { node.text?.toString() }.getOrNull().orEmpty().trim()
+            val d = runCatching { node.contentDescription?.toString() }.getOrNull().orEmpty().trim()
+            val merged = listOf(t, d).filter { it.isNotEmpty() }.joinToString(" ")
+            if (merged.isNotEmpty()) out.add(merged)
+            return
+        }
+
+        // 有子节点：把本节点自己可能带的文本先记下来，再递归
+        val self = runCatching { node.text?.toString() }.getOrNull().orEmpty().trim()
+        if (self.isNotEmpty()) out.add(self)
+        for (i in 0 until node.childCount) {
+            collectLines(node.getChild(i), out, depth + 1)
+        }
     }
 
     private fun collectText(node: AccessibilityNodeInfo?, sb: StringBuilder, depth: Int) {

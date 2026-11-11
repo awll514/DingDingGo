@@ -6,11 +6,37 @@
 
   canRetrieveWindowContent 必须为 true，否则读不到界面文本，
   也就无法做"以界面真实反馈判定成功"（验收标准 3）。
+
+  ## flagRequestEnhancedWebAccessibility 是必须的（真机验证）
+
+  真实的钉钉考勤打卡页是 H5，不是原生页面：
+
+      Activity : com.alibaba.lightapp.runtime.ariver.TheOneActivityMainTask
+      View     : H5PullContainer -> nebulauc.impl.UCWebView -> org.chromium.android_webview.*
+
+  实测证据（Redmi K90 / 钉钉当前版本）：
+  · 不开启该 flag 时，uiautomator dump 连续 20+ 次全部
+    "ERROR: could not get idle state"；监听 10 秒内 rimet 事件 28 条，
+    但非空 Text 数量为 0。
+  · 同进程的原生页（LaunchHomeActivity）dump 正常，所以不是工具问题。
+  · 成因：UCWebView/Chromium 默认不把 DOM 文本导出到无障碍树，
+    必须开启增强 Web 无障碍才会产生可读节点与文本事件。
+
+  没有它，整条"读界面真实反馈判定成功"的链路在考勤页上是完全瞎的：
+  blob 恒为空，targetAlreadyDone 恒 false，verifyResult 恒失败 ——
+  这正是"打完卡识别不出结果/时间"的根因之一。
+
+  ## 关于 dump 失败的时钟问题
+
+  大按钮中间有每秒跳动的时钟（如 20:44:16），UCWebView 持续 invalidate，
+  窗口永不 idle，uiautomator dump 因此超时。这是 dump 通道的固有限制，
+  不是本配置能解决的 —— 所以本 App 的取证主路径必须是无障碍节点树，
+  而不是 uiautomator dump。
 -->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewClicked|typeViewTextChanged"
     android:accessibilityFeedbackType="feedbackGeneric"
-    android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews"
+    android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews|flagRequestEnhancedWebAccessibility"
     android:canPerformGestures="true"
     android:canRetrieveWindowContent="true"
     android:description="@string/accessibility_description"

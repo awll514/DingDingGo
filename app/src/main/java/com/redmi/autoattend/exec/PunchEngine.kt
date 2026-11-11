@@ -43,6 +43,23 @@ data class PunchResult(
     val evidence: String? = null,
     val trace: List<String> = emptyList(),
     val channelUsed: String = "none",
+    /**
+     * 本次是**安全闸门主动放弃**，不是执行失败。
+     *
+     * ## 为什么要区分
+     *
+     * 迟到边界、下班未到、外勤超时这几种情况，App 是**故意不打**的：
+     * 「宁可缺卡也不打迟到卡」是用户明确要求的红线。
+     *
+     * 旧实现把它们和其它失败一视同仁：
+     *   · 写一条 FAILURE 日志；
+     *   · 弹一条「⚠️ 打卡失败」高优先级通知；
+     *   · 重排时不标记本班（因为不是 success）→ 补执行窗口内可能再撞一次同样的拒绝。
+     *
+     * 现在单独标记出来：日志记成"已跳过"，通知语气改为解释而非告警，
+     * 并且不再为这一班保留补执行机会（本来就不该打）。
+     */
+    val abandonedByGate: Boolean = false,
 )
 
 /**
@@ -75,6 +92,81 @@ class PunchEngine(private val context: Context) {
         )
 
         /**
+         * 目标时段是否已完成打卡（纯函数，可直接单测）。
+         *
+         * ## 判定口径
+         *
+         * 打卡页顶部有两张状态卡（上班 / 下班），必须只看**目标那张**，
+         * 不能因为「上班已打卡」就认为「下班也打了」。
+         *
+         * 真实文本形态（uiautomator dump 里相邻节点 text 用空格拼接后）：
+         *
+         *     "上班 09:00 已打卡 更新打卡"           ← 已完成
+         *     "上班打卡 下班打卡 09:00"              ← 未完成（只有按钮）
+         *     "上班 09:00 未打卡 下班 18:30 已打卡"   ← 只有下班完成
+         *
+         * ## 为什么窗口是 90 字符而不是 60
+         *
+         * 钉钉不同版本会把「上班 09:30 已打卡 更新打卡 补卡」这组文本
+         * 排得更开，60 字符有时刚好把「已打卡」截在窗外。
+         *
+         * ## 为什么还要截断到下一个班次关键字（关键修正）
+         *
+         * 只取 90 字符窗口会串味：若「上班」后面紧跟「下班 18:30 已打卡」，
+         * 上班卡会被误判成已完成 → 该打的时候不打（漏卡）。
+         * 所以窗口终点取 min(关键字后 90 字符, 下一个对侧关键字位置)。
+         */
+        internal fun isTargetDone(blob: String, kind: PunchKind): Boolean {
+            if (blob.isEmpty()) return false
+
+            val key = when (kind) {
+                PunchKind.CLOCK_IN -> "上班"
+                PunchKind.CLOCK_OUT -> "下班"
+                // 手动打卡不按班次推断：调用方自己决定打哪一班。
+                PunchKind.MANUAL -> return false
+            }
+            val otherKey = if (key == "上班") "下班" else "上班"
+            val window = 90
+
+            var from = 0
+            while (true) {
+                val idx = blob.indexOf(key, from)
+                if (idx < 0) return false
+
+                // 窗口终点 = min(关键字后 90 字符, 下一个"对侧班次关键字")
+                //
+                // 为什么要截到对侧关键字：真实状态卡里
+                // "上班09:30 09:19已打卡 下班18:30 18:30已打卡 更新打卡"
+                // 是连在一起的。若不截断，取"上班"后 90 字符会把
+                // **下班卡**的"已打卡"算成上班卡的完成状态 → 该打时不打。
+                var end = minOf(blob.length, idx + window)
+                val otherIdx = blob.indexOf(otherKey, idx + key.length)
+                if (otherIdx in 0 until end) end = otherIdx
+
+                val slice = blob.substring(idx, end)
+
+                // 【关键】"未打卡"优先排除。
+                //
+                // "未打卡" 不含 "已打卡"，理论上不冲突；但有些钉钉版本会渲染成
+                // "未 打卡"、或用图形+文字混合，显式排除能挡掉一整类误判。
+                if (DingTalkUi.NOT_DONE_SIGNALS.any { slice.contains(it) }) {
+                    from = idx + key.length
+                    continue
+                }
+
+                // 【关键】把"更新打卡"从判定窗口里剔除后再找"已打卡"。
+                //
+                // 真实文案 "18:30已打卡  更新打卡" —— "更新打卡"是"再打一次"的
+                // 入口，不是完成标记。虽然它不含"已打卡"（所以直接 contains 不会
+                // 误命中），但为了后续维护者不踩坑，这里显式声明并剔除。
+                val cleaned = slice.replace("更新打卡", "").replace("打卡记录", "")
+
+                if (DONE_MARKERS.any { cleaned.contains(it) }) return true
+                from = idx + key.length
+            }
+        }
+
+        /**
          * 打卡结果的纯判定函数。
          *
          * ## 为什么抽成纯函数
@@ -95,6 +187,21 @@ class PunchEngine(private val context: Context) {
             blob: String,
             alreadyDoneBefore: Boolean,
             doneNow: Boolean,
+            /**
+             * 本次要打的是哪一班。
+             *
+             * ## 为什么必须传进来（真机踩到的"下班卡被识别成上班卡"）
+             *
+             * 成功文案是**带班次**的：`18:30 下班打卡·成功` / `09:19 上班打卡·成功`。
+             * 旧实现只问 containsSuccess()，谁的成功文案都算数 —— 于是：
+             *   · 页面上残留一条上班卡的成功卡片时，打下班卡会读到它并判成功；
+             *   · 反之亦然。结果就是用户看到"下班卡识别成上班卡"。
+             *
+             * 现在要求：命中的成功文案必须**明确属于**目标班次。
+             * 不带班次的通用文案（如"打卡·成功"）仍然接受，
+             * 因为它们本身就出现在本次操作之后。
+             */
+            kind: PunchKind = PunchKind.MANUAL,
         ): String? {
             // ---- 1. 失败信号优先 ----
             //
@@ -103,9 +210,12 @@ class PunchEngine(private val context: Context) {
             // 也不能报成功让用户以为打上了。
             DingTalkUi.containsFailure(blob)?.let { return null }
 
-            // ---- 2. 明确的成功信号 ----
+            // ---- 2. 明确的成功信号（必须与目标班次一致）----
             // 钉钉弹出的结果卡片文案，这是最可靠的依据。
-            DingTalkUi.containsSuccess(blob)?.let { return it }
+            DingTalkUi.containsSuccess(blob)?.let { signal ->
+                if (successMatchesKind(signal, blob, kind)) return signal
+                // 命中的成功文案属于**另一班**：不能算本次成功，继续往下走。
+            }
 
             // ---- 3. 状态翻转（极速打卡 / 卡片静默更新）----
             //
@@ -118,6 +228,50 @@ class PunchEngine(private val context: Context) {
             }
 
             return null
+        }
+
+        /**
+         * 命中的成功文案是否属于本次要打的那一班。
+         *
+         * ## 判定口径
+         *
+         * 1. 文案里带**具体班次词**时，必须与目标班次一致：
+         *      · 目标是下班卡 → 只接受含「下班」的文案；
+         *      · 目标是上班卡 → 只接受含「上班」的文案。
+         *    出现「上班打卡·成功」而目标是下班 → 判定为**不属于本次**。
+         *
+         * 2. 文案里**没有**任何班次词（如通用的「打卡·成功」）→ 接受。
+         *    这种文案只会出现在本次操作刚完成之后。
+         *
+         * 3. 目标未知（MANUAL 且未指定）→ 不做班次校验，退回旧行为。
+         *
+         * @param signal 命中的成功文案原文
+         * @param blob 整个页面文本（用于判断是否两班都出现过）
+         */
+        internal fun successMatchesKind(
+            signal: String,
+            blob: String,
+            kind: PunchKind,
+        ): Boolean {
+            if (kind == PunchKind.MANUAL) return true
+
+            val signalHasIn = signal.contains("上班")
+            val signalHasOut = signal.contains("下班")
+
+            // 文案自带班次词 → 必须与目标一致
+            if (signalHasIn || signalHasOut) {
+                return when (kind) {
+                    PunchKind.CLOCK_IN -> signalHasIn && !signalHasOut
+                    PunchKind.CLOCK_OUT -> signalHasOut && !signalHasIn
+                    PunchKind.MANUAL -> true
+                }
+            }
+
+            // 文案不带班次词（通用「打卡·成功」）→ 接受。
+            // 但要防止一种脏情况：页面上同时出现两班的成功文案，
+            // 而命中的是通用那条 —— 此时无法区分，仍然接受
+            // （因为通用文案通常就是本次弹出的）。
+            return true
         }
 
         /** 每步最多重试次数（需求 F3.5） */
@@ -189,6 +343,84 @@ class PunchEngine(private val context: Context) {
          * 早退比缺卡严重，宁可晚 2 秒也不能早。
          */
         private const val CLOCK_OUT_SAFETY_MARGIN_MS = 2_000L
+
+        // ==================== 时间红线：唯一实现 ====================
+        //
+        // ## 为什么必须是「唯一实现」
+        //
+        // 这条红线一度被写成两份：
+        //   · checkSafetyGate 里的闸门 1（点击前第一次判定）
+        //   · recheckTimeWindow（外勤等待 15 分钟后复查）
+        //
+        // 两份常量相同但表达式各写各的。任何边界修正只改一处，就会出现
+        // 「第一次放行、复查拒绝」（或反之）的矛盾行为 —— 真机表现就是
+        // 莫名其妙漏打卡，而且日志两边都「看起来对」。
+        //
+        // 现在统一走下面的纯函数。它们不碰 Context、不碰 UI、不读系统时钟，
+        // 全部由调用方注入 now/targetAt，因此可以被单元测试精确钉住边界。
+
+        /** 上班卡可打窗口的下界（target 之前多久允许开始） */
+        internal fun clockInEarliestAt(targetAt: Long): Long =
+            targetAt - PunchSchedule.PRE_WARM_SECONDS * 1000L
+
+        /**
+         * 上班卡可打窗口的上界（过此即停止，避免生成迟到卡）。
+         *
+         * = target + 60s - 5s = target + 55s
+         */
+        internal fun clockInMustStopAt(targetAt: Long): Long =
+            targetAt + LATE_GRACE_MS - LATE_SAFETY_MARGIN_MS
+
+        /** 下班卡最早可打时刻（= target + 2s，绝不提前） */
+        internal fun clockOutEarliestAt(targetAt: Long): Long =
+            targetAt + CLOCK_OUT_SAFETY_MARGIN_MS
+
+        /**
+         * 判定某个时刻能否打某一班（纯函数，唯一真值来源）。
+         *
+         * @return null 表示可以打；否则返回拒绝原因
+         */
+        internal fun timeWindowVerdict(
+            kind: PunchKind,
+            now: Long,
+            targetAt: Long,
+        ): TimeWindowVerdict? {
+            when (kind) {
+                PunchKind.CLOCK_OUT -> {
+                    val allowedAt = clockOutEarliestAt(targetAt)
+                    if (now < allowedAt) {
+                        return TimeWindowVerdict.Early((allowedAt - now) / 1000L)
+                    }
+                }
+
+                PunchKind.CLOCK_IN -> {
+                    val earliestAt = clockInEarliestAt(targetAt)
+                    if (now < earliestAt) {
+                        return TimeWindowVerdict.TooEarlyForClockIn((earliestAt - now) / 1000L)
+                    }
+                    val mustStopAt = clockInMustStopAt(targetAt)
+                    if (now > mustStopAt) {
+                        return TimeWindowVerdict.Late((now - targetAt) / 1000L)
+                    }
+                }
+
+                // 手动打卡由用户主动触发，不套时间闸门（但仍会过外勤闸门）。
+                PunchKind.MANUAL -> Unit
+            }
+            return null
+        }
+    }
+
+    /** 时间窗口判定结果（与 UI/日志文案解耦，便于单测） */
+    sealed interface TimeWindowVerdict {
+        /** 下班时间未到，还差 [remainSec] 秒 */
+        data class Early(val remainSec: Long) : TimeWindowVerdict
+
+        /** 上班时间还没到（预热窗口之外），还差 [aheadSec] 秒 */
+        data class TooEarlyForClockIn(val aheadSec: Long) : TimeWindowVerdict
+
+        /** 已过迟到停手点，已过 [lateSec] 秒 */
+        data class Late(val lateSec: Long) : TimeWindowVerdict
     }
 
     private val trace = mutableListOf<String>()
@@ -209,6 +441,50 @@ class PunchEngine(private val context: Context) {
     suspend fun execute(
         kind: PunchKind,
         wakeLock: PowerManager.WakeLock? = null,
+        /**
+         * 本次调度的**真实目标时刻**（由闹钟 Intent 传入）。
+         *
+         * ## 为什么必须由外部传入（P0 修复）
+         *
+         * 旧实现里安全闸门自己算目标时刻：
+         *
+         *     val targetAt = startOfDay(now) + settings.clockInMinute * 60_000L
+         *
+         * 这有两个致命问题：
+         * 1. **单日临时覆盖（F1）被完全忽略** —— PunchSchedule.Override 只在
+         *    排班计算里生效，闸门压根看不到它，覆盖日会按常规时间去判迟到；
+         * 2. 它把"哪一班"变成了全局推算，而不是"这次闹钟让我打的是哪一班"。
+         *
+         * 现在目标是调度事实（Intent 里的 EXTRA_TARGET_AT），闸门只做判定。
+         * 传 0 时（例如手动打卡）才回退到按设置推算。
+         */
+        targetAt: Long = 0L,
+        /**
+         * 预热模式：把「点亮 → 解锁 → 拉起钉钉 → 进入考勤页」提前做完，
+         * 然后**停在考勤页等目标时刻**，到点只做"过闸门 → 点击 → 确认"。
+         *
+         * ## 为什么必须这样（这是上班卡能不能打成的关键）
+         *
+         * 上班卡的合法窗口是 [target, target + 55s]（迟到边界 60s 减 5s 余量）。
+         * 而这条链路的固定开销是：
+         *
+         *     点亮屏幕   ≤ 4s 轮询
+         *     解锁       0.8s + 最多 3×6s（三次密码尝试）
+         *     硬等钉钉    8s（DINGTALK_WARMUP_MS，需求 F3.4 明确要求）
+         *     就绪轮询   ≤ 20s
+         *     导航点击   每步 6s，最多 3 次尝试
+         *
+         * 真机日志实测：18:30 那次从"开始执行"到"进入考勤页"用了 27.7 秒。
+         * 如果这些都从 target 时刻才开始，55 秒窗口连"还没点到按钮"都撑不住 ——
+         * 上班卡会稳定被自己的闸门拒绝，用户看到的是"已过上班时间…已跳过"。
+         *
+         * 所以 PREWARM（target−75s）必须**真的预热**：
+         * 把 27 秒的开销挪到窗口之外，窗口内只剩下几百毫秒的点击。
+         *
+         * 预热失败也不要紧：FIRE / RETRY 闹钟仍然在系统里（P0-1 已修），
+         * 会各自完整重跑一遍。
+         */
+        holdUntilTarget: Boolean = false,
     ): PunchResult {
         trace.clear()
 
@@ -266,7 +542,10 @@ class PunchEngine(private val context: Context) {
 
             // ---- 3.5 显示接管提示（系统悬浮窗，能在钉钉之上可见）----
             // 从这里开始我们要操作界面了，用户有权知道。
-            ControlHudOverlay.show(
+            //
+            // 【必须判断开关】设置里关掉"屏幕接管提示"后就不能再弹 ——
+            // 之前这里是无条件 show()，开关完全是空转的。
+            if (AppConfig.showControlHud.value) ControlHudOverlay.show(
                 context = context,
                 title = "正在接管屏幕",
                 subtitle = "钉钉GO 正在操作界面",
@@ -316,8 +595,37 @@ class PunchEngine(private val context: Context) {
                 return fail(PunchStage.NAVIGATE, "无法进入考勤打卡页")
             }
 
+            // ---- 5.4 预热：停在考勤页等目标时刻 ----
+            //
+            // 走到这里说明"点亮 / 解锁 / 拉起钉钉 / 进入考勤页"都完成了，
+            // 现在离 target 可能还有几十秒。**先不判闸门**——
+            // 闸门要看时间，提前判必然被判成"距上班时间还有 N 秒"而放弃。
+            //
+            // 这段时间里只做两件事：
+            //   1. 每秒醒一次检查取消（用户可能点了暂停/取消）；
+            //   2. 到点（或已在窗口内）立刻放行。
+            //
+            // 同时守住一条：**绝不在 target 之前点击**。
+            if (holdUntilTarget && targetAt > 0L) {
+                val waitMs = targetAt - System.currentTimeMillis()
+                if (waitMs > 0L) {
+                    log("预热完成，停在考勤页等待目标时刻（还有 " + (waitMs / 1000L) + " 秒）")
+                    // 分段等待，保证暂停/取消能立刻生效
+                    var remaining = waitMs
+                    while (remaining > 0) {
+                        val slice = minOf(remaining, 1_000L)
+                        delay(slice)
+                        remaining -= slice
+                        currentCoroutineContext().ensureActive()
+                    }
+                    log("已到目标时刻，开始点击")
+                } else {
+                    log("预热期间已过目标时刻（超出 " + (-waitMs / 1000L) + " 秒），直接进入点击")
+                }
+            }
+
             // ---- 5.5 安全闸门（绝不能跳过） ----
-            val guard = checkSafetyGate(kind)
+            val guard = checkSafetyGate(kind, targetAt)
             if (guard != null) {
                 return guard
             }
@@ -337,14 +645,23 @@ class PunchEngine(private val context: Context) {
             val alreadyDoneBefore = readTargetDoneState(kind)
             log("点击前基线：目标时段已打卡=" + alreadyDoneBefore)
 
-            // ---- 6. 点击打卡 ----
-            val clicked = clickPunchButton(kind)
-
-            // 极速打卡 / 本来已完成：不需要点击也应该判成功。
-            // 但必须满足"目标时段确实已完成"，不能笼统看到"已打卡"就算。
-            if (!clicked && alreadyDoneBefore) {
+            // ---- 5.95 极速打卡：进页面时就已打好，绝不能再去点 ----
+            //
+            // ## 这是真机上真实发生的情况（用户明确反馈）
+            //
+            // 钉钉自带「极速打卡」：进入考勤页的瞬间它就自己把卡打完了，
+            // 页面上显示「已打卡」+ 打卡时间，**没有可点的按钮**。
+            //
+            // 旧代码把这一步放在点击**之后**：先 clickPunchButton（点了个空），
+            // 再判断 !clicked && alreadyDoneBefore。顺序颠倒带来两个后果：
+            //   1. 明明已经打好了，还要去点一下 —— 点到的可能是状态卡或记录入口；
+            //   2. 判断完又不 return，继续走 verifyResult 等"打卡成功"四个字，
+            //      而极速打卡根本不会弹那个卡片 → 判失败（正是用户看到的现象）。
+            //
+            // 正确顺序：先看基线 → 已完成就直接收工 → 否则才点。
+            if (alreadyDoneBefore) {
                 ControlHudOverlay.hide()
-                val evidence = "极速打卡（无需点击）：目标时段已是已打卡状态"
+                val evidence = "极速打卡（无需点击）：进入考勤页时目标时段已是已打卡状态"
                 log("判定成功，依据: " + evidence)
                 return PunchResult(
                     success = true,
@@ -356,7 +673,25 @@ class PunchEngine(private val context: Context) {
                 )
             }
 
+            // ---- 6. 点击打卡 ----
+            val clicked = clickPunchButton(kind)
+
             if (!clicked) {
+                // 点不到按钮时再确认一次：可能是基线读取与点击之间
+                // 钉钉的极速打卡正好完成（这个时间差在真机上确实存在）。
+                if (readTargetDoneState(kind)) {
+                    ControlHudOverlay.hide()
+                    val evidence = "点击阶段发现目标时段已完成（极速打卡抢先）"
+                    log("判定成功，依据: " + evidence)
+                    return PunchResult(
+                        success = true,
+                        stage = PunchStage.FINISH,
+                        message = "该时段已完成打卡（钉钉极速打卡）",
+                        evidence = evidence,
+                        trace = trace.toList(),
+                        channelUsed = channelUsed,
+                    )
+                }
                 return fail(PunchStage.CLICK, "未找到打卡按钮或点击无效")
             }
 
@@ -661,36 +996,87 @@ class PunchEngine(private val context: Context) {
         }
         channelUsed = "accessibility"
 
-        // ---- 第 1 步：进入工作台 ----
-        if (!tapAndVerify(service, DingTalkUi.TAB_WORK, "工作台 tab")) {
-            log("未能进入工作台，尝试其他路径")
-        }
+        // ==================== 导航顺序（按用户实测的真实路径）====================
+        //
+        // 用户明确说明：**打开钉钉默认在「消息」页，消息页顶部就有一个「打卡」
+        // 快捷入口，点它才是真正的打卡页面。**
+        //
+        // 所以主路径是：消息页顶部「打卡」→ 考勤页。
+        // 旧实现反着来：先进「工作台」→ 找「考勤打卡」应用图标，
+        // 把顶部快捷入口当兜底。真机日志里那句
+        // 「工作台 tab：当前已在考勤页」说明这条链路本来就走得磕磕绊绊。
+        //
+        // 现在的顺序：
+        //   1. 先试顶部「打卡」快捷入口（最短、最稳，正是用户说的那条）；
+        //   2. 不行再走「工作台」→「考勤打卡」；
+        //   3. 都不行返回 false，由调用方降级到 root 通道。
 
-        // ---- 第 2 步：找考勤入口 ----
-        repeat(MAX_RETRY) { attempt ->
-            dismissPopups(service)
+        dismissPopups(service)
 
-            if (tapAndVerify(service, DingTalkUi.ENTRY_ATTENDANCE, "考勤入口")) {
-                log("已进入考勤页")
-                return true
+        // ---- 路径 A：消息页顶部「打卡」快捷入口 ----
+        if (tryQuickPunchEntry(service)) return true
+
+        // ---- 路径 B：工作台 → 考勤打卡 ----
+        if (tapAndVerify(service, DingTalkUi.TAB_WORK, "工作台 tab")) {
+            repeat(MAX_RETRY) { attempt ->
+                dismissPopups(service)
+                if (tapAndVerify(service, DingTalkUi.ENTRY_ATTENDANCE, "考勤入口")) {
+                    log("已通过工作台进入考勤页")
+                    return true
+                }
+                log("首屏未找到考勤入口，滚动查找（第 " + (attempt + 1) + " 次）")
+                service.swipeUp()
+                delay(1200)
             }
-
-            // 页面上没有就滚动找（工作台应用可能不在首屏）
-            log("首屏未找到考勤入口，滚动查找（第 " + (attempt + 1) + " 次）")
-            service.swipeUp()
-            delay(1200)
+        } else {
+            log("未能进入工作台")
         }
 
-        // ---- 第 3 步：兜底，试试首页顶部的"打卡"快捷入口 ----
-        log("工作台路径失败，尝试首页快捷打卡入口")
-        val pkg = service.foregroundPackage()
-        if (pkg == DingTalkUi.PACKAGE) {
-            if (tapAndVerify(service, DingTalkUi.QUICK_PUNCH, "首页打卡快捷入口")) {
-                return true
-            }
-        }
+        // ---- 路径 C：从工作台返回后再试一次顶部快捷入口 ----
+        service.pressBack()
+        delay(800)
+        if (tryQuickPunchEntry(service)) return true
 
         return false
+    }
+
+    /**
+     * 尝试点击消息页顶部的「打卡」快捷入口。
+     *
+     * ## 为什么要单独抽出来
+     *
+     * 这个入口的节点本身常常 **不可点击**（text 挂在内层 TextView 上），
+     * 必须点它的可点击父节点 —— 这正是原注释里记录的坑。
+     * 而且它会和页面上其它含「打卡」字样的元素（打卡记录、打卡提醒）混淆，
+     * 所以匹配要**精确**，不能包含匹配。
+     *
+     * @return true 表示已经进入考勤页
+     */
+    private suspend fun tryQuickPunchEntry(service: PunchAccessibilityService): Boolean {
+        val before = service.readAllText()
+        // 已经在这页了就别再点
+        if (looksLikeAttendancePage(before)) {
+            log("顶部快捷入口：当前已在考勤页")
+            return true
+        }
+
+        // 「打卡」二字太短，用的是精确相等匹配（findClickableByText 第一轮），
+        // 不会命中「打卡记录」「打卡提醒」这类长文案。
+        if (!service.clickByText(DingTalkUi.QUICK_PUNCH)) {
+            log("顶部快捷入口：未找到「打卡」入口")
+            return false
+        }
+        log("顶部快捷入口：已点击「打卡」，等待进入考勤页")
+
+        val entered = waitUntil(15_000L) {
+            looksLikeAttendancePage(service.readAllText())
+        }
+        if (entered) {
+            log("顶部快捷入口：已进入考勤页")
+        } else {
+            log("顶部快捷入口：点击后未进入考勤页")
+        }
+        return entered
     }
 
     /**
@@ -753,16 +1139,99 @@ class PunchEngine(private val context: Context) {
      */
     private fun readTargetDoneState(kind: PunchKind): Boolean {
         val text = runCatching { readCurrentPageText() }.getOrNull().orEmpty()
+
+        // 【联调诊断】确认无障碍到底能不能读到考勤页文本。
+        //
+        // 真机结论（investigator 实测）：打卡页是 UCWebView/H5，
+        // 且中间有每秒跳动的时钟 → uiautomator dump 永远 could not get idle state。
+        // 所以判定**只能**走无障碍实时节点树（主动 rootInActiveWindow 遍历），
+        // 不能走 dump、也不能依赖事件缓存（事件里 Text 常常全空）。
+        //
+        // 这里打长度而不是内容：既不泄露页面内容，又足以判断读通没读通。
+        runCatching {
+            val svc = PunchAccessibilityService.get()
+            val lines = svc?.readTextLines()?.size ?: -1
+            Log.i(
+                TAG,
+                "诊断 a11y: kind=" + kind.name +
+                    " readAllText.len=" + text.length +
+                    " readTextLines.size=" + lines +
+                    " doneMarkers=" + DONE_MARKERS.count { text.contains(it) },
+            )
+        }
+
         if (text.isEmpty()) return false
         return targetAlreadyDone(text, kind)
     }
 
     /** 判断当前页面是否像考勤打卡页 */
+    /**
+     * 当前页面是否像"考勤打卡页"。
+     *
+     * ## 这里曾是整条链路失败的起点（真机定位结论）
+     *
+     * 旧判据有一句 text.contains("考勤打卡")，看似合理，实际必错：
+     *
+     * **消息列表里有一条推送，文案是「考勤打卡: 11-11 考勤全部正常」。**
+     *
+     * 于是：
+     *   1. tapAndVerify 第一步读页面 -> looksLikeAttendancePage 返回 true
+     *      -> 直接认定"当前已在考勤页"，两次点击（工作台 tab、考勤入口）
+     *      **一次都没发生**；
+     *   2. 但页面仍停在消息列表；
+     *   3. 后续时间闸门 / 基线 / 点击 / 判定全部在**错误页面**上执行。
+     *
+     * 真机铁证：18:30 那次日志里的 root 点击打卡按钮 @ 737,785，
+     * 反查消息页 dump，中心点恰为 (737,785) 的节点是
+     *   resource-id = session_content_tv
+     *   text        = "考勤打卡: 11-11 考勤全部正常"
+     * 即它点的是**推送条目**，不是打卡按钮。逐像素吻合。
+     *
+     * ## 现在的判据：只认可考勤页独有的**结构性**证据
+     *
+     * 单靠"某个词出现过"不够，必须出现只有在考勤页才有的组合：
+     *   1. 打卡按钮（上班打卡 / 下班打卡）
+     *   2. 状态卡组合（上班 + 下班 + 已打卡 同现，或出现更新打卡）
+     *   3. 外勤提示（未进入考勤范围 / 可外勤打卡 / 如需内勤打卡）
+     *   4. 班次词 + 打卡记录/补卡
+     */
     private fun looksLikeAttendancePage(text: String): Boolean {
         if (text.isEmpty()) return false
-        return (text.contains("上班打卡") || text.contains("下班打卡")) ||
-            text.contains("考勤打卡") ||
-            text.contains("打卡记录")
+
+        // ---- 先排除消息列表的推送文案 ----
+        // 推送格式是 "考勤打卡: 11-11 考勤全部正常"，特征是「考勤打卡」后紧跟冒号。
+        // 真正的考勤页不会这么写 —— 那里是按钮和状态卡。
+        if (text.contains("考勤打卡:") || text.contains("考勤打卡：")) {
+            val strong = text.contains("上班打卡") || text.contains("下班打卡") ||
+                text.contains("未进入考勤范围") || text.contains("可外勤打卡")
+            if (!strong) {
+                log("疑似消息列表推送（含考勤打卡:），不判定为考勤页")
+                return false
+            }
+        }
+
+        // ---- 强证据 1：打卡按钮 ----
+        if (text.contains("上班打卡") || text.contains("下班打卡")) return true
+
+        // ---- 强证据 2：状态卡组合 ----
+        // 真实状态卡："上班09:30 09:19已打卡 下班18:30 18:30已打卡 更新打卡"
+        val hasIn = text.contains("上班")
+        val hasOut = text.contains("下班")
+        val hasDone = text.contains("已打卡")
+        if (hasIn && hasOut && hasDone) return true
+        if ((hasIn || hasOut) && text.contains("更新打卡")) return true
+
+        // ---- 强证据 3：外勤提示 ----
+        if (text.contains("未进入考勤范围") || text.contains("可外勤打卡") ||
+            text.contains("如需内勤打卡")
+        ) {
+            return true
+        }
+
+        // ---- 弱证据：班次词 + 打卡记录/补卡 ----
+        if ((hasIn || hasOut) && (text.contains("打卡记录") || text.contains("补卡"))) return true
+
+        return false
     }
     /** root 通道：靠 uiautomator dump 解析坐标后 input tap */
     private suspend fun navigateWithRoot(): Boolean {
@@ -778,6 +1247,19 @@ class PunchEngine(private val context: Context) {
             if (xml == null) {
                 log("uiautomator dump 失败")
                 return@repeat
+            }
+
+            // ---- 优先：消息页顶部「打卡」快捷入口（用户实测的真实路径）----
+            val quickNode = UiHierarchy.findNode(xml, DingTalkUi.QUICK_PUNCH)
+            if (quickNode != null) {
+                RootShell.tap(quickNode.centerX, quickNode.centerY)
+                log("root 点击顶部「打卡」入口 @ " + quickNode.centerX + "," + quickNode.centerY)
+                delay(4000)
+                val after = RootShell.dumpUiHierarchy()
+                if (after != null && looksLikeAttendancePage(UiHierarchy.allText(after))) {
+                    log("root 已进入考勤页")
+                    return true
+                }
             }
 
             // 找"工作" tab 并点击
@@ -819,11 +1301,35 @@ class PunchEngine(private val context: Context) {
         }
     }
 
-    /** 点击打卡按钮 */
+    /**
+     * 点击打卡按钮。
+     *
+     * ## 两个必须修的问题
+     *
+     * 1. **候选拼接方向错了**：旧代码是
+     *
+     *        CLOCK_OUT -> BTN_CLOCK_OUT + BTN_CLOCK_IN
+     *
+     *    下班卡的候选列表里塞了上班按钮当兜底。真机上如果页面上
+     *    「下班打卡」不可点（已打完/不在范围），就会去点「上班打卡」，
+     *    可能触发"更新上班卡"之类的错误操作。
+     *    **打下班绝不应该去点上班按钮**，宁可失败。
+     *
+     * 2. **裸 2 字候选危险**：DingTalkUi.BTN_* 里带 "上班"/"下班"，
+     *    而打卡页顶部状态卡文案就是「上班 09:00」，会被当成按钮命中，
+     *    点它的可点击祖先可能跳到打卡记录/详情页。
+     *    这里在调用前把裸 2 字候选过滤掉，只保留 "上班打卡" 这种明确按钮文案。
+     */
     private suspend fun clickPunchButton(kind: PunchKind): Boolean {
-        val candidates = when (kind) {
-            PunchKind.CLOCK_OUT -> DingTalkUi.BTN_CLOCK_OUT + DingTalkUi.BTN_CLOCK_IN
+        val raw = when (kind) {
+            PunchKind.CLOCK_OUT -> DingTalkUi.BTN_CLOCK_OUT
             else -> DingTalkUi.BTN_CLOCK_IN
+        }
+        // 只保留长度 >= 3 的明确按钮文案（"上班打卡" 是 4 字）。
+        val candidates = raw.filter { it.length >= 3 }
+        if (candidates.isEmpty()) {
+            log("打卡按钮候选为空（配置错误）")
+            return false
         }
 
         repeat(MAX_RETRY) { attempt ->
@@ -867,104 +1373,165 @@ class PunchEngine(private val context: Context) {
      *
      * @return null 表示可以打；非 null 表示本次必须中止，返回值即结果
      */
-    private suspend fun checkSafetyGate(kind: PunchKind): PunchResult? {
+    private suspend fun checkSafetyGate(kind: PunchKind, scheduledTargetAt: Long): PunchResult? {
         // ---------- 闸门 1：时间窗口 ----------
         val now = System.currentTimeMillis()
         val settings = AppConfig.settings.value
-        val slot = PunchSchedule.nextSlot(now, settings)
 
-        // 目标时刻：优先用本次调度对应的 slot；手动打卡时用设置里的时间
-        val targetMinute = when (kind) {
-            PunchKind.CLOCK_IN -> settings.clockInMinute
-            PunchKind.CLOCK_OUT -> settings.clockOutMinute
-            PunchKind.MANUAL -> settings.clockInMinute
+        // 目标时刻来源（优先级从高到低）：
+        //   1. 闹钟 / 手动打卡带来的真实 targetAt —— 唯一正确来源；
+        //      - 单日临时覆盖（PunchSchedule.Override）只有这条路径能看到；
+        //      - 手动打卡现在传的是「该班次的计划时刻」，不再传 now，
+        //        否则上班卡窗口 [target-75s, target+55s] 会永远放行（见 MainViewModel）。
+        //   2. MANUAL：没有 targetAt 时沿用 now（MANUAL 本来就不套时间闸门）；
+        //   3. 兜底：按今天的设置时间推算（只应在旧调用方漏传时命中）。
+        val targetAt = when {
+            scheduledTargetAt > 0L -> scheduledTargetAt
+            kind == PunchKind.MANUAL -> now
+            else -> {
+                val startOfDay = PunchSchedule.startOfDay(now)
+                val minute = when (kind) {
+                    PunchKind.CLOCK_OUT -> settings.clockOutMinute
+                    else -> settings.clockInMinute
+                }
+                startOfDay + minute * 60_000L
+            }
         }
-
-        // 计算「目标时刻」的毫秒值（同一天）
-        val startOfDay = PunchSchedule.startOfDay(now)
-        val targetAt = startOfDay + targetMinute * 60_000L
         val deltaMs = now - targetAt
 
         log(
             "安全闸门：kind=" + kind.name +
-                " 目标=" + PunchSchedule.formatMinute(targetMinute) +
-                " 偏差=" + (deltaMs / 60_000L) + "分钟"
+                " 目标=" + PunchSchedule.formatTime(targetAt) +
+                " 偏差=" + (deltaMs / 1000L) + "秒"
         )
 
-        when (kind) {
-            PunchKind.CLOCK_OUT -> {
-                // ===== 【红线 1】下班卡：目标时刻之前一律不打 =====
-                //
-                // 早退记录比缺卡严重：缺卡还能补卡申请，早退直接影响全勤。
-                // 这里额外留 CLOCK_OUT_SAFETY_MARGIN_MS，
-                // 避免"恰好在 18:29:59.8 判定通过、18:30:00.2 点击生效"这种跨界。
-                val allowedAt = targetAt + CLOCK_OUT_SAFETY_MARGIN_MS
-                if (now < allowedAt) {
-                    val remainSec = (allowedAt - now) / 1000L
-                    val remainText = if (remainSec >= 60) {
-                        (remainSec / 60) .toString() + " 分 " + (remainSec % 60) + " 秒"
-                    } else {
-                        remainSec.toString() + " 秒"
-                    }
-                    log("拒绝：下班时间未到，还差 " + remainText)
-                    return PunchResult(
-                        success = false,
-                        stage = PunchStage.CLICK,
-                        message = "距下班时间还有 " + remainText + "，已阻止提前打下班卡",
-                        trace = trace.toList(),
-                        channelUsed = channelUsed,
-                    )
+        // 走唯一实现判定（见 companion 里的 timeWindowVerdict）。
+        // 这里的职责只剩「把判定结果翻译成 PunchResult」。
+        when (val verdict = timeWindowVerdict(kind, now, targetAt)) {
+            null -> log("时间窗校验通过（kind=" + kind.name + "）")
+
+            is TimeWindowVerdict.Early -> {
+                val remainText = if (verdict.remainSec >= 60) {
+                    (verdict.remainSec / 60).toString() + " 分 " + (verdict.remainSec % 60) + " 秒"
+                } else {
+                    verdict.remainSec.toString() + " 秒"
                 }
-                log("下班卡时间窗校验通过（已过目标 " + (now - targetAt) / 1000L + " 秒）")
-            }
-
-            PunchKind.CLOCK_IN -> {
-                // ===== 【红线 2】上班卡：迟到边界前必须停手 =====
-                //
-                // 用户规格：
-                //   - 09:30:00 ~ 09:30:59 算正常（满 1 分钟才算迟到）；
-                //   - 要预留安全余量，不能卡在 58/59 秒。
-                //
-                // 实现：可打窗口 = [targetAt, targetAt + 60s - 5s] = 55 秒宽。
-                // 超过 09:30:55 就拒绝，而不是等到 09:31 才拒绝。
-                val lateBoundary = targetAt + LATE_GRACE_MS
-                val mustStopAt = lateBoundary - LATE_SAFETY_MARGIN_MS
-
-                if (now > mustStopAt) {
-                    val lateMin = (now - targetAt) / 60_000L
-                    val lateSec = ((now - targetAt) / 1000L) % 60
-                    val lateText = if (lateMin > 0) {
-                        lateMin.toString() + " 分 " + lateSec + " 秒"
-                    } else {
-                        lateSec.toString() + " 秒"
-                    }
-                    log("拒绝：已超迟到边界 " + lateText + "，避免生成迟到卡")
-                    return PunchResult(
-                        success = false,
-                        stage = PunchStage.CLICK,
-                        message = "已过上班时间 " + lateText +
-                            "（迟到边界 1 分钟，留 5 秒安全余量），为避免迟到记录已跳过。" +
-                            "如需打卡请手动操作。",
-                        trace = trace.toList(),
-                        channelUsed = channelUsed,
-                    )
-                }
-
-                val remainToBoundaryMs = mustStopAt - now
-                log(
-                    "上班卡时间窗校验通过（距停手还有 " +
-                        (remainToBoundaryMs / 1000L) + " 秒）"
+                log("拒绝：下班时间未到，还差 " + remainText)
+                return PunchResult(
+                    success = false,
+                    stage = PunchStage.CLICK,
+                    message = "距下班时间还有 " + remainText + "，已阻止提前打下班卡",
+                    trace = trace.toList(),
+                    channelUsed = channelUsed,
+                    abandonedByGate = true,
                 )
             }
 
-            PunchKind.MANUAL -> {
-                // 手动打卡由用户主动触发，不套时间闸门（但要过外勤闸门）
-                log("手动打卡：跳过时间闸门（仍会检查外勤）")
+            is TimeWindowVerdict.TooEarlyForClockIn -> {
+                log("拒绝：离上班时间还差 " + verdict.aheadSec + " 秒（预热窗口之外），不提前打卡")
+                return PunchResult(
+                    success = false,
+                    stage = PunchStage.CLICK,
+                    message = "距上班时间还有 " + verdict.aheadSec + " 秒，已阻止提前打上班卡",
+                    trace = trace.toList(),
+                    channelUsed = channelUsed,
+                    abandonedByGate = true,
+                )
+            }
+
+            is TimeWindowVerdict.Late -> {
+                val lateMin = verdict.lateSec / 60
+                val lateRestSec = verdict.lateSec % 60
+                val lateText = if (lateMin > 0) {
+                    lateMin.toString() + " 分 " + lateRestSec + " 秒"
+                } else {
+                    lateRestSec.toString() + " 秒"
+                }
+                log("拒绝：已超迟到边界 " + lateText + "，避免生成迟到卡")
+                return PunchResult(
+                    success = false,
+                    stage = PunchStage.CLICK,
+                    message = "已过上班时间 " + lateText +
+                        "（迟到边界 1 分钟，留 5 秒安全余量），为避免迟到记录已跳过。" +
+                        "如需打卡请手动操作。",
+                    trace = trace.toList(),
+                    channelUsed = channelUsed,
+                    abandonedByGate = true,
+                )
             }
         }
 
         // ---------- 闸门 2：外勤检查（需要读界面，可能要等） ----------
-        return waitUntilInRange(kind)
+        val outdoorVerdict = waitUntilInRange(kind)
+        if (outdoorVerdict != null) return outdoorVerdict
+
+        // ---------- 闸门 3：等待结束后**必须重新过一遍时间闸门** ----------
+        //
+        // ## 这是一个真实的漏卡/打错卡漏洞
+        //
+        // 外勤等待最长 15 分钟（OUTDOOR_WAIT_TOTAL_MS）。旧实现里：
+        //
+        //     闸门1 时间窗（此刻 09:30:10 通过）
+        //       → 闸门2 外勤等待（一直等到 09:44）
+        //       → 返回 null（可以打）→ 直接点击
+        //
+        // 也就是说：时间闸门只判了**进入等待之前**的那一刻。
+        // 09:30 目标、09:44 才走出地铁进公司范围 —— 仍然会去打，
+        // 生成一张迟到卡。这正好击穿「宁可缺卡也不打迟到卡」的红线。
+        //
+        // 同样地，下班卡等 15 分钟本来没问题（越等越晚），
+        // 但上班卡的 55 秒窗口根本撑不住这种等待。
+        //
+        // 所以这里用等待结束后的真实时间**再判一次**，语义与首次完全一致。
+        return recheckTimeWindow(kind, targetAt)
+    }
+
+    /**
+     * 时间窗复查（纯判定，不涉及界面）。
+     *
+     * 与 [checkSafetyGate] 里的闸门 1 完全同口径 ——
+     * 因为它们本来就该是同一套规则，只是执行时刻不同。
+     */
+    private fun recheckTimeWindow(kind: PunchKind, targetAt: Long): PunchResult? {
+        val now = System.currentTimeMillis()
+
+        when (kind) {
+            PunchKind.CLOCK_OUT -> {
+                val allowedAt = targetAt + CLOCK_OUT_SAFETY_MARGIN_MS
+                if (now < allowedAt) {
+                    val remainSec = (allowedAt - now) / 1000L
+                    log("外勤等待后复查：下班时间仍未到（还差 " + remainSec + " 秒），放弃")
+                    return PunchResult(
+                        success = false,
+                        stage = PunchStage.CLICK,
+                        message = "距下班时间还有 " + remainSec + " 秒，已阻止提前打下班卡",
+                        trace = trace.toList(),
+                        channelUsed = channelUsed,
+                        abandonedByGate = true,
+                    )
+                }
+            }
+
+            PunchKind.CLOCK_IN -> {
+                val mustStopAt = targetAt + LATE_GRACE_MS - LATE_SAFETY_MARGIN_MS
+                if (now > mustStopAt) {
+                    val lateSec = (now - targetAt) / 1000L
+                    log("外勤等待后复查：已超出迟到停手点 " + lateSec + " 秒，放弃本次打卡")
+                    return PunchResult(
+                        success = false,
+                        stage = PunchStage.CLICK,
+                        message = "外勤等待期间已越过迟到边界（已过 " + lateSec +
+                            " 秒），为避免生成迟到记录已跳过。如需打卡请手动操作。",
+                        trace = trace.toList(),
+                        channelUsed = channelUsed,
+                        abandonedByGate = true,
+                    )
+                }
+            }
+
+            PunchKind.MANUAL -> Unit
+        }
+        return null
     }
 
     /**
@@ -1005,7 +1572,7 @@ class PunchEngine(private val context: Context) {
                         success = true,
                         stage = PunchStage.FINISH,
                         message = "今日该时段已打过卡，跳过重复打卡",
-                        evidence = signal,
+                        evidence = "考勤页显示目标时段已完成：" + signal,
                         trace = trace.toList(),
                         channelUsed = channelUsed,
                     )
@@ -1028,6 +1595,7 @@ class PunchEngine(private val context: Context) {
                         (waitedMs / 60_000L) + " 分钟后放弃，未生成外勤记录",
                     trace = trace.toList(),
                     channelUsed = channelUsed,
+                    abandonedByGate = true,
                 )
             }
 
@@ -1053,31 +1621,8 @@ class PunchEngine(private val context: Context) {
      * 打卡页顶部有两张状态卡（上班 09:30 / 下班 18:30）。
      * 必须只看**目标那张**，不能因为"上班已打"就认为"下班也打了"。
      */
-    private fun targetAlreadyDone(blob: String, kind: PunchKind): Boolean {
-        val key = when (kind) {
-            PunchKind.CLOCK_IN -> "上班"
-            PunchKind.CLOCK_OUT -> "下班"
-            // 手动打卡时按"当前该打哪一班"推断，不能一律 false ——
-            // 否则手动打卡永远无法走"极速打卡已完成"的判定。
-            PunchKind.MANUAL -> return false
-        }
-
-        // 形如 "上班09:30 09:30已打卡"：找到目标关键字后，
-        // 看其后一小段窗口里有没有完成标记。
-        //
-        // 窗口取 90 字符而不是 60：钉钉在不同版本里会把
-        // "上班 09:30 已打卡 更新打卡 补卡" 这类文本排得更开，
-        // 60 字符有时刚好把"已打卡"截在窗外。
-        var from = 0
-        while (true) {
-            val idx = blob.indexOf(key, from)
-            if (idx < 0) return false
-            val end = minOf(blob.length, idx + 90)
-            val window = blob.substring(idx, end)
-            if (DONE_MARKERS.any { window.contains(it) }) return true
-            from = idx + key.length
-        }
-    }
+    private fun targetAlreadyDone(blob: String, kind: PunchKind): Boolean =
+        isTargetDone(blob, kind)
 
 
     /** 读取当前页面文本（无障碍优先，root 兜底） */
@@ -1114,6 +1659,19 @@ class PunchEngine(private val context: Context) {
     private suspend fun verifyResult(kind: PunchKind, alreadyDoneBefore: Boolean): String? {
         val service = PunchAccessibilityService.get()
 
+        // 【关键】记录点击时刻，并且把"点击之前"的历史文本丢掉重新开始记。
+        //
+        // 旧实现直接读 recentTextBlob()（32 条历史事件的累积），
+        // 只在整个 execute() 开头清空一次。后果很严重：
+        //   · 本次运行中只要某一瞬间出现过"网络异常"/"定位失败"，
+        //     containsFailure() 一票否决 → 之后**即使打成功也永远判失败**，
+        //     三次重试全部无效；
+        //   · 反向也成立：历史里残留的"打卡成功"可能顶替本次证据，
+        //     没打上也报成功（这是最坏的一种 bug）。
+        //
+        // 现在点击完成的那一刻清空历史，只让"点击之后"的界面事件参与判定。
+        service?.resetEventHistoryOnly()
+
         repeat(MAX_RETRY) { attempt ->
             delay(1500)
 
@@ -1137,7 +1695,7 @@ class PunchEngine(private val context: Context) {
             val doneNow = readTargetDoneState(kind)
 
             // 判定逻辑本身是纯函数（judgeResult），这里只负责取证与重试。
-            judgeResult(blob, alreadyDoneBefore, doneNow)?.let { evidence ->
+            judgeResult(blob, alreadyDoneBefore, doneNow, kind)?.let { evidence ->
                 if (evidence.contains("未打卡变为已打卡")) {
                     log("判定依据：状态翻转")
                 }

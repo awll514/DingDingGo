@@ -52,46 +52,37 @@ class PunchAlarmReceiver : BroadcastReceiver() {
 
         Log.i(TAG, "alarm fired action=" + action + " kind=" + kindName)
 
+        // ==================== 这里**不再重排闹钟**（P0 修复）====================
+        //
+        // ## 旧实现的致命问题
+        //
+        // 旧代码在 onReceive 里"先 startService 再 scheduleNext"，后来又改成
+        // "先 markJustFired + scheduleNext 再 startService"，并且整段 when 被
+        // 复制了两遍（每次闹钟 startService 两次）。但真正的致命点不是顺序：
+        //
+        //   PREWARM 在 target-75s 触发 → markJustFired(target) →
+        //   scheduleNext 认为"这一班已经处理过" → 算出下一班（下班卡）→
+        //   render() 先 cancelAll(readLastScheduled()) →
+        //   **把同一 targetAt 的 FIRE 和 RETRY 一起取消了**。
+        //
+        // 结果：三段闹钟实际退化成"一个凭空等待 75 秒的前台服务"。这 75 秒里
+        // 进程一旦被 HyperOS 回收，打卡静默失败、连兜底都没有。因为服务自己
+        // 会执行打卡，表面功能正常，所以真机上一路都没暴露。
+        //
+        // ## 现在的分工
+        //
+        //   · 接收器：**只**负责把服务拉起来，不碰闹钟；
+        //   · 服务：在执行结束（成功/失败/取消）后统一调用
+        //     AlarmScheduler.onPunchFinished() 重排下一班。
+        //
+        // 好处：
+        //   1. PREWARM 之后 FIRE / RETRY 依然在系统里，兜底链路完整；
+        //   2. 重排发生在本班真正结束之后，天然不会自激；
+        //   3. 只有一个重排入口，不会出现"谁先谁后"的竞争。
         when {
             action.endsWith("PREWARM") -> {
-                // 预热闹钟：提前 75 秒，先在后台把屏幕点亮、把服务拉起来做准备
-                startService(context, kind, targetAt, prewarm = true)
-            }
-
-            action.endsWith("FIRE") -> {
-                // 主闹钟：真正的打卡执行点
-                startService(context, kind, targetAt, prewarm = false)
-            }
-
-            action.endsWith("RETRY") -> {
-                // 补执行：目标时间后 120 秒内的最后机会
-                startService(context, kind, targetAt, prewarm = false)
-            }
-        }
-
-        // 先重排下一个打卡点的闹钟，**再**启动服务。
-        //
-        // 顺序很关键。原来的顺序是 startService 之后立刻 scheduleNext，
-        // 但 scheduleNext 是一个纯计算的同步调用，而启动服务是异步的；
-        // 两者之间没有因果依赖，却被放在了有竞争的位置：
-        //   - 若服务在这一行之前就跑完并 stopSelf，render() 内部
-        //     readLastScheduled() 读到的可能已经是 cancelAll 清空后的 null，
-        //     新的三段闹钟排不上；
-        //   - 更麻烦的是重排本身：PunchSchedule.nextSlot 在补执行窗口内
-        //     会把 **同一班次** 当成"下一次打卡"返回（effectiveTrigger=now），
-        //     于是每次触发都把同一个槽位重排一遍。假如 FIRE 因为
-        //     "已有执行在进行" 被忽略，就会形成
-        //     FIRE → 重排 FIRE → FIRE … 的自激循环，一直到窗口耗尽。
-        //
-        // 这里把重排提前，并且在重排前把"刚刚触发过的这一班"标成已处理，
-        // 让 scheduleNext 直接跳过它（详见 AlarmScheduler.markJustFired）。
-        AlarmScheduler.markJustFired(targetAt, kind)
-        runCatching { AlarmScheduler.scheduleNext(context) }
-            .onFailure { Log.w(TAG, "重排闹钟失败: " + it.javaClass.simpleName) }
-
-        when {
-            action.endsWith("PREWARM") -> {
-                // 预热闹钟：提前 75 秒，先在后台把屏幕点亮、把服务拉起来做准备
+                // 预热闹钟：提前 75 秒。服务会在这段时间里把"点亮屏幕 → 解锁 →
+                // 拉起钉钉 → 进入考勤页"全部做完，到点只点一下按钮。
                 startService(context, kind, targetAt, prewarm = true)
             }
 

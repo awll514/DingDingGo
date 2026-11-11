@@ -94,12 +94,20 @@ fun SettingsRow(
 ) {
     val colors = GlassTheme.colors
 
+    // 【顺序必须是 padding 在前、clickable 在后】
+    //
+    // Modifier 链是按顺序包裹的：写在 clickable 之后的 padding 属于**内层**，
+    // 也就是说可点击区域只覆盖内容，两侧 16dp 与上下 13dp 的留白点不动。
+    // 真机上表现为「点这一行的边缘 / 空白处没反应」，
+    // 设置页里「锁屏密码」这种重要入口因此很难点开。
+    //
+    // 正确顺序：先 padding 撑出整行高度，再 clickable 覆盖整行（含留白）。
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .then(if (onClick != null) Modifier.ClickableNoRipple(onClick = onClick) else Modifier)
             // Apple 列表行：内边距 16dp，行高由内容决定但通常 48-56dp
-            .padding(horizontal = 16.dp, vertical = 13.dp),
+            .padding(horizontal = 16.dp, vertical = 13.dp)
+            .then(if (onClick != null) Modifier.ClickableNoRipple(onClick = onClick) else Modifier),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(Modifier.weight(1f)) {

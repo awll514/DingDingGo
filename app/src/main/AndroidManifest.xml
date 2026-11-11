@@ -23,6 +23,19 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <!-- 通知 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!--
+      震动。
+
+      【为什么必须显式声明】PunchNotifier.playCompletionFeedback() 里调
+      vibrator.vibrate(...) 做代码级触觉反馈（验收标准 7：震动不能只依赖
+      通知渠道）。但 Android 的 VIBRATE 是**普通权限**，没有它时
+      Vibrator.vibrate() 会直接抛 SecurityException，而不是静默返回 0 ——
+      而调用点外面套着 runCatching，异常被吞掉，于是"震动反馈"实际从未发生，
+      而且完全不报错、看不出来。
+
+      合并后的 manifest 里缺这一条，就等于验收标准 7 只完成了一半。
+    -->
+    <uses-permission android:name="android.permission.VIBRATE" />
     <!-- 忽略电池优化 -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <!-- 查询包是否安装（钉钉检测） -->
@@ -71,14 +84,26 @@
             </intent-filter>
         </receiver>
 
-        <!-- 开机等系统事件 -->
+        <!--
+          开机等系统事件。
+
+          【为什么没有 LOCKED_BOOT_COMPLETED】
+          那个广播只在**直接启动（direct boot）**阶段发出，要求 receiver 声明
+          android:directBootAware="true" 且只访问设备加密（device-encrypted）存储。
+          本应用两点都不满足：
+            · 这里显式写了 directBootAware="false"；
+            · AppConfig 用 EncryptedSharedPreferences（凭据加密存储），
+              direct boot 阶段根本读不到密钥。
+          所以它是一条**永远不可能被投递**的声明 —— 留着只会让人误以为
+          我们支持直接启动阶段恢复闹钟，属于误导性配置，删掉。
+          开机恢复只靠 BOOT_COMPLETED（此时用户已解锁，凭据加密存储可用）。
+        -->
         <receiver
             android:name=".exec.BootReceiver"
             android:exported="true"
             android:directBootAware="false">
             <intent-filter android:priority="1000">
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
-                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
                 <action android:name="android.intent.action.TIME_SET" />
                 <action android:name="android.intent.action.TIMEZONE_CHANGED" />
@@ -102,16 +127,24 @@
         <!--
           心跳接收器。
 
-          exported=true 是为了让 adb 能发 TEST_ISLAND 做真机验证；
-          同时它只响应两个自定义 action，没有数据泄露风险
-          （不接收系统敏感广播，也不导出任何数据）。
+          【为什么 exported=false】
+          心跳闹钟由 AlarmManager 直接投递 PendingIntent —— 显式 Intent
+          由系统代替我们投递，不经过 exported 检查，所以 exported=false
+          完全不影响功能。
 
-          心跳闹钟由 AlarmManager 直接投递 PendingIntent，
-          即使 exported=false 也能收到 —— 这里是纯粹的测试便利。
+          改成 false 是为了收窄攻击面：exported=true 时，任何第三方 App
+          都能给它发这个 action，反复拉起我们的进程（等于给外部提供了一个
+          "免权限唤醒"的把手），与「后台零消耗」相悖。
+
+          【真机验证怎么办】
+          不需要 exported。adb 的 -n 直接指定组件名时同样能投递到
+          exported=false 的组件（adb shell 有 BROADCAST 权限）：
+              adb shell am broadcast -n com.redmi.autoattend/.exec.HeartbeatReceiver \
+                  -a com.redmi.autoattend.action.HEARTBEAT
         -->
         <receiver
             android:name=".exec.HeartbeatReceiver"
-            android:exported="true">
+            android:exported="false">
             <intent-filter>
                 <action android:name="com.redmi.autoattend.action.HEARTBEAT" />
             </intent-filter>

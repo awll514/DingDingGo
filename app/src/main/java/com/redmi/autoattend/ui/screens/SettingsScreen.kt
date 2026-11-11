@@ -70,7 +70,7 @@ fun SettingsScreen(
     onSavePassword: (String) -> Result<Unit>,
     onClearPassword: () -> Unit,
     onFixPermission: (String) -> Unit,
-    onTestNotification: (Boolean) -> Unit,
+
     onRecheckRoot: () -> Unit,
     onClearLogs: () -> Unit,
     onThemeChange: (ThemeMode) -> Unit,
@@ -349,44 +349,7 @@ fun SettingsScreen(
                 )
             }
 
-            // 【自检入口】不打卡也能验证悬浮窗能否显示。
-            //
-            // 用户反馈过"操控屏幕运行时没看见悬浮窗"，
-            // 但正常触发悬浮窗必须走一次真实打卡 —— 代价太高。
-            // 这个按钮只是把提示条显示 3 秒然后自动收起，不碰任何打卡逻辑。
-            SettingsDivider()
-            SettingsRow(
-                title = "测试悬浮窗",
-                subtitle = if (canOverlay) {
-                    "显示提示条 3 秒后自动收起，不会打卡"
-                } else {
-                    "需要先授予上面的悬浮窗权限"
-                },
-                danger = false,
-                onClick = {
-                    if (canOverlay) {
-                        com.redmi.autoattend.exec.ControlHudOverlay.showForTest(context)
-                    } else {
-                        openOverlaySettings(context)
-                    }
-                },
-            )
 
-            SettingsDivider()
-            SettingsRow(
-                title = "测试结果提示",
-                subtitle = "依次演示成功 / 失败 / 迟到三种状态，各显示 3 秒",
-                danger = false,
-                onClick = {
-                    if (canOverlay) {
-                        com.redmi.autoattend.exec.ControlHudOverlay.testStatus(context)
-                    } else {
-                        openOverlaySettings(context)
-                    }
-                },
-            )
-
-            SettingsDivider()
             // 常驻通知开关：
             // 关掉后保活服务仍然运行，只是通知栏不留那一行。
             var showPersistent by remember {
@@ -411,18 +374,7 @@ fun SettingsScreen(
                     )
                 },
             )
-            SettingsDivider()
-            SettingsRow(
-                title = "测试成功通知",
-                subtitle = "发一条成功样例，检查通知能否到达",
-                onClick = { onTestNotification(true) },
-            )
-            SettingsDivider()
-            SettingsRow(
-                title = "测试失败通知",
-                subtitle = "发一条带「立即重试」按钮的告警样例",
-                onClick = { onTestNotification(false) },
-            )
+
         }
 
         Spacer(Modifier.height(18.dp))

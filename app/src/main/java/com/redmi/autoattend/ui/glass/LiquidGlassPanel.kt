@@ -6,6 +6,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.BoxScope
 import com.kyant.backdrop.drawBackdrop
 import com.kyant.backdrop.effects.blur
+import com.kyant.backdrop.effects.effect
 import com.kyant.backdrop.effects.lens
 import com.kyant.backdrop.effects.vibrancy
 import com.kyant.backdrop.highlight.Highlight
@@ -21,6 +22,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.asComposeRenderEffect
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalDensity
@@ -122,6 +124,50 @@ fun LiquidGlassPanel(
     onClick: (() -> Unit)? = null,
     sampleOffsetX: Float = 0.35f,
     sampleOffsetY: Float = 0.25f,
+    /**
+     * 是否启用**方向性光学效果**（vibrancy 提亮 + lens 边缘折射）。
+     *
+     * ## 为什么需要这个开关（用户反馈"模糊上面强下面弱"）
+     *
+     * `lens()` 的折射只作用在**边缘带**（默认 8dp）：它把面板外面的像素
+     * 向内拉伸。于是面板**四周一圈**都比中间更"实"——
+     * 因为边缘采到的是未被模糊的外部原始内容。
+     *
+     * `vibrancy()` 同样带方向性：它按亮度做非线性提亮，
+     * 顶部亮、底部暗的背景会被拉出上下差异。
+     *
+     * 对**卡片**来说这是优点（有玻璃厚度感）；
+     * 但对**底栏**这种横向长条，顶部边缘和底部边缘的"厚度"占比不同，
+     * 视觉上就是"上面糊得厉害、下面却没糊"。
+     *
+     * 关掉后只剩 blur + tint：模糊强度在整个面板内**均匀**，
+     * 这也更接近 iOS 底栏的真实观感（iOS 底栏是均匀磨砂，不做透镜）。
+     */
+    directionalOptics: Boolean = true,
+    /**
+     * 用**系统 RenderEffect** 对采样结果做模糊；null 表示不加。
+     *
+     * ## 为什么需要它（真机实测，别再试库内的 blur）
+     *
+     * 库内的 `effects { blur(r) }` 在本机**完全不生效**：
+     * 把 blurRadius 从 8dp 一路调到 200dp，同一位置的像素 stdev
+     * 始终在 8 附近（甚至轻微升高），背后文字一直清晰可读。
+     *
+     * 原因是它走 AGSL 采样管线，和 HANDOVER.md 里记录的
+     * 「AGSL blurRadius 在本机不生效」是同一个限制。
+     *
+     * 但同一台机器上，系统的 `RenderEffect.createBlurEffect` **完全有效**。
+     * 库恰好提供了 `effects.effect(...)` 这个入口，
+     * 可以把一个 Compose RenderEffect 送进**采样管线内部** ——
+     * 于是模糊只作用于「玻璃采到的那份画面」，
+     * 屏幕上显示的内容完全不受影响。
+     *
+     * ## 为什么不能像之前那样挂在 graphicsLayer 上
+     *
+     * 那个做法会连带把**可见图层**一起糊掉（实测整屏发虚）。
+     * 而 effect() 作用在采样阶段，是「只糊玻璃背后」，二者本质不同。
+     */
+    systemBlur: Dp? = null,
     content: @Composable BoxScope.() -> Unit,
 ) {
     val colors = GlassTheme.colors
@@ -194,9 +240,41 @@ fun LiquidGlassPanel(
                     // 之前我把 vibrancy 放在最后，模糊被前面的效果覆盖掉了。
 
                     // 提亮：让玻璃比背景亮一档
-                    vibrancy()
-                    // 模糊：这才是"看不清背后文字"的关键
+                    //
+                    // 方向性开关关闭时不加 —— vibrancy 按亮度非线性提亮，
+                    // 会让上亮下暗的背景产生可见的上下差。
+                    if (directionalOptics) vibrancy()
+                    // 模糊：这才是"看不清背后文字"的关键。
+                    //
+                    // 【注意】这一行在本机**不生效**（见 systemBlur 的注释），
+                    // 保留它是为了在其它走 AGSL 成功的设备上仍有正确的观感；
+                    // 本机真正的模糊由下面的 effect(...) 承担。
                     blur(with(density) { blurRadius.toPx() })
+
+                    // 系统 RenderEffect 模糊：本机唯一真正生效的模糊。
+                    //
+                    // 作用在**采样管线内部**，只糊「玻璃背后采到的画面」，
+                    // 屏幕上显示的内容不受任何影响。
+                    //
+                    // 调用顺序放在 blur 之后、lens 之前：
+                    //   · 先糊掉细节，再让 lens 对已柔化的画面做折射，
+                    //     边缘不会把外部高对比笔画整段吸进来（那正是"脏边"的来源）；
+                    //   · 如果放在 lens 之后，折射会先把锐利内容拉进来再糊，
+                    //     边缘会留下一圈清晰的鬼影。
+                    if (systemBlur != null &&
+                        android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S
+                    ) {
+                        val px = with(density) { systemBlur.toPx() }
+                        effect(
+                            android.graphics.RenderEffect
+                                .createBlurEffect(
+                                    px,
+                                    px,
+                                    android.graphics.Shader.TileMode.CLAMP,
+                                )
+                                .asComposeRenderEffect(),
+                        )
+                    }
                     // 折射：两个参数都是**像素尺寸**，不是强度系数。
                     // 官方底栏用 24dp / 24dp。
                     // 折射：两个参数都是**像素尺寸**，不是强度系数。
@@ -209,10 +287,17 @@ fun LiquidGlassPanel(
                     //
                     // 折射位移越小，被拉进来的内容越靠近面板内部（那里已经被模糊过），
                     // 边缘就越干净。8dp 仍有明显的透镜感，但不会把外部黑字整段吸进来。
-                    lens(
-                        with(density) { 8.dp.toPx() },
-                        with(density) { 8.dp.toPx() },
-                    )
+                    // 方向性开关关闭时不加 lens。
+                    //
+                    // lens 只作用在边缘带，会把外部未模糊的原始内容向内拉，
+                    // 于是面板四周一圈比中间更锐利 —— 横向长条（底栏）尤其明显，
+                    // 表现为"上面强下面弱"。
+                    if (directionalOptics) {
+                        lens(
+                            with(density) { 8.dp.toPx() },
+                            with(density) { 8.dp.toPx() },
+                        )
+                    }
                 },
                 highlight = {
                     Highlight.Default.copy(

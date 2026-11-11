@@ -91,7 +91,17 @@ object HealthCheck {
         )
 
         // 3. 无障碍服务
-        val accOk = PunchAccessibilityService.isReady()
+        //
+        // 【必须双判据】只查 PunchAccessibilityService.isReady()（= 进程内 instance
+        // 是否为 null）是不够的：
+        //   · 重装 App 后系统已重新绑定服务，但 activity/进程可能还没走到
+        //     onServiceConnected，instance 仍是 null；
+        //   · 反过来，服务被系统停掉但进程还在时，instance 也可能是旧值。
+        // 结果是首页健康度显示「未开启」，而系统里其实是开着的 —— 用户在
+        // 设置页点「去设置」会发现已经开了，只会更困惑。
+        //
+        // 所以：进程内实例 **或** 系统无障碍列表里包含本服务，任一成立即视为在线。
+        val accOk = PunchAccessibilityService.isReady() || isAccessibilityServiceEnabled(context)
         items.add(
             Item(
                 key = "accessibility",
@@ -203,10 +213,33 @@ object HealthCheck {
 
     // ---------- 单项查询 ----------
 
+    /**
+     * 通知权限是否可用。
+     *
+     * ## 为什么要两个判据（真机踩到）
+     *
+     * 只查 NotificationManager.areNotificationsEnabled() 在 HyperOS 上会误报「已关闭」：
+     * 实测 `dumpsys package ... POST_NOTIFICATIONS: granted=true` 的同时，
+     * 该 API 仍可能返回 false（权限刚授予、或系统侧通知总开关与 App 权限分别记账）。
+     *
+     * 用户看到「通知权限 已关闭」，点「去设置」却发现是开着的 —— 只会更困惑。
+     *
+     * 所以：运行时权限已授予 **或** 通知渠道未被关闭，任一成立即视为可用。
+     * （两者都为假才是真的不能发通知。）
+     */
     fun notificationEnabled(context: Context): Boolean {
-        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE)
-            as android.app.NotificationManager
-        return nm.areNotificationsEnabled()
+        val granted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+        } else {
+            true
+        }
+        val channelOn = runCatching {
+            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE)
+                as android.app.NotificationManager
+            nm.areNotificationsEnabled()
+        }.getOrDefault(false)
+        return granted || channelOn
     }
 
     fun isIgnoringBatteryOptimizations(context: Context): Boolean {
@@ -217,6 +250,34 @@ object HealthCheck {
     fun isDingTalkInstalled(context: Context): Boolean = runCatching {
         context.packageManager.getPackageInfo("com.alibaba.android.rimet", 0)
         true
+    }.getOrDefault(false)
+    /**
+     * 系统层面是否已启用本应用的**无障碍服务**（不依赖进程内实例）。
+     *
+     * ## 为什么要单独查一次
+     *
+     * [PunchAccessibilityService.isReady] 看的是静态 instance。
+     * 但「系统已绑定服务」和「进程里 onServiceConnected 已跑过」是两件事：
+     * 重装 App、进程被杀后重建、服务刚被用户打开等时刻，两者会出现不一致。
+     *
+     * 直接读 Settings.Secure 里的 enabled_accessibility_services 是系统事实，
+     * 不受进程生命周期影响。
+     *
+     * 注意：这里**只用于健康度展示与决策辅助**，真正的执行仍然以
+     * PunchAccessibilityService.get() 是否非空为准（拿不到实例就做不了操作）。
+     */
+    fun isAccessibilityServiceEnabled(context: Context): Boolean = runCatching {
+        val expected = context.packageName + "/" + PunchAccessibilityService::class.java.name
+        val enabled = Settings.Secure.getString(
+            context.contentResolver,
+            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+        ).orEmpty()
+        val globalOn = Settings.Secure.getInt(
+            context.contentResolver,
+            Settings.Secure.ACCESSIBILITY_ENABLED,
+            0,
+        ) == 1
+        globalOn && enabled.split(':').any { it.equals(expected, ignoreCase = true) }
     }.getOrDefault(false)
 
     // ---------- 跳转 ----------

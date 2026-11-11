@@ -7,6 +7,7 @@ import android.os.Bundle
 import android.util.Log
 import androidx.core.view.WindowCompat
 import androidx.activity.ComponentActivity
+import androidx.activity.viewModels
 import com.styropyr0.prismal.sources.prismalGlassLayer
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -66,7 +67,53 @@ import kotlinx.coroutines.launch
  * - 底部两块 tab（首页/设置），tab bar 是全 AGSL 玻璃面之一；
  * - 主题由 GlassThemeProvider 下发，支持浅色/深色/跟随系统。
  */
+// ==================== 拖拽松手后的页面收尾动画 ====================
+//
+// 拖到**中间**松手时，页面只挪了半屏。旧实现用 scrollToPage（零动画）
+// 把剩余半屏在 1 帧内补齐，用户看到的就是「直接瞬移过去」。
+//
+// 现在按剩余距离缩放时长：
+//   · 剩得少（拖了 95%）→ 180ms，干脆利落
+//   · 剩得多（拖了 50%）→ 最长 460ms，从容收尾
+// 两端都用 iOS 的 IosEaseOut 曲线（快起步、缓收尾）。
+
+//
+// 【速率：用户要求「别太快」】
+//
+// 最短 260ms：哪怕只差 5%，也要有一小段可见的缓动收尾，
+//   否则瞬间落位会显得廉价（这是「复读动画」修好之后的新问题：
+//   动画一旦变成实时跟手，收尾再快就会像被掐断）。
+//
+// 最长 620ms：拖到正中间松手时走这个值。
+//   460ms 在真机上仍偏急促，620ms 才和底栏其它动画（位移 420ms、
+//   松手回落 520ms）处在同一个「从容」的量级上。
+// 点击切换的完整翻页动画时长（iOS 18 质感：慢速非线性）。
+//
+// 与 TAB_RELEASE_MS 保持一致：指示器位置由 liveOffset 驱动，
+// liveOffset 由 pager 的翻页动画驱动 —— 只要两边时长相同，
+// 指示器就与页面严格同步，不会出现「页面到了指示器还在走」。
+private const val CLICK_PAGE_MS = 620
+
+// 拖拽松手时，页面落位与底栏指示器落位**共用**的时长。
+//
+// 必须与 GlassTabBar 里的 RELEASE_MS 保持同一个值，
+// 否则页面和指示器收尾不同步，两个方向看起来会不对称。
+private const val TAB_RELEASE_MS = 620
+
+private const val DRAG_PAGE_MIN_MS = 260
+private const val DRAG_PAGE_MAX_MS = 620
+
 class MainActivity : ComponentActivity() {
+
+    /**
+     * 首页 ViewModel。
+     *
+     * 这里用 Activity 的 ViewModelStore 取实例，和下面 AppRoot 里
+     * Compose 的 `viewModel()` **拿到的是同一个对象**
+     * （LocalViewModelStoreOwner 默认就是宿主 Activity），
+     * 所以在这里调 setVisible() 确实作用到首页那个 ticker 上。
+     */
+    private val vm: MainViewModel by viewModels()
 
     private val notificationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
@@ -202,6 +249,35 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         sawTouchDown = false
+    }
+
+    /**
+     * 【后台零消耗】倒计时 ticker 只跟着"界面是否可见"跑。
+     *
+     * ## 为什么是 onStart/onStop，而不是 onResume/onPause
+     *
+     * 用 onResume 的话，本应用弹一个 Dialog（时间选择器、确认框）也会触发
+     * onPause，ticker 被停掉又立刻重启 —— 界面明明还在屏幕上，倒计时却
+     * 出现不必要的抖动。onStart/onStop 的语义正好是"用户还能不能看到这个界面"。
+     *
+     * 对打卡场景尤其重要：打卡执行时我们的 Activity 在钉钉背后，
+     * 已经 onStop —— 此时停掉 ticker 正是我们要的。
+     *
+     * ## 停掉之后为什么还能恢复
+     *
+     * setVisible(true) 会把查库节流时间戳清零，回到前台的第一帧就重新
+     * 查一次真实的打卡记录并重算下一次打卡，不会先显示切后台之前的旧数据。
+     */
+    override fun onStart() {
+        super.onStart()
+        vm.setVisible(true)
+    }
+
+    override fun onStop() {
+        // 先停 ticker 再走父类流程，避免父类 super.onStop() 期间
+        // 还有一次 tick 走到 refreshTick() 里去做 binder IPC。
+        vm.setVisible(false)
+        super.onStop()
     }
 
     /**
@@ -585,8 +661,7 @@ private fun AppRoot() {
                                 onSavePassword = { pwd -> vm.savePassword(pwd) },
                                 onClearPassword = { vm.clearPassword() },
                                 onFixPermission = { key -> handlePermissionFix(vm, key) },
-                                onTestNotification = { vm.testNotification(it) },
-                                onRecheckRoot = { vm.recheckRoot() },
+                                                    onRecheckRoot = { vm.recheckRoot() },
                                 onClearLogs = { vm.clearLogs() },
                                 onThemeChange = { vm.setThemeMode(it) },
                                 onRefreshPersistent = {
@@ -625,6 +700,17 @@ private fun AppRoot() {
                             pagerState.currentPageOffsetFraction
                     }
 
+                    // 底栏拖拽换算需要的量：
+                    //   · tabCount  —— 固定 2 个 tab；
+                    //   · barWidthPxForDrag —— 底栏实际宽度（由 onSizeChanged 回写）。
+                    val tabCount = 2
+                    var barWidthPxForDrag by androidx.compose.runtime.remember {
+                        androidx.compose.runtime.mutableStateOf(0f)
+                    }
+                    var dragFrac by androidx.compose.runtime.remember {
+                        androidx.compose.runtime.mutableStateOf(0f)
+                    }
+
                     // ============ 底栏采样「内容层」，让它能折射出背后的东西 ============
                     //
                     // 【第七轮 · 纠正上一轮的错误判断】
@@ -658,6 +744,31 @@ private fun AppRoot() {
                     // 代价是底栏背后看不到卡片和文字。但这正是磨砂玻璃的本质：
                     // 你看到的是"被模糊的光"，不是"能认出来的字"。
                     // 玻璃感由折射与描边提供，不需要靠透出文字来证明。
+                    // ==================== 底栏采样源（真机修复）====================
+                    //
+                    // ## 这里曾经把底栏的玻璃彻底弄没了
+                    //
+                    // 历史：底栏原本采样 liquidBackdropContent（含内容层），
+                    // 但因为「三个录制修饰符同时挂在一棵树上互相争抢」，
+                    // 每帧拿到不确定快照 → 折射闪烁、模糊时有时无。
+                    // 当时的修法是「退回只录背景的 liquidBackdropCards」，
+                    // 结果模糊和折射一起消失，底栏变成一块不透明色块。
+                    //
+                    // ## 真正的原因不是「内容层不能用」
+                    //
+                    // 而是**同时录了多份**。现在内容层只保留一个
+                    // layerBackdrop(liquidBackdropContent)（见上面内容层的注释），
+                    // 争抢问题已经不存在，可以安全地让底栏采样内容层。
+                    //
+                    // ## 为什么必须采样内容层
+                    //
+                    // liquidBackdropCards 只录 FlowingBackground，它挂在内容层**之下**，
+                    // 录制范围不含任何卡片与文字。底栏在屏幕最下方、盖在内容之上，
+                    // 它去采样那一层 → 在底栏所在区域采到的是空样本 →
+                    // 模糊作用在空样本上等于没有 → 视觉上就是一块纯色圆角矩形。
+                    //
+                    // 采样内容层才能得到「卡片 + 文字」的真实画面，
+                    // 模糊与折射才有东西可作用 —— 这才是 iOS 悬浮底栏的观感。
                     CompositionLocalProvider(
                         LocalBackdropLayer provides (contentBackdropLayer ?: backdropLayer),
                         // 底栏采样「只录背景」那一层。
@@ -688,7 +799,28 @@ private fun AppRoot() {
                         //
                         // 统一采样背景层后，底栏和卡片的光学输入完全一致，
                         // 颜色自然落在同一个色系，玻璃的通透度也回来了。
-                        com.redmi.autoattend.ui.glass.LocalLiquidBackdrop provides liquidBackdropCards,
+                        // ============ 底栏采样源：必须是**含内容**的那一层 ============
+                        //
+                        // 用户反复反馈「底下内容透不过来」。
+                        //
+                        // ## 根因（这次是结构问题，不是参数）
+                        //
+                        // 底栏原先采样 liquidBackdropCards —— 那一层只录了 FlowingBackground
+                        // （流动光斑），**底下的卡片和文字压根没被录进去**。
+                        // 也就是说：无论 blurRadius / tintAlpha 怎么调，
+                        // 采样里都没有「内容」这个东西可透 —— 调参永远调不出来。
+                        //
+                        // 要让底栏透出下方内容，采样源必须是录了内容的 liquidBackdropContent。
+                        //
+                        // ## 为什么这次不会自引用崩溃
+                        //
+                        // 历史上改成 content 曾导致 SIGSEGV，原因是当时**同时**挂了
+                        // prismalGlassLayer + layerBackdrop + blurredContentLayer 三个录制修饰符，
+                        // 互相争抢同一份绘制结果。
+                        // 现在全树只有**一个** layerBackdrop(liquidBackdropContent)（第 551 行），
+                        // 且它位于内容子树、**不包含底栏**（底栏在它之外，第 770 行），
+                        // 因此底栏采样它不存在「录制自己」的递归。
+                        com.redmi.autoattend.ui.glass.LocalLiquidBackdrop provides liquidBackdropContent,
                     ) {
                     GlassTabBar(
                         tabs = listOf("首页", "设置"),
@@ -698,17 +830,36 @@ private fun AppRoot() {
                             // 它由 pager 稳定后回写，避免两个写入者打乱状态。
                             pagerScope.launch {
                                 if (fromDrag) {
-                                    // 【拖拽松手】页面已经跟着手指挪了一大半，
-                                    // 再播一次完整翻页动画就成了"重复一遍点击的动作"。
-                                    // 直接用 scrollToPage 落到目标页：零动画，
-                                    // 跟手结束即到位，这才是 iOS 的手感。
-                                    pagerState.scrollToPage(target)
+                                    // ============ 拖拽松手：与指示器**同长同曲线** ============
+                                    //
+                                    // ## 为什么必须固定时长（对称性问题的根因）
+                                    //
+                                    // 旧实现按「剩余距离」缩放时长：
+                                    //     ms = (620 * remaining).coerceIn(260, 620)
+                                    // 而指示器落位是**固定** 620ms。
+                                    //
+                                    // 两者时长不同 → 页面先到、指示器后到（或反之），
+                                    // 用户看到的就是「一个有一个没」「不对称」。
+                                    // 从首页拖到设置在 remaining≈1，时长接近 620，勉强一致；
+                                    // 从设置拖到首页 remaining 小，页面 260ms 就冲完了，
+                                    // 指示器还在慢慢走 —— 这就是两个方向观感不同的原因。
+                                    //
+                                    // 现在固定为 RELEASE_MS，与底栏指示器落位**完全一致**：
+                                    // 同一时长、同一条 cubic-bezier，两个方向严格对称。
+                                    pagerState.animateScrollToPage(
+                                        page = target,
+                                        animationSpec = androidx.compose.animation.core.tween(
+                                            durationMillis = TAB_RELEASE_MS,
+                                            easing = androidx.compose.animation.core
+                                                .CubicBezierEasing(0.32f, 0.72f, 0f, 1f),
+                                        ),
+                                    )
                                 } else {
                                     // 【点击】完整翻页动画，慢速非线性（iOS 18 质感）。
                                     pagerState.animateScrollToPage(
                                         page = target,
                                         animationSpec = androidx.compose.animation.core.tween(
-                                            durationMillis = 460,
+                                            durationMillis = CLICK_PAGE_MS,
                                             easing = androidx.compose.animation.core
                                                 .CubicBezierEasing(0.32f, 0.72f, 0f, 1f),
                                         ),
@@ -717,6 +868,11 @@ private fun AppRoot() {
                             }
                         },
                         liveOffset = pageOffset.value,
+                        // 【拖拽期间完全不碰 pager】
+                        //
+                        // 指示器跟手由 GlassTabBar 内部的同步 state 完成（dragFrac），
+                        // 这里不再需要任何拖拽回调 —— 那样只会引入协程调度丢帧。
+                        onBarWidth = { barWidthPxForDrag = it },
                         modifier = Modifier.fillMaxWidth(),
                     )
                     }

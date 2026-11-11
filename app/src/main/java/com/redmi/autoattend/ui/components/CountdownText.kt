@@ -23,6 +23,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
+import com.redmi.autoattend.ui.theme.IosEaseInOut
+import com.redmi.autoattend.ui.theme.IosEaseOut
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -82,6 +84,27 @@ fun CountdownText(
 /** 倒计时主字号 */
 private val CountdownFontSize = 62.sp
 
+// ---------- 数字翻动动效的时长（必须成组看，改一个就要重新核对观感）----------
+
+/**
+ * 位移时长：新旧数字**共用**这一个值。
+ *
+ * 只有沿用同一个时长，新数字从 +H 走到 0 与旧数字从 0 走到 -H 才始终同步，
+ * 中间不出现空隙或重叠 —— 这是「顶上去」的视觉基础。
+ */
+private const val DigitShiftMs = 620
+
+/** 新数字淡入：比位移略快，落位时已经基本实心 */
+private const val DigitFadeInMs = 420
+
+/**
+ * 旧数字淡出：**故意比位移慢一点**。
+ *
+ * 这样旧数字在被推走的前半程仍然清晰，到接近顶部才淡干净，
+ * 有被「顶出去」的重量感；完全同步淡出会显得轻飘、生硬。
+ */
+private const val DigitFadeOutMs = 540
+
 /**
  * 每个数字槽的固定行高。
  *
@@ -111,20 +134,50 @@ private fun DigitSlot(
         modifier = Modifier
             .width(96.dp)
             .height(CountdownLineHeight)
-            // clipToBounds 是这个组件正常工作的关键：
-            // AnimatedContent 过渡期间新旧数字同时在布局里，
-            // 不裁剪的话旧数字会飘出槽位、压到面板其它内容上。
+            // clipToBounds 仍然必须保留：
+            // 旧数字是「整块向上移出」，移出过程中会越过槽位边界，
+            // 不裁剪就会压到倒计时面板上方的时间标签上。
             .clipToBounds(),
         contentAlignment = Alignment.Center,
     ) {
+        // 【动效：后一个数字把前一个「顶」上去并淡出】
+        //
+        // 用户原话："之前的是后一个数字把前一个数字顶上去并淡出的"。
+        //
+        // ## 让它看起来像「顶」而不是「两段各滑各的」的关键
+        //
+        // 1. **入/出必须同一条时间曲线、同一个时长。**
+        //    上一版写成「入 380ms IosEaseOut / 出 460ms IosEaseInOut」，
+        //    新数字早早停下、旧数字还在慢慢滑，视觉上就是两张纸各自飘，
+        //    完全不像被顶出去。
+        //
+        // 2. **位移距离必须正好是一个行高。**
+        //    新数字从 +H 走到 0，旧数字同时从 0 走到 -H。
+        //    两者在任何时刻都保持「新在旧正下方 H 的位置」，
+        //    并且同步向上推进 —— 于是中间没有任何空隙、没有重叠，
+        //    读起来就是一个把另一个顶出去。
+        //
+        // 3. **淡出要比位移略慢一点点（尾巴）。**
+        //    完全同步淡出会显得生硬；让旧数字在刚开始上移时仍接近不透明、
+        //    到接近顶部才淡干净，才有「被推走」的重量感。
+        //    这里位移 620ms，淡出 540ms 起步稍缓。
+        //
+        // 曲线用 AGENTS 规定的 IosEaseOut（快速起步、极缓收尾），
+        // 与全应用其它动效保持一致；**不使用 spring**。
         AnimatedContent(
             targetState = value,
             transitionSpec = {
-                (                    slideInVertically(animationSpec = tween(300)) { full -> full } +
-                        fadeIn(animationSpec = tween(200))
-                    ) togetherWith (                    slideOutVertically(animationSpec = tween(300)) { full -> -full } +
-                        fadeOut(animationSpec = tween(160))
-                    )
+                (
+                    slideInVertically(
+                        animationSpec = tween(DigitShiftMs, easing = IosEaseOut),
+                        initialOffsetY = { fullHeight -> fullHeight },
+                    ) + fadeIn(animationSpec = tween(DigitFadeInMs, easing = IosEaseOut))
+                ) togetherWith (
+                    slideOutVertically(
+                        animationSpec = tween(DigitShiftMs, easing = IosEaseOut),
+                        targetOffsetY = { fullHeight -> -fullHeight },
+                    ) + fadeOut(animationSpec = tween(DigitFadeOutMs, easing = IosEaseOut))
+                )
             },
             contentAlignment = Alignment.Center,
             label = "digit",

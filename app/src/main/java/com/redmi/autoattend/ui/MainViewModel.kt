@@ -17,12 +17,14 @@ import com.redmi.autoattend.exec.PunchNotifier
 import com.redmi.autoattend.exec.RootShell
 import com.redmi.autoattend.ui.theme.ThemeMode
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Calendar
@@ -135,15 +137,18 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             kotlinx.coroutines.delay(STARTUP_DEFER_MS * 2)
             refreshHealth()
         }
-        startTicker()
+
+        // 【不再在这里无条件起 ticker】
+        //
+        // ticker 的唯一启停入口是 setVisible()，由 UI 层的
+        // ON_START / ON_STOP 驱动。init 里直接起 ticker 的话，
+        // Activity 一停到后台就再也没有东西能让它停下来 ——
+        // 详见 setVisible() 的注释。
+        //
+        // Activity 紧接着就会 onStart，所以"首帧之后才有状态"这件事
+        // 和原来没有区别（原来也是第一个 tick 才写入 _ui）。
     }
 
-    /**
-     * 秒级刷新循环——需求 F2.1 要求倒计时精确到秒。
-     *
-     * 用 200ms 的间隔而不是 1000ms，是为了让"秒"跳变更贴近真实秒边界，
-     * 避免固定 1s 采样造成的视觉抖动。
-     */
     /**
      * 上一次查库的时间与结果缓存。
      *
@@ -189,12 +194,57 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         const val TICK_INTERVAL_MS = 200L
     }
 
-    private fun startTicker() {
-        viewModelScope.launch {
-            while (true) {
-                refreshTick()
-                delay(TICK_INTERVAL_MS)
+    /**
+     * 秒级刷新循环的 Job。
+     *
+     * 【为什么必须能被停掉 —— "后台零消耗"红线】
+     *
+     * 原来是 viewModelScope.launch { while (true) { refreshTick(); delay(200) } }。
+     * viewModelScope 的生命周期是**整个 ViewModel**，不是 Activity 的可见性：
+     * 用户按 Home 键、切到钉钉之后，Activity 已经 onStop，这个循环照样在跑。
+     *
+     * 而 refreshTick() 每个 tick 要：
+     *   1. PunchSchedule.nextSlot() 重算一遍下一次打卡（含 completedSlotsForToday）；
+     *   2. 每 3 秒真正查一次 Room（lastSuccessSince × 2）；
+     *   3. 状态为 busy 时还会走 isPunchServiceRunning() →
+     *      ActivityManager.getRunningServices()，一次 **binder IPC**；
+     *   4. 每 tick 都 copy 出一个新的 HomeUiState 写进 StateFlow
+     *      （now 字段每 tick 都变，所以必然会 emit，去重优化也救不了）。
+     *
+     * 5Hz × 上面这一整套，在最该零消耗的后台场景持续跑，是完全不符合
+     * 「没运行时在后台不要消耗资源」的。倒计时只对看得见的人有意义。
+     *
+     * 采样率保持不变：仍然 200ms 一跳（而不是 1000ms），
+     * 这样"秒"的跳变更贴近真实秒边界，避免固定 1s 采样造成的视觉抖动
+     * —— 需求 F2.1 要求倒计时精确到秒。改的只是"什么时候跑"，不是"跑多快"。
+     */
+    private var tickerJob: Job? = null
+
+    /**
+     * UI 可见性开关（由 Activity 的 ON_START / ON_STOP 调用）。
+     *
+     * 可见 → 起 ticker（如果已经在跑则幂等）；不可见 → 取消 ticker。
+     * 同时把查库节流时间戳清零，保证重新可见时**立刻**查一次真实的打卡记录，
+     * 而不是先拿一份切后台之前的旧缓存糊上去。
+     *
+     * 这样"秒级精度"的行为完全不变：可见期间依旧 200ms 一跳；
+     * 只是不可见期间不再有任何轮询。
+     */
+    fun setVisible(visible: Boolean) {
+        if (visible) {
+            if (tickerJob?.isActive == true) return
+            // 回到前台的第一帧就要看到真实状态，不能被 3 秒节流窗口挡住
+            invalidateTodayCache()
+            tickerJob = viewModelScope.launch {
+                while (isActive) {
+                    refreshTick()
+                    delay(TICK_INTERVAL_MS)
+                }
             }
+        } else {
+            // 取消后 Job 引用留着也没意义，置空便于下次重建
+            tickerJob?.cancel()
+            tickerJob = null
         }
     }
 
@@ -461,13 +511,33 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     // 手动打卡要落到"当前真正该打的那一次"上，
                     // 否则首页的今日上班/下班状态永远不会更新
                     // （首页只查 CLOCK_IN / CLOCK_OUT，MANUAL 不在统计里）。
+                    val kind = inferManualKind()
                     putExtra(
                         com.redmi.autoattend.exec.PunchAlarmReceiver.EXTRA_KIND,
-                        inferManualKind().name,
+                        kind.name,
                     )
+
+                    // 【关键】targetAt 必须是**该班次的计划时刻**，不能是「此刻」。
+                    //
+                    // 真机踩到的坑：晚上的手动打卡传了 now 当 targetAt，
+                    // 而上班卡闸门窗口是 [target-75s, target+55s] —— target=now
+                    // 时永远放行，于是 21:38 打出了一张「上班卡」。
+                    //
+                    // 传入今天的计划时刻后：
+                    //   · 晚上点「手动打卡」→ kind=CLOCK_OUT、target=18:30
+                    //   · 闸门按 18:30 判定 → 正确；超出补卡窗口会如实拒绝。
+                    //
+                    // 这也让首页的"今日上班/下班"能落到正确的一格。
+                    val settings = AppConfig.settings.value
+                    val startOfDay = com.redmi.autoattend.core.PunchSchedule
+                        .startOfDay(System.currentTimeMillis())
+                    val minute = when (kind) {
+                        com.redmi.autoattend.data.db.PunchKind.CLOCK_OUT -> settings.clockOutMinute
+                        else -> settings.clockInMinute
+                    }
                     putExtra(
                         com.redmi.autoattend.exec.PunchAlarmReceiver.EXTRA_TARGET_AT,
-                        System.currentTimeMillis(),
+                        startOfDay + minute * 60_000L,
                     )
                 }
                 androidx.core.content.ContextCompat.startForegroundService(getApplication(), intent)
@@ -491,17 +561,43 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      */
     private fun inferManualKind(): PunchKind {
         val s = _ui.value
-        return when {
-            s.todayClockIn == null -> PunchKind.CLOCK_IN
-            s.todayClockOut == null -> PunchKind.CLOCK_OUT
-            else -> {
-                val cal = java.util.Calendar.getInstance()
-                if (cal.get(java.util.Calendar.HOUR_OF_DAY) < 12) {
-                    PunchKind.CLOCK_IN
-                } else {
-                    PunchKind.CLOCK_OUT
-                }
+
+        // 【必须按 DB 判断，不能只看首页状态】
+        //
+        // 旧实现在今日两班都为 null 时直接返回 CLOCK_IN —— 这在真机上造成
+        // 「晚上 21:38 手动打卡被判成上班卡」的错误：
+        //   · DB 里今天没有记录 → todayClockIn == null → 返回 CLOCK_IN
+        //   · 而手动打卡的 targetAt 取的是「此刻」
+        //   · 上班卡闸门窗口是 [target-75s, target+55s]，target=此刻 → 永远放行
+        //   · 于是深夜也能打出一张「上班卡」
+        //
+        // 正确做法是先看**系统时钟**落在哪个班次附近：
+        //   距上班时间更近 → CLOCK_IN；距下班时间更近 → CLOCK_OUT。
+        // 只有两者都无法判断时才退回 DB 状态。
+        val now = System.currentTimeMillis()
+        val settings = AppConfig.settings.value
+        val startOfDay = com.redmi.autoattend.core.PunchSchedule.startOfDay(now)
+        val inAt = startOfDay + settings.clockInMinute * 60_000L
+        val outAt = startOfDay + settings.clockOutMinute * 60_000L
+
+        // 两班都已打 → 按时间就近归属（此时多半是补卡，就近最不容易错）
+        if (s.todayClockIn != null && s.todayClockOut != null) {
+            return if (kotlin.math.abs(now - outAt) <= kotlin.math.abs(now - inAt)) {
+                PunchKind.CLOCK_OUT
+            } else {
+                PunchKind.CLOCK_IN
             }
+        }
+
+        // 只有一班已打 → 打另一班，这是明确无歧义的
+        if (s.todayClockIn != null && s.todayClockOut == null) return PunchKind.CLOCK_OUT
+        if (s.todayClockIn == null && s.todayClockOut != null) return PunchKind.CLOCK_IN
+
+        // 两班都没打 → 按当前时刻就近归属（关键修复：不再无条件 CLOCK_IN）
+        return if (kotlin.math.abs(now - outAt) <= kotlin.math.abs(now - inAt)) {
+            PunchKind.CLOCK_OUT
+        } else {
+            PunchKind.CLOCK_IN
         }
     }
 
@@ -514,10 +610,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun clearPassword() {
         AppConfig.clearLockPassword()
         refreshHealth()
-    }
-
-    fun testNotification(success: Boolean) {
-        PunchNotifier.notifyTest(getApplication(), success)
     }
 
     fun recheckRoot() {
