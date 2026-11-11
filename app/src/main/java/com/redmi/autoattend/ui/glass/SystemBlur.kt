@@ -98,3 +98,138 @@ fun rememberGlassPipelineDescription(): String = remember {
         }
     }
 }
+/**
+ * 【弹窗专用】给 Dialog 的 Window 开启系统级背景模糊。
+ *
+ * ## 为什么弹窗必须用这条路，而不是 AGSL
+ *
+ * AGSL 面板的模糊只作用于**它采样的 GraphicsLayer**。
+ * 但弹窗采样的是主界面内容层的录制结果 ——
+ * 弹窗打开后主界面被遮挡、不再重绘，那个录制层就不再更新，
+ * 于是 blurRadius 实际上作用在一张静态快照上，视觉上「没有模糊」。
+ *
+ * 这是实测出来的：把 blurRadius 从 32dp 调到 52dp，画面毫无变化。
+ *
+ * ## 系统级背景模糊才是 iOS 的真实做法
+ *
+ * `Window.setBackgroundBlurRadius()` 由 SurfaceFlinger 在合成阶段执行，
+ * 模糊的是**该 Window 之后的所有图层**（也就是弹窗背后的整个界面）。
+ * 效果稳定、性能好，而且不依赖任何图层录制。
+ *
+ * 配合一层半透明填充，就是 iOS 26 sheet 的标准做法：
+ *   · 背景：系统模糊（真模糊，一定有）
+ *   · 前景：半透明材质 + 描边 + 阴影
+ *
+ * @param radius 模糊半径（dp 换算成 px 由调用方负责）
+ */
+@Composable
+fun DialogSystemBlur(radiusDp: Float = 28f) {
+    val view = androidx.compose.ui.platform.LocalView.current
+
+    // 【第 9 次修正】不再从 View 树里猜 Window。
+    //
+    // 前两次失败的共同点：都拿到了**主窗口**。
+    //   · parent 链 → 走到 Activity 的 DecorView
+    //   · rootView 的 mAttachInfo → 同样指向宿主 Window
+    // 而 dumpsys 证实弹窗是独立的 Window #11，主窗口是 #12。
+    //
+    // 最可靠的方式：**直接枚举 WindowManager 里的窗口**,
+    // 按「类型是 DIALOG 且属于本应用」挑出来。
+    // 这是唯一不依赖 View 树结构的地方。
+    androidx.compose.runtime.LaunchedEffect(radiusDp) {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.S) return@LaunchedEffect
+
+        val ctx = view.context
+        val wm = ctx.getSystemService(android.content.Context.WINDOW_SERVICE) as android.view.WindowManager
+
+        runCatching {
+            val density = ctx.resources.displayMetrics.density
+            val px = (radiusDp * density).toInt()
+
+            // 反射拿 WindowManagerGlobal 里的所有 root view，
+            // 从中挑出属于 Dialog 的那个。
+            val wmgClass = Class.forName("android.view.WindowManagerGlobal")
+            val getInstance = wmgClass.getMethod("getInstance")
+            val wmg = getInstance.invoke(null)
+            val viewsField = wmgClass.getDeclaredField("mViews")
+            viewsField.isAccessible = true
+            @Suppress("UNCHECKED_CAST")
+            val views = viewsField.get(wmg) as? List<android.view.View> ?: emptyList()
+
+            android.util.Log.i("DialogBlur", "WindowManagerGlobal 中共 " + views.size + " 个 root view")
+
+            var applied = false
+            for (v in views) {
+                // 只处理本应用、且是 Dialog 类型的 root
+                val lp = v.layoutParams as? android.view.WindowManager.LayoutParams ?: continue
+                val isDialog = lp.type == android.view.WindowManager.LayoutParams.TYPE_APPLICATION
+                val belongToUs = lp.packageName?.contains("autoattend") == true
+                android.util.Log.i(
+                    "DialogBlur",
+                    "rootView=" + v.javaClass.simpleName +
+                        " type=" + lp.type + " pkg=" + lp.packageName +
+                        " isDialog=" + isDialog + " ours=" + belongToUs,
+                )
+                if (!isDialog || !belongToUs) continue
+
+                // 这是弹窗的 root。它所属的 Window 可以通过 ViewRootImpl 反查，
+                // 但更简单：直接改 lp 并 re-add。
+                lp.flags = lp.flags or android.view.WindowManager.LayoutParams.FLAG_BLUR_BEHIND
+                lp.setBlurBehindRadius(px)
+                // 【关键】dimAmount 归零。
+                //
+                // Dialog 默认给背景加一层黑色蒙版（约 60%），
+                // 它会**盖在模糊结果之上**，把整片压暗。
+                // 用户看到的"背景发黑"就是这层蒙版，不是模糊本身。
+                //
+                // iOS 的 sheet 背景是**模糊 + 极淡的纱**，不需要压黑：
+                // 模糊本身已经提供了足够的层次分离。
+                lp.dimAmount = 0.06f
+                runCatching { wm.updateViewLayout(v, lp) }
+                applied = true
+                android.util.Log.i("DialogBlur", "已给弹窗 root 应用模糊 radius=" + px + "px")
+            }
+
+            if (!applied) android.util.Log.w("DialogBlur", "没有找到弹窗 root view")
+        }.onFailure {
+            android.util.Log.w("DialogBlur", "失败: " + it.javaClass.simpleName + " " + it.message)
+        }
+    }
+}
+
+/**
+ * 从任意 View 反查它所属的 Window。
+ *
+ * Compose Dialog 的 View 树是：DialogWrapper → DecorView → ... ，
+ * 只有 DecorView 的 `.window` 属性（隐藏 API）或
+ * `View.getRootView()` 的上下文才能拿到 Window。
+ *
+ * 这里用最稳的两条路：
+ *   1. DialogWrapper 实现了 DialogWindowProvider，直接取 window；
+ *   2. 退化到反射 DecorView 的 mWindow 字段。
+ */
+private fun findWindowForView(start: android.view.View?): android.view.Window? {
+    var v: android.view.View? = start
+    var depth = 0
+    while (v != null && depth < 20) {
+        // 路 1：DialogWrapper 实现了隐藏接口 Window.DialogWindowProvider，
+        // 该接口不是 SDK 公开 API，只能反射调用 getWindow()。
+        if (v.javaClass.simpleName.contains("DialogWrapper")) {
+            runCatching {
+                val m = v.javaClass.getMethod("getWindow")
+                (m.invoke(v) as? android.view.Window)?.let { return it }
+            }
+        }
+        // 路 2：DecorView 的隐藏字段
+        if (v.javaClass.name.contains("DecorView")) {
+            runCatching {
+                val f = v.javaClass.getDeclaredField("mWindow")
+                f.isAccessible = true
+                (f.get(v) as? android.view.Window)?.let { return it }
+            }
+        }
+        v = v.parent as? android.view.View
+        depth++
+    }
+    return null
+}

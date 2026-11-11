@@ -166,33 +166,80 @@ private fun WheelColumn(
             }
         }
 
-        // 中央选中指示带
+        // 中央选中指示带。
+        //
+        // 【真机修正】浅色主题原来用 Color.White.copy(alpha = 0.85f)，
+        // 在玻璃面板上变成一条几乎不透明的白带 —— 而选中项文字是
+        // textPrimary（接近黑），对比度被白带冲掉，实际观感是
+        // "白底浅字"，几乎读不出数值。
+        //
+        // 苹果的 wheel picker 指示带是**极淡的一层**，靠边缘两条细线
+        // 定义区间，而不是一块实色。这里照做：
+        //   · 填充降到 0.10~0.14，只做轻微提亮
+        //   · 上下各加一条 1.5dp 的 accent 细线定界
         Box(
             modifier = Modifier
                 .align(Alignment.Center)
                 .fillMaxWidth()
-                .height(itemHeight)
-                .clip(RoundedCornerShape(12.dp))
-                .background(
-                    Brush.horizontalGradient(
-                        colors = if (colors.isDark) {
+                .height(itemHeight),
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(
+                        Brush.horizontalGradient(
+                            colors = listOf(
+                                Color.Transparent,
+                                if (colors.isDark) {
+                                    Color.White.copy(alpha = 0.09f)
+                                } else {
+                                    colors.accent.copy(alpha = 0.10f)
+                                },
+                                if (colors.isDark) {
+                                    Color.White.copy(alpha = 0.09f)
+                                } else {
+                                    colors.accent.copy(alpha = 0.10f)
+                                },
+                                Color.Transparent,
+                            ),
+                        ),
+                    ),
+            )
+
+            // 上下定界线：让"选中区间"有明确边界，而不是一块渐隐色块
+            val lineColor = colors.accent.copy(alpha = if (colors.isDark) 0.70f else 0.55f)
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .fillMaxWidth()
+                    .height(1.5.dp)
+                    .background(
+                        Brush.horizontalGradient(
                             listOf(
                                 Color.Transparent,
-                                Color.White.copy(alpha = 0.075f),
-                                Color.White.copy(alpha = 0.075f),
+                                lineColor,
                                 Color.Transparent,
-                            )
-                        } else {
+                            ),
+                        ),
+                    ),
+            )
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .height(1.5.dp)
+                    .background(
+                        Brush.horizontalGradient(
                             listOf(
                                 Color.Transparent,
-                                Color.White.copy(alpha = 0.85f),
-                                Color.White.copy(alpha = 0.85f),
+                                lineColor,
                                 Color.Transparent,
-                            )
-                        },
-                    )
-                ),
-        )
+                            ),
+                        ),
+                    ),
+            )
+        }
 
     }
 }

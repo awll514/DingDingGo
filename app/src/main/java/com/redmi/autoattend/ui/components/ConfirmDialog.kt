@@ -88,17 +88,23 @@ fun ConfirmDialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false),
     ) {
+        // 系统级真模糊：和 TimeEditorSheet 同一套方案。
+        // 枚举 WindowManagerGlobal 找到 type=TYPE_APPLICATION 的弹窗窗口。
+        com.redmi.autoattend.ui.glass.DialogSystemBlur(radiusDp = 26f)
+        // 【关键】显式注入采样源。
+        // Dialog 继承了父级的 LocalBackdropLayer（只含流动背景），
+        // 采样它只能得到一片渐变，没有页面内容 —— 看起来像塑料板。
+        // 改用 contentLayer（背景+卡片+文字），玻璃后才能透出真实内容。
+        androidx.compose.runtime.CompositionLocalProvider(
+            com.redmi.autoattend.ui.glass.LocalDialogBackdrop provides
+                com.redmi.autoattend.ui.glass.SharedBackdrop.contentLayer,
+        ) {
         Box(
             modifier = Modifier
                 .fillMaxWidth()
                 // 不压黑：只做极轻的背景后退，符合 Apple sheet 的观感
-                .background(
-                    if (colors.isDark) {
-                        Color.Black.copy(alpha = 0.34f)
-                    } else {
-                        Color(0xFF0A1220).copy(alpha = 0.12f)
-                    },
-                )
+                // 系统模糊已提供层次，不再叠自绘蒙版。
+                .background(Color.Transparent)
                 .padding(horizontal = 32.dp),
             contentAlignment = Alignment.Center,
         ) {
@@ -114,8 +120,16 @@ fun ConfirmDialog(
                 LiquidGlassPanel(
                     modifier = Modifier.fillMaxWidth(),
                     cornerRadius = GlassDimens.radiusLarge,
+                    // 与时间弹层同一套材质：iOS 26 磨砂玻璃窗。
+                    // 模糊 52dp 把背景糊成色块，tint 0.045 给一层中性底。
+                    tint = Color(0x0BF2F5FA),
+                    tintAlpha = 0.045f,
+                    blurRadius = 52.dp,
+                    refractionHeightOverride = 40.dp,
+                    refractionAmountOverride = 58.dp,
+                    dispersionOverride = 0.15f,
                     sampleOffsetX = 0.5f,
-                    sampleOffsetY = 0.35f,
+                    sampleOffsetY = 0.5f,
                 ) {
                     Column(
                         modifier = Modifier.padding(22.dp),
@@ -167,6 +181,7 @@ fun ConfirmDialog(
                 }
             }
         }
+        }   // CompositionLocalProvider
     }
 }
 

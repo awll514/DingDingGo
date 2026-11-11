@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import androidx.core.view.WindowCompat
 import androidx.activity.ComponentActivity
 import com.styropyr0.prismal.sources.prismalGlassLayer
@@ -124,11 +125,14 @@ class MainActivity : ComponentActivity() {
                 sawTouchDown = false
                 if (!tracked) {
                     // 孤立 UP/CANCEL：DROP。
-                    // 记一条日志，方便事后确认防护真的生效过。
-                    android.util.Log.i(
-                        "GhostGuard",
-                        "已丢弃孤立触摸事件 action=" + ev.actionMasked,
-                    )
+                    // 只对"切窗口导致的事件迁移"生效——
+                    // 真实点击永远成对，不受影响。
+                    //
+                    // 注意：这不拦自动点击工具（如 GKD）注入的
+                    // 完整 DOWN+UP，那种事件从窗口视角看完全合法。
+                    // 曾在真机上被 GKD 的"跳过"规则误触过「跳过今天」，
+                    // 最终通过在 GKD 侧排除本应用解决。
+                    Log.i("GhostGuard", "已丢弃孤立触摸事件 action=" + ev.actionMasked)
                     return true
                 }
             }
@@ -138,6 +142,10 @@ class MainActivity : ComponentActivity() {
 
     /** 当前手势是否先收到过 ACTION_DOWN */
     private var sawTouchDown = false
+
+
+
+
     override fun onCreate(savedInstanceState: Bundle?) {
         // 【启动速度】不要 setTheme 到透明主题再切回来——那会多一次重启 Activity。
         // 正确做法是让 Window 背景在 Manifest 主题里就设成和首页接近的颜色，
@@ -178,6 +186,18 @@ class MainActivity : ComponentActivity() {
         setContent {
             AppRoot()
         }
+    }
+
+    /**
+     * 回到前台时复位按下状态。
+     *
+     * 边界场景：用户按着屏幕时切到后台，系统不会再补发 UP，
+     * [sawTouchDown] 会永久停在 true。此后回来后收到的第一个
+     * 孤立 UP 就会被误判为合法手势 —— 必须复位。
+     */
+    override fun onResume() {
+        super.onResume()
+        sawTouchDown = false
     }
 
     /**
@@ -348,6 +368,39 @@ private fun AppRoot() {
          */
         val contentBackdropLayer = rememberPrismalGlassLayer()
 
+        // 【跨 Window 共享】把两套录制层写进应用级容器。
+        //
+        // 弹窗（Dialog / 时间选择器）跑在独立 Window，
+        // CompositionLocal 传不进去 —— 它们只能通过 SharedBackdrop 拿采样源。
+        // 不写这一步，弹窗里的玻璃就永远只能画静态渐变兜底图。
+        androidx.compose.runtime.LaunchedEffect(backdropLayer, contentBackdropLayer) {
+            com.redmi.autoattend.ui.glass.SharedBackdrop.backgroundLayer = backdropLayer
+            com.redmi.autoattend.ui.glass.SharedBackdrop.contentLayer = contentBackdropLayer
+        }
+
+        // ==================== 统一采样源 ====================
+        //
+        // 用户反馈：时间卡片和打卡卡片是青色，健康度卡片是蓝色 —— 不同色。
+        //
+        // ## 根因
+        //
+        // 两套录制层同时在用：
+        //   · backdropLayer      → 只录 FlowingBackground（纯光斑，偏青）
+        //   · contentBackdropLayer → 录背景+卡片+文字（偏蓝）
+        //
+        // 不同卡片因为位置不同，采到的层不一样，于是颜色分裂。
+        //
+        // ## 为什么不直接用 contentLayer 给所有卡片
+        //
+        // contentLayer 是**正在录制的内容本身**。卡片如果采样它，
+        // 就会形成「录制 → 渲染进录制层 → 重新录制」的自我引用，必崩。
+        // 这一点已经真机验证过。
+        //
+        // ## 正确做法：所有卡片统一采样 backdropLayer
+        //
+        // backdropLayer 只录流动背景，不会自我引用，
+        // 所有卡片采样它 → 颜色必然一致。
+        // 代价是卡片背后看不到其他卡片（但磨砂 30dp 本来也看不清，无影响）。
         CompositionLocalProvider(LocalBackdropLayer provides backdropLayer) {
             Box(Modifier.fillMaxSize()) {
                 // 第 1 层：流动背景（带录制）
@@ -513,12 +566,27 @@ private fun AppRoot() {
                     GlassTabBar(
                         tabs = listOf("首页", "设置"),
                         selectedIndex = tabIndex,
-                        onSelect = { target ->
-                            // 底栏点击：直接翻页，pager 是唯一真相来源。
-                            // 不在这里写 tabIndex —— 它由 pager 稳定后回写，
-                            // 避免两个写入者打乱状态。
+                        onSelect = { target, fromDrag ->
+                            // pager 是唯一真相来源。这里不写 tabIndex ——
+                            // 它由 pager 稳定后回写，避免两个写入者打乱状态。
                             pagerScope.launch {
-                                pagerState.animateScrollToPage(target)
+                                if (fromDrag) {
+                                    // 【拖拽松手】页面已经跟着手指挪了一大半，
+                                    // 再播一次完整翻页动画就成了"重复一遍点击的动作"。
+                                    // 直接用 scrollToPage 落到目标页：零动画，
+                                    // 跟手结束即到位，这才是 iOS 的手感。
+                                    pagerState.scrollToPage(target)
+                                } else {
+                                    // 【点击】完整翻页动画，慢速非线性（iOS 18 质感）。
+                                    pagerState.animateScrollToPage(
+                                        page = target,
+                                        animationSpec = androidx.compose.animation.core.tween(
+                                            durationMillis = 460,
+                                            easing = androidx.compose.animation.core
+                                                .CubicBezierEasing(0.32f, 0.72f, 0f, 1f),
+                                        ),
+                                    )
+                                }
                             }
                         },
                         liveOffset = pageOffset.value,

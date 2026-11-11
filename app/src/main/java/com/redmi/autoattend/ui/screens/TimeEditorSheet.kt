@@ -59,17 +59,44 @@ fun TimeEditorSheet(
     // 苹果的 sheet 都是"弹出来"而不是"直接出现"。
     val scale = remember { androidx.compose.animation.core.Animatable(0.92f) }
     val alpha = remember { androidx.compose.animation.core.Animatable(0f) }
+    // iOS 18 标准：慢速非线性。FastOutSlowInEasing 偏"急停"，
+    // 这里换成 Apple 常用的 cubic-bezier(0.32, 0.72, 0, 1)。
+    val iosEaseOut = androidx.compose.animation.core.CubicBezierEasing(0.32f, 0.72f, 0f, 1f)
+
     androidx.compose.runtime.LaunchedEffect(Unit) {
-        scale.animateTo(1f, androidx.compose.animation.core.tween(280, easing = androidx.compose.animation.core.FastOutSlowInEasing))
+        scale.animateTo(
+            1f,
+            androidx.compose.animation.core.tween(360, easing = iosEaseOut),
+        )
     }
     androidx.compose.runtime.LaunchedEffect(Unit) {
-        alpha.animateTo(1f, androidx.compose.animation.core.tween(200))
+        alpha.animateTo(
+            1f,
+            androidx.compose.animation.core.tween(240, easing = iosEaseOut),
+        )
     }
 
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false),
     ) {
+        // 【系统级真模糊】这是 iOS sheet 的真实做法：
+        // 由 SurfaceFlinger 在合成阶段模糊弹窗背后的整个界面。
+        // AGSL 在这里不起作用（主界面被遮挡后录制层不再更新），
+        // 所以必须走系统管线。
+        com.redmi.autoattend.ui.glass.DialogSystemBlur(radiusDp = 26f)
+        // 【关键】弹窗必须显式传采样源。
+        //
+        // Dialog 是 subcomposition，会继承父级 LocalBackdropLayer，
+        // 但那层只录了流动背景（纯光斑），没有页面内容 ——
+        // 弹窗玻璃采样它就只剩一片蓝色渐变，没有任何质感。
+        //
+        // 这里改用 SharedBackdrop.contentLayer（背景+卡片+文字）。
+        // 弹窗自己不在内容层里，采样它**不会**自我引用。
+        androidx.compose.runtime.CompositionLocalProvider(
+            com.redmi.autoattend.ui.glass.LocalDialogBackdrop provides
+                com.redmi.autoattend.ui.glass.SharedBackdrop.contentLayer,
+        ) {
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -82,14 +109,15 @@ fun TimeEditorSheet(
                 //
                 // 这里用 12% 的极淡白（浅色）或 8% 的黑（深色），
                 // 只做"轻微后退"，绝不压暗画面。
-                .background(
-                    if (colors.isDark) {
-                        Color.Black.copy(alpha = 0.30f)
-                    } else {
-                        // 浅色主题：用极淡的冷白，模拟 iOS 的"背景微退"
-                        Color(0xFF0A1220).copy(alpha = 0.10f)
-                    },
-                )
+                // 【不要再自绘遮罩】
+                //
+                // 之前这里铺了一层半透明色，把系统模糊的效果盖住了。
+                // iOS sheet 的背景是**系统模糊 + 极淡的纱**，
+                // 不是纯色蒙版。现在遮罩透明，让 SurfaceFlinger 的
+                // 模糊结果直接透出，再叠一层极轻的纱即可。
+                // 系统模糊已经提供了层次，这里不再叠自绘蒙版。
+                // 之前那层 0.04~0.12 的色把模糊结果又压暗了一次。
+                .background(Color.Transparent)
                 .ClickableNoRipple(onClick = onDismiss),
             contentAlignment = Alignment.Center,
         ) {
@@ -108,8 +136,39 @@ fun TimeEditorSheet(
                             this.alpha = alpha.value
                         },
                     cornerRadius = GlassRadius.Large,
+                    // ============ iOS 26 磨砂玻璃窗 ============
+                    //
+                    // 目标是 Apple 的 sheet：背景内容**完全柔化成色块**，
+                    // 只留得下"大概是什么颜色"，文字绝不可辨认；
+                    // 而弹窗自己的文字清晰锐利、对比充足。
+                    //
+                    // ## 两次调错的方向
+                    //
+                    // 第一次（tint 0.058 + 白描边 0.95）：整片发白，像蒙雾。
+                    //   原因：浅色背景被白 tint 继续提亮，把内容洗掉。
+                    //
+                    // 第二次（tint 0.012 + 模糊 32dp）：透过头且发暗。
+                    //   原因：模糊不够大，背后文字没糊成色块，
+                    //   两层文字打架；同时描边被压太狠，整个面板失去存在感。
+                    //
+                    // ## 正确配方
+                    //
+                    //   1. 模糊 52dp —— 文字必须糊到不可辨认，只剩色块；
+                    //   2. tint 用**中性灰白**（不是纯白也不是深灰），
+                    //      alpha 0.045 —— 给玻璃一层自己的"底"，
+                    //      既不提亮（纯白会洗掉内容）也不压暗（深灰会显脏）；
+                    //   3. 描边保持中等强度，靠它定义"厚度"。
+                    // 系统模糊已经提供了真正的背景虚化，
+                    // 面板自身只需要一层薄材质来定形与提亮，
+                    // 不再是"既要模糊又要着色"的双重负担。
+                    tint = Color(0x12F8FAFD),
+                    tintAlpha = 0.055f,
+                    blurRadius = 12.dp,
+                    refractionHeightOverride = 46.dp,
+                    refractionAmountOverride = 64.dp,
+                    dispersionOverride = 0.16f,
                     sampleOffsetX = 0.5f,
-                    sampleOffsetY = 0.4f,
+                    sampleOffsetY = 0.5f,
                 ) {
                     Column(
                         modifier = Modifier.padding(24.dp),
@@ -164,6 +223,7 @@ fun TimeEditorSheet(
                 }
             }
         }
+        }   // CompositionLocalProvider
     }
 }
 

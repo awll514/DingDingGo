@@ -23,6 +23,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.redmi.autoattend.core.HealthCheck
 import com.redmi.autoattend.ui.glass.FrostedPanel
+import com.redmi.autoattend.ui.glass.LiquidGlassPanel
 import com.redmi.autoattend.ui.theme.GlassDimens
 import com.redmi.autoattend.ui.theme.GlassTheme
 
@@ -40,9 +41,42 @@ fun HealthCard(
 ) {
     val colors = GlassTheme.colors
 
+    // ============ 材质与配色的统一（真机实测驱动）============
+    //
+    // 用户反馈：时间卡片/打卡卡片偏青，健康度卡片偏蓝，要求同步。
+    //
+    // 试过把本卡片也改成 LiquidGlassPanel，结果是：
+    //   · 布局塌陷（两者内容尺寸计算方式不同）
+    //   · 倒计时数字出现 AGSL 自引用残影
+    // 所以维持 FrostedPanel —— 它是列表项的正确选择，
+    // 问题只是**配色没对齐**。
+    //
+    // 真机取样（h7.png，1280x2772）：
+    //   时间卡片中心  R=145 G=204 B=241
+    //   打卡卡片中心  R=134 G=203 B=248
+    //   健康度卡片    R=155 G=213 B=251
+    //
+    // 三者本该接近，但 FrostedPanel 的颜色完全由 tint 决定、
+    // 不采样背景，所以固定偏蓝。
+    //
+    // ## 为什么改 tint 的 RGB 而几乎无效
+    //
+    // FrostedPanel 在浅色主题下会把 tint 的 alpha 再乘 0.42 / 0.24：
+    //     base.copy(alpha = base.alpha * 0.42f)
+    //
+    // 我传的 0x16 是 0.086，再乘 0.42 → 只剩 3.6%，几乎完全透明。
+    // 所以无论 RGB 怎么改，在最终画面上都看不出来。
+    //
+    // 正确做法：**不传 tint，而是给一个明显更高的 alpha**，
+    // 让它在乘完 0.42 之后仍有可见的存在感。
+    //
+    // 实测目标色（时间卡片中心）：R=144 G=203 B=241。
+    // 用 R 低于 G、G 低于 B 的冷青白，配合较高 alpha，
+    // 让合成结果落在同一色域。
     FrostedPanel(
         modifier = modifier.fillMaxWidth(),
         cornerRadius = GlassDimens.radiusMedium,
+        tint = Color(0x4DEAF4FF),
     ) {
         Column {
             Row(
