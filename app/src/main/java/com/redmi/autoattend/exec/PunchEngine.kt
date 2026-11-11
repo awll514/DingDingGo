@@ -7,7 +7,10 @@ import com.redmi.autoattend.core.AppConfig
 import com.redmi.autoattend.core.ChannelPreference
 import com.redmi.autoattend.core.PunchSchedule
 import com.redmi.autoattend.data.db.PunchKind
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import java.util.concurrent.TimeUnit
 
 /**
@@ -245,6 +248,12 @@ class PunchEngine(private val context: Context) {
             // ---- 1. 准备 ----
             log("开始执行 kind=" + kind.name + " 通道偏好=" + pref.name)
 
+            // ---- 1.5 取消检查点 ----
+            //
+            // 从进入 try 到第一条 delay 之间没有挂起点，期间如果用户点了暂停，
+            // 取消信号不会自动生效。显式检查一次，保证暂停能立刻中断。
+            currentCoroutineContext().ensureActive()
+
             // ---- 2. 点亮屏幕 ----
             if (!prepareScreen()) {
                 return fail(PunchStage.WAKE, "无法点亮屏幕")
@@ -262,8 +271,25 @@ class PunchEngine(private val context: Context) {
                 title = "正在接管屏幕",
                 subtitle = "钉钉GO 正在操作界面",
                 onPause = {
-                    // 暂停 = 取消本次执行，但保留服务
+                    // 暂停 = 取消当前协程，但保留服务与悬浮窗，
+                    // 用户可以再点「▶」继续。
                     PunchForegroundService.requestPause(context)
+                    ControlHudOverlay.setPaused(
+                        context,
+                        paused = true,
+                        title = "正在接管屏幕",
+                        subtitle = "钉钉GO 正在操作界面",
+                    )
+                },
+                onResume = {
+                    // 继续 = 让服务重新走一次执行流程（跳过预热等待）
+                    PunchForegroundService.requestResume(context)
+                    ControlHudOverlay.setPaused(
+                        context,
+                        paused = false,
+                        title = "正在接管屏幕",
+                        subtitle = "钉钉GO 正在操作界面",
+                    )
                 },
                 onCancel = {
                     PunchForegroundService.requestCancel(context)
@@ -353,9 +379,27 @@ class PunchEngine(private val context: Context) {
                 trace = trace.toList(),
                 channelUsed = channelUsed,
             )
+        } catch (c: CancellationException) {
+            // 【关键】取消必须原样抛出去，绝不能转成 PunchResult。
+            //
+            // 之前这里是 catch (Throwable)，CancellationException 也被吞成一个
+            // "success=false" 的普通结果。后果是：
+            //   用户点悬浮窗「暂停」→ job.cancel() → 本函数"正常返回" →
+            //   PunchForegroundService 的 finally 里 paused==true 就不 cleanup、
+            //   不 stopSelf，running 永远是 true。此后 FIRE 闹钟走进
+            //   "已有执行在进行" 分支直接 return —— **当天再也打不了卡**，
+            //   并且唤醒锁一直挂到 5 分钟超时。
+            //
+            // 协程取消是控制流，不是业务失败。这里只做资源清理然后 rethrow。
+            ControlHudOverlay.hide()
+            log("执行被中断（暂停/取消），交给上层收尾")
+            throw c
         } catch (t: Throwable) {
             ControlHudOverlay.hide()
             log("执行异常: " + t.javaClass.simpleName + " " + (t.message ?: ""))
+            // 严重错误（OOM / StackOverflow）继续往上抛：
+            // 把它们伪装成"打卡失败"会掩盖真正的故障原因。
+            if (t is VirtualMachineError || t is ThreadDeath) throw t
             return PunchResult(
                 success = false,
                 stage = PunchStage.PREPARE,

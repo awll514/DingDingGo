@@ -118,8 +118,16 @@ class KeepAliveService : Service() {
         // 必须尽快 startForeground，否则系统会在 5 秒内判定 ANR
         startForeground(NOTIFICATION_ID, buildNotification())
 
-        // 启动时就把无障碍和灵动岛准备好
-        runCatching { AccessibilityKeeper.ensureEnabled(this) }
+        // 启动时就把无障碍准备好。
+        //
+        // 【启动性能】onStartCommand 跑在主线程，而 ensureEnabled 内部会
+        // fork su + 轮询等待系统重新 bind 无障碍，最长接近 2 秒。
+        // 这里是**保活服务**，晚几百毫秒做这件事完全无影响，
+        // 但直接在主线程做就会阻塞任何正在进行的界面绘制。
+        // 所以放到 scope（Dispatchers.Default）里。
+        scope.launch {
+            runCatching { AccessibilityKeeper.ensureEnabled(this@KeepAliveService) }
+        }
 
         startSelfCheckLoop()
 

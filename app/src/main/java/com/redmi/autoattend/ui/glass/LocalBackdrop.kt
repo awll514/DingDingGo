@@ -65,3 +65,12 @@ object SharedBackdrop {
  * 最后才是静态渐变兜底。
  */
 val LocalDialogBackdrop = staticCompositionLocalOf<PrismalBackdrop?> { null }
+
+/**
+ * 新库（Kyant0/AndroidLiquidGlass）的采样源。
+ *
+ * 与上面的 LocalBackdropLayer 并存，用于分阶段迁移：
+ * 旧的 Prismal 层先留着（卡片还在用），
+ * 新的组件走这个 —— 它的模糊在库内实现，不依赖 Compose 效果链。
+ */
+val LocalLiquidBackdrop = compositionLocalOf<com.kyant.backdrop.Backdrop?> { null }

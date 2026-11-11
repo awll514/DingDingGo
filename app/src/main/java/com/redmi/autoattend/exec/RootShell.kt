@@ -102,7 +102,17 @@ object RootShell {
                 sb.append("\n[timeout]")
             }
             sb.toString()
+        } catch (c: InterruptedException) {
+            // 协程取消时 Thread.sleep 会被中断。恢复中断位后原样抛出，
+            // 不要把它伪装成"命令执行失败"。
+            Thread.currentThread().interrupt()
+            Log.w(TAG, "exec interrupted")
+            throw c
         } catch (t: Throwable) {
+            // 只吞运行期异常（IOException / SecurityException / 超时）。
+            // VirtualMachineError 之类继续上抛，否则真正的故障会被当成"su 没输出"。
+            if (t is kotlinx.coroutines.CancellationException) throw t
+            if (t is VirtualMachineError) throw t
             Log.w(TAG, "exec failed: " + t.javaClass.simpleName)
             sb.toString()
         } finally {

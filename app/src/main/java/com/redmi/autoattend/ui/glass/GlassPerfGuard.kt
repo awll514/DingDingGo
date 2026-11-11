@@ -47,6 +47,30 @@ object GlassPerfGuard {
     /** 降级后至少保持这么久再考虑恢复，避免反复横跳 */
     private const val RESTORE_COOLDOWN_MS = 8_000L
 
+    /**
+     * 切回前台后的预热帧数。
+     *
+     * ## 为什么必须有这个
+     *
+     * 进程从后台回到前台的第一帧必然很慢：Compose 要重建组合、
+     * AGSL 管线要重新初始化、图层要重新录制。实测这一段单帧轻松超过 200ms，
+     * 远超 SLOW_FRAME_MS 的 48ms 阈值。
+     *
+     * 如果这段被算进"慢帧"统计，只要用户切几次前后台，
+     * 就会在**设备完全不卡**的情况下被判成"需要降级"，
+     * 然后玻璃永久退化成没有模糊和折射的 FrostedPanel ——
+     * 看起来就像"玻璃突然变成一块塑料板"，而且用户不知道为什么。
+     *
+     * 所以切回前台后先丢弃若干帧不参与统计。
+     */
+    private const val WARMUP_FRAMES_AFTER_RESUME = 8
+
+    /**
+     * 两帧间隔超过这个值，就认为发生了"suspend / 屏幕熄灭 / 切前后台"，
+     * 而不是普通掉帧。1 秒足够区分：正常掉帧不会到这个量级。
+     */
+    private const val RESUME_GAP_MS = 1_000L
+
     /** 是否应该降级（false = 用全 AGSL 管线） */
     var shouldDegrade by mutableStateOf(initialDegrade())
         private set
@@ -85,10 +109,26 @@ object GlassPerfGuard {
             var lastFrameNanos = 0L
             var degradedAt = 0L
 
+            // 前后台切换时重置统计窗口，避免"切回来第一帧慢"被误判为掉帧。
+            // 前后台切换会触发一次重新组合，但 LaunchedEffect(Unit) 不会重启，
+            // 所以这里用一个可变的预热计数来吸收那几帧。
+            var warmupLeft = 0
+
             while (true) {
                 withFrameNanos { now ->
                     if (lastFrameNanos != 0L) {
                         val deltaMs = (now - lastFrameNanos) / 1_000_000L
+
+                        // 间隔异常大 = 刚从后台回来（或屏幕刚点亮），不计入判定
+                        if (deltaMs > RESUME_GAP_MS) {
+                            warmupLeft = WARMUP_FRAMES_AFTER_RESUME
+                        }
+                        if (warmupLeft > 0) {
+                            warmupLeft--
+                            slowFrames = 0
+                            lastFrameNanos = now
+                            return@withFrameNanos
+                        }
                         val elapsedSinceDegrade = (now - degradedAt) / 1_000_000L
 
                         if (shouldDegrade) {

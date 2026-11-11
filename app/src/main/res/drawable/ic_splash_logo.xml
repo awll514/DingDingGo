@@ -1,17 +1,32 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 启动图标：简洁的时钟 + 勾，和 App icon 语言一致 -->
+<!--
+  启动图标：时钟 + 对勾。
+
+  ## 尺寸约束（Android 12+ SplashScreen）
+  系统会把图标裁进一个**圆形遮罩**（直径约等于画布的 2/3）。
+  图形一旦撑满画布，四角就会被裁掉 —— 实测出现过"外环被切成四段、只剩四条弧"。
+  所以图形必须收在中心安全区内：
+    · 画布 108×108，安全圆直径 ≈ 72（半径 36，圆心 54,54）
+    · 这里取半径 34，留 2px 余量
+
+  ## 不要给 windowSplashScreenIconBackgroundColor
+  留空即可。图形小于画布时系统不会再补底色。
+-->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
+    <!-- 外环：外径 34，内径 26，中心 (54,54) -->
     <path
         android:fillColor="#7CC4FF"
-        android:pathData="M54,26 C69.5,26 82,38.5 82,54 C82,69.5 69.5,82 54,82 C38.5,82 26,69.5 26,54 C26,38.5 38.5,26 54,26 Z M54,32 C41.8,32 32,41.8 32,54 C32,66.2 41.8,76 54,76 C66.2,76 76,66.2 76,54 C76,41.8 66.2,32 54,32 Z" />
+        android:pathData="M54,20 C72.8,20 88,35.2 88,54 C88,72.8 72.8,88 54,88 C35.2,88 20,72.8 20,54 C20,35.2 35.2,20 54,20 Z M54,28 C39.6,28 28,39.6 28,54 C28,68.4 39.6,80 54,80 C68.4,80 80,68.4 80,54 C80,39.6 68.4,28 54,28 Z" />
+    <!-- 时针：从中心向上，再向右折 -->
     <path
         android:fillColor="#7CC4FF"
-        android:pathData="M52,40 L56,40 L56,55 L67,55 L67,59 L52,59 Z" />
+        android:pathData="M51,35 L57,35 L57,54 L68,54 L68,60 L51,60 Z" />
+    <!-- 对勾：小而短，压在时针右下方 -->
     <path
         android:fillColor="#4ADE80"
-        android:pathData="M44,66 L49,71 L66,50 L61,46 Z" />
+        android:pathData="M42,62 L48,68 L66,48 L60,42 Z" />
 </vector>

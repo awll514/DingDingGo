@@ -86,6 +86,40 @@ object SystemBlur {
                 .asComposeRenderEffect()
         }
     }
+
+    /**
+     * 把模糊**直接施加到一个 Prismal 录制层的 GraphicsLayer 上**。
+     *
+     * ## 为什么需要这个
+     *
+     * PrismalAGSL 的 `blurRadius` 在本机上完全不生效：
+     *   底栏 14dp / 60dp / 200dp 三个值的截图逐像素一致，背后文字始终锐利；
+     *   折射、色散归零也不影响；而 `supportsBackdropBlur` 返回 true。
+     *   → 不是设备不支持，是那条采样路径上模糊没接上（库的问题）。
+     *
+     * 但同一台机器上，原生 `RenderEffect.createBlurEffect` **完全有效**
+     * （加在任何元素上都能把它糊掉）。
+     *
+     * ## 思路
+     *
+     * 不去修"玻璃糊采样结果"，而是让**采样源本身是糊的**：
+     * `PrismalGlassLayer` 内部就是一个 Compose `GraphicsLayer`，
+     * 把 RenderEffect 挂在它上面，录制进去的内容天然模糊。
+     * 之后不管库的模糊是否工作，玻璃采到的都已经是柔化画面。
+     *
+     * 这是唯一能绕开库缺陷、又不改库本身的做法。
+     */
+    fun applyTo(layer: com.styropyr0.prismal.sources.PrismalGlassLayer?, blurPx: Float) {
+        if (layer == null) return
+        if (!isSupported || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
+        runCatching {
+            layer.graphicsLayer.renderEffect = RenderEffect
+                .createBlurEffect(blurPx, blurPx, Shader.TileMode.CLAMP)
+                .asComposeRenderEffect()
+        }.onFailure {
+            android.util.Log.w("SystemBlur", "给录制层加模糊失败: " + it.javaClass.simpleName)
+        }
+    }
 }
 
 /** 组合本机实际可用的模糊管线描述，用于设置页如实展示 */

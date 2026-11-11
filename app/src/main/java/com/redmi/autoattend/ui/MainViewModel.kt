@@ -109,12 +109,33 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         AppConfig.reload()
         _ui.value = _ui.value.copy(themeMode = AppConfig.themeMode.value)
         PunchNotifier.ensureChannels(app)
-        // 启动时确保闹钟已注册（进程可能被杀过）
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching { AlarmScheduler.scheduleNext(getApplication()) }
+
+        // 启动时确保闹钟已注册（进程可能被杀过）。
+        //
+        // 【启动性能关键修正】这里原本和 refreshHealth() 一起在 init 里立刻触发，
+        // 而 refreshHealth() 内部的 HealthCheck.check() 会调
+        // RootShell.isAvailable() —— 那是一次 **fork su 进程**的同步探测，
+        // 真机实测耗时 300~400ms，而且要连着跑好几次（每次 refreshHealth 一次），
+        // 直接造成冷启动时 "Skipped 185 frames"（约 3 秒主线程被占满）。
+        //
+        // 现在把两件重活都推迟到首帧绘制之后：
+        //   · 闹钟重排不着急 —— 系统里的闹钟本来就还在，这里只是修正 +
+        //     兜底；晚 1 秒不影响任何功能；
+        //   · 健康度检查更不着急 —— 它是诊断信息，晚一点出完全可接受。
+        //
+        // 用 viewModelScope（Main 调度器）+ delay 让出首帧，
+        // 再切到 IO 执行真正的重活。
+        viewModelScope.launch {
+            kotlinx.coroutines.delay(STARTUP_DEFER_MS)
+            withContext(Dispatchers.IO) {
+                runCatching { AlarmScheduler.scheduleNext(getApplication()) }
+            }
+        }
+        viewModelScope.launch {
+            kotlinx.coroutines.delay(STARTUP_DEFER_MS * 2)
+            refreshHealth()
         }
         startTicker()
-        refreshHealth()
     }
 
     /**
@@ -132,6 +153,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * 打卡记录一天最多变化几次，所以这里每 3 秒才真正查一次库；
      * 中间的 tick 只用缓存值算倒计时。
      */
+    /**
+     * 首帧之后再干重活。
+     *
+     * 冷启动时用户最先看到的是界面，而不是"闹钟是否已重排"。
+     * 把 root 探测、数据库查询这类几百毫秒的同步操作推到首帧之后，
+     * 直接决定了启动是"丝滑"还是"卡 2 秒"。
+     */
     @Volatile
     private var lastDbQueryAt: Long = 0L
 
@@ -145,6 +173,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private var cachedDayKey: Int = -1
 
     private companion object {
+        /**
+         * 首帧之后多久才做启动期的重活。
+         *
+         * 冷启动时用户最先看到的是界面，而不是"闹钟是否已重排"。
+         * 把 root 探测（fork su，实测 300~400ms）、数据库查询
+         * 这类同步操作推到首帧之后，直接决定了启动是"丝滑"还是"卡 2 秒"。
+         */
+        const val STARTUP_DEFER_MS = 400L
+
         /** 查库节流间隔 */
         const val DB_REFRESH_INTERVAL_MS = 3_000L
 

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!--
+      应用主题（深色 · values-night）。
+
+      与浅色版本结构完全一致，只换颜色。
+      背景取 GlassColors.DarkGlassColors.backgroundDeep = #04070F。
+    -->
+    <style name="Theme.AutoAttend" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@drawable/bg_app_window</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+    </style>
+
+    <style name="Theme.AutoAttend.Splash" parent="Theme.AutoAttend">
+        <item name="android:windowSplashScreenBackground">#04070F</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/ic_splash_logo</item>
+        <item name="android:windowSplashScreenAnimationDuration">0</item>
+        <item name="android:windowSplashScreenIconBackgroundColor">@android:color/transparent</item>
+    </style>
+
+</resources>

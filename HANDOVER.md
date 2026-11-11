@@ -2,7 +2,177 @@
 
 > 生成时间：2026-11-11 · 设备：Redmi K90 至尊版（M332BF / warsaw / HyperOS V816 / Android 16 / API 36）
 >
-> **最后更新：2026-11-11 14:05（第二轮真机迭代，详见 §0）**
+> **最后更新：2026-11-11 18:25（第三轮：换液态玻璃库 + 悬浮窗状态化，详见 §0）**
+
+---
+
+## 0. 第三轮迭代（本轮）
+
+### 0.1 换掉整套液态玻璃实现 ⚠️ 有取舍
+
+**从 `PrismalAGSL`（50 星）换成 `Kyant0/AndroidLiquidGlass`（4600 星）**
+
+```kotlin
+// gradle/libs.versions.toml
+backdrop = "2.0.1"
+backdrop = { group = "io.github.kyant0", name = "backdrop-android", version.ref = "backdrop" }
+```
+
+#### 为什么换
+
+PrismalAGSL 在本机有个硬伤：**`blurRadius` 完全不生效**。真机证据：
+
+- `14dp / 60dp / 200dp` 三档截图逐像素一致
+- 折射、色散归零 → 仍然不糊
+- 底栏高度 `52dp → 120dp` → 仍然不糊
+- 它自己的 `supportsBackdropBlur` 却返回 `true`
+
+为此试过七八种绕过方案（外层 `RenderEffect` 链、`RenderNode` 中转、
+`Bitmap` 拷贝、录制层预模糊、`CanvasDrawScope`），全部卡在同一个物理限制：
+**Compose 的 `GraphicsLayer` 无法在绘制阶段同步读成像素**，
+而 `drawLayer` 画出去的内容不经过父节点的 `RenderEffect`。
+
+（验证过：`RenderNode` + `setRenderEffect` 在这台机器上是有效的——
+画纯色矩形能看到真实羽化；但把 `drawLayer` 画进去就是空白。
+另外 `setRenderEffect` 必须在 `beginRecording` **之前**调用。）
+
+#### 新库的三个坑（都踩过了）
+
+**1. `effects` 块的顺序不能改**
+
+```kotlin
+effects = {
+    vibrancy()                       // 提亮 + 提饱和
+    blur(with(density) { r.toPx() }) // 真实高斯模糊
+    lens(w, h)                       // 边缘透镜，参数是**像素尺寸**
+}
+```
+
+- 把 `vibrancy()` 放最后 → 模糊被覆盖，等于没糊
+- `lens()` 两个参数是**像素**，不是强度系数。传 `1.2f / 0.35f` 等于 1 像素，等于没折射
+
+**2. `tintAlpha` 不是"着色浓度"，是"挡住下层多少"**
+
+这是最容易误判的一点。实测区间（浅色）：
+
+| tintAlpha | 效果 |
+|---|---|
+| 0.05 | 下层文字完全锐利，blur 调到 150px 都像没糊 |
+| 0.28 | 文字淡成灰影，仍能认出字形 |
+| 0.40 | **能看出后面有东西、但认不出字**（当前取值） |
+| 0.55 | 完全盖住，玻璃变实心白板 |
+
+**3. 这个库的 blur 本来就是"轻微柔化"，不是"糊成团块"**
+
+官方所有示例的半径都在 2–16dp：`LiquidBottomTabs` 8dp、`LiquidButton` 2dp、
+`DialogContent` 16dp(浅)/8dp(深)。所以"要仔细分辨才看清"在这个库里
+**不是靠加大 blur 实现的，是靠 tint 遮挡**。当前取值：
+
+- 底栏 `blur 8dp(深)/16dp(浅)` + `tintAlpha 0.45(深)/0.40(浅)`
+- 卡片 `blur 30dp`（默认，走同样的默认 tint）
+
+### 0.2 修掉的两个真机问题
+
+#### 折射闪烁（已修复）
+
+内容层上同时挂了**三个**录制修饰符（两个 Prismal + 一个新库），每帧互相覆盖
+同一份快照。删到只剩一个后实测三帧色值 `332 / 333.1 / 322.8`，波动 3%，稳定。
+
+#### 深黑字体导致折射发脏（已修复）
+
+`lens()` 传 20dp 时，折射把面板外的黑色笔画整段拉进边缘，模糊又不足以化开，
+形成内部发黑的污渍。**降到 8dp** 后边缘干净。
+
+### 0.3 深色主题底栏与界面统一（已修复）
+
+用户原话：「深色模式下感觉底栏风格和界面不是很统一」。
+
+根因是三条叠加：
+
+1. 底栏显式传了 `tint = Color(0xFFFFFFFF)`（白色）——
+   白叠在深蓝紫背景上，数学上必然趋向灰，于是底栏变灰紫
+2. 流动背景是「上蓝下紫」的渐变，底栏在屏幕底部天然采到紫色，卡片在中部采到蓝色
+3. 底栏区域背景本来最暗，再叠 0.40 的近黑 tint 就被压成近黑
+
+修法：深色 tint 改为偏蓝的 `Color(0xFF0E1B33)`，`tintAlpha 0.45`；
+底栏采样层与卡片统一为「只录背景」那一层。
+
+验证数据：
+
+| | 改前 | 改后 |
+|---|---|---|
+| 深色底栏 | `RGB(22,21,42)` 灰紫 | `RGB(24,26,67)` 蓝调 |
+| 深色卡片 | `RGB(27,50,77)` | `RGB(27,50,77)` |
+| 浅色底栏 | — | `RGB(211,227,251)` |
+| 浅色卡片 | — | `RGB(190,220,241)` |
+
+### 0.4 悬浮窗改造（部分完成 ⚠️）
+
+用户反馈三条：
+
+1. **两个按钮没作用** — ⚠️ **已改代码但未在真机验证点击效果**
+2. **只能暂停不能恢复** — ✅ 已加「▶」继续按钮（`requestResume` + `ACTION_RESUME`）
+3. **成功/失败/迟到全都不显示** — ✅ 已加状态提示，3 秒后自动淡出
+
+#### 已实现
+
+`ControlHudOverlay` 新增状态形态：
+
+```kotlin
+enum class Tone { RUNNING, SUCCESS, FAILURE, LATE, PAUSED }
+
+showStatus(context, tone, title, subtitle, holdMs = 3000L)
+```
+
+- **入场**：上方 12dp 滑入 + 淡入，220ms `DecelerateInterpolator(1.6f)`
+- **停留**：2400ms
+- **出场**：上移 10dp + 淡出，380ms `AccelerateInterpolator(1.4f)`（收得比展开慢）
+- 左侧结果色圆点：成功绿 `#34C759` / 失败红 `#FF3B30` / 迟到琥珀 `#FF9F0A`
+
+接入点 `PunchForegroundService.runPunch()`：打卡结束后立即显示，
+迟到判定口径与引擎一致（`finishedAt - targetAt >= 60_000L`）。
+
+设置页新增「测试结果提示」入口（依次演示成功/失败/迟到）。
+
+### 0.5 本轮**未完成**的事（重要，接手请从这里开始）
+
+| # | 事项 | 状态 | 关键信息 |
+|---|------|------|---------|
+| 1 | 悬浮窗两个按钮点击是否真的生效 | ⚠️ **未验证** | 代码已改，但最后一次截图没拍到悬浮窗（点击坐标偏了），**需要在真机上点一次确认** |
+| 2 | 状态提示的实际视觉效果 | ⚠️ **未验证** | `showStatus` 已实现并接入，但没拍到生效截图 |
+| 3 | 底栏"真正的模糊" | ❌ **放弃** | 见下方说明 |
+| 4 | `LiquidGlassPanel` 的 `sampleOffsetX/Y` | 死参数 | 签名里保留但函数体从未使用，是旧 Prismal 遗留 |
+| 5 | `SettingsScreen` / `LaunchOverlay` 的裸 `tween()` | 未迁移 | 仍有多处 `tween(220)` / `tween(280)` 未走 `GlassMotion` |
+| 6 | 深色首页两个大卡片偏黑 | 用户说不急 | 第二轮遗留 |
+
+#### 关于「底栏真正的模糊」为什么放弃
+
+要让底栏背后的文字真的糊成一团，必须让它采样**包含该文字的内容层**。
+但试过把底栏移进内容层录制范围，**直接 SIGSEGV**（RenderThread 崩在 GL 栈）——
+这是「录制 → 自身画进录制层 → 重新录制」的自引用。
+
+官方用「隐藏录制节点 + 显示节点」两个兄弟节点绕开，但那套结构针对固定尺寸的
+tab bar；我们的底栏要跟随 pager 进度和拖拽动画，重构成本高、风险大。
+
+**当前方案**：靠 `tintAlpha` 遮挡 + 小半径柔化，视觉上达到「能看出后面有东西、
+但认不出字」，但技术手段不是高斯模糊。
+
+### 0.6 本轮删除的文件
+
+- `ui/glass/HomegrownGlass.kt` — 自建 RenderNode 方案的遗留，已无引用
+- `ui/glass/GlassSurface.kt` — 同上
+
+### 0.7 验收状态
+
+| 项 | 结果 |
+|---|---|
+| `assembleDebug` | ✅ BUILD SUCCESSFUL |
+| 单元测试（8 个类） | ✅ OK (88 tests) |
+| 安装运行 | ✅ 进程存活，无崩溃 |
+| 深浅双主题 | ✅ 都验证过截图 |
+| 调试探针残留 | ✅ 已清理干净 |
+
+---
 
 ---
 
@@ -97,7 +267,7 @@ AGSL 的 `blurRadius` 只能模糊**它采集的 GraphicsLayer**。
 | 项目 | 状态 |
 |------|------|
 | 编译 | ✅ `BUILD SUCCESSFUL` |
-| 单元测试 | ✅ **84 / 84 全绿**（新增 24 个） |
+| 单元测试 | ✅ **88 / 88 全绿**（第三轮新增 4 个调度抗自激用例） |
 | 真机运行 | ✅ 无崩溃（`logcat AndroidRuntime:E` 空） |
 | 冷启动 | ⚠️ ~1966ms（首帧降级已移除，见 §0.3） |
 | 玻璃渲染 | ✅ AGSL 全管线正常运行 |
@@ -232,9 +402,21 @@ CLOCK_OUT_SAFETY_MARGIN_MS = 2_000L  // 下班卡最早触发点
 
 **必须来自钉钉界面真实反馈**，不能以"点击已发出"为成功。
 `verifyResult()` 返回非 null 才能 `success = true`。
-全库只有一个 `success = true` 站点。
 
 `ALREADY_DONE ≠ SUCCESS`。
+
+> **更正（第三轮）**：此处曾写"全库只有一个 `success = true` 站点"，实测有 **3 处**。
+> 改判定逻辑时必须三处一起看：
+>
+> | 位置 | 触发条件 | 说明 |
+> |------|---------|------|
+> | `PunchEngine.kt` L324 | `!clicked && alreadyDoneBefore` | 极速打卡：进页面时钉钉已自己打好 |
+> | `PunchEngine.kt` L349 | `verifyResult() != null` | 主路径，唯一"点了并验证成功"的站点 |
+> | `PunchEngine.kt` L961 | `targetAlreadyDone(blob, kind)` | 外勤闸门里的"目标时段已打卡 → 跳过" |
+>
+> 第三处最需要警惕：它靠 `targetAlreadyDone()` 的**字符串邻近匹配**
+> （"上班"/"下班" 关键词后 90 字符窗口内找"已打卡"）判定。
+> 钉钉改文案或改排布时这里会先失准。
 
 ### 3.3 外勤规则
 
@@ -285,10 +467,20 @@ Activity 不可见后**不得有任何持续动画或 AGSL 计算**。
 底栏折射需要肉眼判断（是否既能透出字、又有边缘形变）——
 如果太透就调 tintAlpha 到 0.08，如果折射过头就降 refractionAmount 到 18dp。
 
-### 4.2 暂停/恢复未真机验证
+### 4.2 暂停/恢复 —— 代码缺陷已修，仍未真机验证
 
 `ACTION_PAUSE` / `ACTION_RESUME` 已实现且编译通过，
 但**从未真正触发过一次打卡来验证**。
+
+**第三轮发现的真实缺陷（已修，见 §12）**：这条路原本是坏的。
+`PunchEngine.execute()` 用 `catch (Throwable)` 把协程取消也吞成一个普通失败结果，
+导致"暂停"之后 `running` 永远为 true、服务不退出、**当天再也打不了卡**。
+所以之前"没验证"不只是时间问题——即使去验证也会失败。
+
+**现在的语义**（待真机确认）：
+- 暂停 → 协程被取消并透传、立即释放唤醒锁、服务保活但不再阻塞
+- 暂停有 5 分钟有效期，超时后下一次闹钟可正常接管
+- 继续 → 先核对是否仍在可打卡窗口内，超出则收尾而不是硬打
 
 需要：在打卡窗口期手动触发一次，观察悬浮窗暂停按钮是否生效、能否恢复。
 
@@ -422,7 +614,14 @@ app/src/main/java/com/redmi/autoattend/
 | **`CompletedSlotTest`** | **11** | **已完成班次跳过（手动打卡后不重复触发）** |
 | `DayLabelTest` | 8 | 今天/明天/周几/日期文案 |
 | `SkipDateTest` | 5 | 跳过某天后下次打卡顺延 |
-| **合计** | **84** | |
+| **`SchedulerGuardTest`** | **4** | **调度抗自激（第三轮新增）** |
+| **合计** | **88** | |
+
+> **SchedulerGuardTest 覆盖的回归点**：闹钟触发后会重排下一班，
+> 而 `nextSlot` 在补执行窗口内会返回**同一个班次** ——
+> 如果重排时不把刚触发的槽位标记为已完成，就会形成
+> "FIRE → 重排 FIRE → FIRE…" 的自激循环。这组用例把
+> "确实会返回同一班次"和"标记后确实让位"两个事实都钉住了。
 
 > ⚠️ **AGP 9.3.1 在 Windows 下 `testDebugUnitTest` 会报 ClassNotFoundException**，
 > 但测试类其实编译成功了（在 `intermediates/built_in_kotlinc/` 下）。
@@ -467,10 +666,16 @@ app/src/main/java/com/redmi/autoattend/
 
 ## 9. 下一步建议（按优先级）
 
-1. **验证暂停/恢复**（§4.2）—— 这是唯一没跑过的功能路径
+1. **验证暂停/恢复**（§4.2）—— 第三轮已修复其代码缺陷（见 §12），
+   **但仍未真机验证**，需要在打卡窗口期手动跑一次
 2. **冷启动优化**（§4.1）—— 1936ms 仍偏慢
 3. 设置页剩余控件苹果化（§4.4）—— 分段控件、开关、周选择器
 4. 时间选择弹层视觉确认（§4.5）
+
+> ⛔ **已否决的方案**：本节过去建议"首帧先用 `FrostedPanel` 降级、稳定后退到 AGSL"。
+> **不要这么做** —— 踩坑 #9 已经论证过，用 `withFrameNanos` 做首帧降级会让
+> `agslReady` 永远是 false，全部面板永久停在无模糊的降级路径。
+> 冷启动要优化，方向是**减少首屏 AGSL 面板数量**或**预编译 shader**。
 
 ---
 
@@ -563,3 +768,80 @@ $base = "li.songe.gkd/com.google.android.accessibility.selecttospeak.SelectToSpe
 
 17. **第三方无障碍工具会干扰 UI 测试** —— 用户设备上的 GKD 会自动点击
     匹配到的文字（如「跳过今天」），排查时先确认有没有这类工具在跑。
+
+### 第三轮（代码审计，未跑真机）
+
+18. **`catch (Throwable)` 会吞掉协程取消** —— 这是本项目最危险的一处。
+    `PunchEngine.execute()` 里的 `catch (Throwable)` 把 `CancellationException`
+    转成了普通的 `PunchResult(success=false)`。协程取消是**控制流**，不是业务失败；
+    吞掉它之后上层 `finally` 里的 `if (!paused)` 判断失效，
+    服务既不清不退出、`running` 永远为 true，**当天后续打卡全部被静默忽略**。
+    **规则：任何 `catch (Throwable)` 之前先单独接 `CancellationException` 并 rethrow。**
+
+19. **`nextSlot` 在补执行窗口内会返回"同一个班次"** ——
+    这是"补执行"特性的必然结果（`effectiveTrigger = now`）。
+    但它和"每次闹钟触发后重排"组合起来，会形成
+    "FIRE → 重排 FIRE → FIRE…" 的自激循环。
+    凡是"触发后立刻重排"的调度器，都必须显式标记"刚触发过的这个槽位"。
+
+20. **"暂停"如果没有有效期，就等于"永久停用"** ——
+    `paused` 曾是布尔值，一旦置 true 就没人能改回来。
+    用户点了暂停又忘记继续，当天就再也打不了卡，界面上还完全看不出原因。
+    **凡是"用户可进入但不会自动退出的状态"，都要有超时。**
+
+21. **前后台切换的第一帧不能计入掉帧统计** ——
+    `GlassPerfGuard` 用 48ms 作为"慢帧"阈值，而进程回到前台的
+    首帧重建组合 + AGSL 管线初始化轻松超过 200ms。
+    切几次前后台就会被误判成"设备卡顿"，然后玻璃永久降级成无模糊的磨砂板。
+    需要丢弃切换后的若干帧。
+
+22. **动效参数必须集中定义** —— 之前缓动曲线散在 6 个文件里，
+    还有 2 处残留 `spring()`，导致同一个"按下回弹"在两个组件里观感不同。
+    统一到 `ui/theme/GlassMotion.kt` 后改一处即全局生效。
+---
+
+## 12. 第三轮：代码审计与修复（未跑真机）
+
+> **本轮全程没有触发任何真实打卡。** 所有验证都是编译 + 纯函数单元测试。
+
+### 12.1 修复清单
+
+| # | 严重度 | 问题 | 修复 | 验证 |
+|---|--------|------|------|------|
+| 1 | 🔴 P0 | `PunchEngine` 用 `catch (Throwable)` 吞掉 `CancellationException`，暂停后 `running` 永远为 true、服务不退出、**当天再也打不了卡** | 单独 catch `CancellationException` 并 rethrow；`VirtualMachineError` 等也继续上抛；入口加 `ensureActive()` 检查点 | 编译通过 |
+| 2 | 🔴 P0 | 闹钟触发后立刻重排，而 `nextSlot` 在补执行窗口内返回**同一班次** → FIRE 自激循环 | 新增 `AlarmScheduler.markJustFired()`；重排前标记刚触发的槽位；重排提到 startService **之前** | `SchedulerGuardTest` 4 例 |
+| 3 | 🔴 P0 | 暂停态无有效期，且暂停时不释放唤醒锁 | 加 `PAUSE_MAX_MS`（5 分钟）有效期；暂停立即 `releaseWakeLock()`，继续时重新获取；新请求可接管超时暂停 | 编译通过 |
+| 4 | 🟡 P2 | 恢复执行时不校验 `pendingTargetAt` 是否已过期 | 恢复前先查 `withinRetryWindow`，超窗直接收尾 | 编译通过 |
+| 5 | 🟡 P2 | 前后台切换首帧被计入掉帧 → 误判降级，玻璃永久变磨砂 | `RESUME_GAP_MS` 间隔检测 + 丢弃切换后 8 帧 | 编译通过 |
+| 6 | 🟡 P2 | 2 处残留 `spring()` 违反"全应用禁用 spring"；缓动曲线散在 6 个文件 | 新建 `ui/theme/GlassMotion.kt` 统一时长与曲线；`PressEffect`/`LiquidGlassButton` 改用它 | 全库 `spring(` 仅剩注释 |
+| 7 | 🟢 | `PunchSchedule` 的 `best!!` 断言 | 改局部变量持有 | 编译通过 |
+| 8 | 🟢 | `RootShell.exec` 的 `catch (Throwable)` 会把中断当失败 | 单独接 `InterruptedException` 恢复中断位并 rethrow | 编译通过 |
+| 9 | 🟢 | 文档称"全库只有一个 `success = true` 站点"，实际 3 处 | 修正 §3.2 并列表三处 | — |
+| 10 | 🟢 | §9 建议的冷启动方案与踩坑 #9 直接矛盾 | §9 标注"已否决" | — |
+
+### 12.2 新增/变更文件
+
+| 文件 | 变更 |
+|------|------|
+| `exec/PunchEngine.kt` | 取消传播；`ensureActive()` 检查点 |
+| `exec/PunchForegroundService.kt` | `PAUSE_MAX_MS`、`isPauseActive()`、暂停释放唤醒锁、恢复前校验窗口 |
+| `exec/PunchAlarmReceiver.kt` | 重排提前到启动服务之前 + 调用 `markJustFired` |
+| `core/AlarmScheduler.kt` | `markJustFired()` / `isJustFired()` / 重排时跳过刚触发槽位 |
+| `core/PunchSchedule.kt` | 去掉 `!!` |
+| `exec/RootShell.kt` | 中断语义修正 |
+| `ui/theme/GlassMotion.kt` | **新增**：统一动效规格 |
+| `ui/components/PressEffect.kt` | 去掉 spring |
+| `ui/components/LiquidGlassButton.kt` | 去掉 spring |
+| `ui/glass/GlassPerfGuard.kt` | 前后台切换预热帧 |
+| `app/src/test/.../SchedulerGuardTest.kt` | **新增**：4 个调度抗自激用例 |
+
+### 12.3 本轮验证结果
+
+```
+:app:compileDebugKotlin        BUILD SUCCESSFUL
+:app:compileDebugUnitTestKotlin BUILD SUCCESSFUL
+JUnitCore 全量                  OK (88 tests)
+```
+
+> ⚠️ **仍未真机验证**：暂停/恢复的实际观感、`markJustFired` 在跨天场景下的行为、
+> 玻璃降级阈值是否合适。这些都需要上机确认。

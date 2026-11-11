@@ -131,7 +131,11 @@ object PunchSchedule {
                     isOverride = override != null,
                 )
 
-                if (best == null || slot.targetAtMillis < best!!.targetAtMillis) {
+                // 用局部变量持有当前最优值，避免 !! 断言：
+                // 这里 if/赋值之间虽然无并发，但 !! 会让后续维护者在
+                // 增加判断分支时踩空。
+                val current = best
+                if (current == null || slot.targetAtMillis < current.targetAtMillis) {
                     best = slot
                 }
             }

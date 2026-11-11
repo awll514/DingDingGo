@@ -1,9 +1,8 @@
 package com.redmi.autoattend.ui.components
 
 import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.Spring
-import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
+import com.redmi.autoattend.ui.theme.GlassMotion
 import androidx.compose.foundation.interaction.InteractionSource
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
@@ -51,24 +50,22 @@ fun Modifier.pressEffect(
         if (!enabled) return@LaunchedEffect
 
         if (pressed) {
-            // 按下：快速缩小，用 tween 保证跟手（弹簧在这里会显得拖沓）
+            // 按下：180ms 主曲线。不用 spring —— 见 GlassMotion 的说明。
             launch {
-                scale.animateTo(scaleDown, tween(90))
+                scale.animateTo(scaleDown, tween(GlassMotion.PRESS_DOWN, easing = com.redmi.autoattend.ui.theme.IosEaseOut))
             }
             // 触觉反馈：只在按下时触发一次
             runCatching {
                 haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
             }
         } else {
-            // 抬起：弹簧回弹，带一点过冲，手感更"Q"
+            // 抬起：340ms 主曲线回落。
+            //
+            // 原先这里用 spring(DampingRatioMediumBouncy)，会产生一次可见的
+            // 过冲再回弹。AGENTS.md 已明确禁用 spring：在"按下→抬起"这种
+            // 有明确终点的闭环里，过冲属于多余动作，观感上更廉价。
             launch {
-                scale.animateTo(
-                    1f,
-                    spring(
-                        dampingRatio = Spring.DampingRatioMediumBouncy,
-                        stiffness = Spring.StiffnessMedium,
-                    ),
-                )
+                scale.animateTo(1f, GlassMotion.settleSpec())
             }
         }
     }

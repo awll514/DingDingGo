@@ -62,6 +62,20 @@ class PunchForegroundService : Service() {
         private const val CHANNEL_ID = "punch_execution"
         private const val NOTIFICATION_ID = 2001
 
+        /**
+         * 暂停状态的最长存活时间。
+         *
+         * ## 为什么暂停必须会过期
+         *
+         * 暂停曾是"永久"状态：一旦点过暂停，`running` 再也不会变回 false，
+         * 之后每一次 FIRE / RETRY 闹钟都会走进"已有执行在进行"分支被直接忽略。
+         * 用户忘了点"继续"，当天就再也打不上卡，而且界面上看不出原因。
+         *
+         * 这里给暂停加一个明确的有效期（与唤醒锁上限同量级）。
+         * 超过之后状态自动失效，下一次闹钟可以正常接管。
+         */
+        private const val PAUSE_MAX_MS = 5 * 60 * 1000L
+
         /** 唤醒锁最长持有时间，防止异常泄漏导致耗电 */
         private const val WAKELOCK_TIMEOUT_MS = 5 * 60 * 1000L
 
@@ -76,6 +90,22 @@ class PunchForegroundService : Service() {
                 context.startService(
                     Intent(context, PunchForegroundService::class.java)
                         .setAction(ACTION_PAUSE),
+                )
+            }
+        }
+
+        /**
+         * 请求继续执行（悬浮提示的「▶」按钮用）。
+         *
+         * 暂停只是取消了当前协程，服务和悬浮窗都还在 ——
+         * 用户点「▶」后由这里重新投递 ACTION_RESUME，
+         * 服务会重走一次执行流程（跳过预热等待）。
+         */
+        fun requestResume(context: Context) {
+            runCatching {
+                context.startService(
+                    Intent(context, PunchForegroundService::class.java)
+                        .setAction(ACTION_RESUME),
                 )
             }
         }
@@ -100,6 +130,14 @@ class PunchForegroundService : Service() {
     /** 是否处于暂停状态（暂停后保留服务，可恢复） */
     @Volatile
     private var paused = false
+
+    /** 暂停的失效时刻。到点后不再阻塞新的执行请求。 */
+    @Volatile
+    private var pausedUntil = 0L
+
+    /** 暂停是否仍然有效（既在暂停态，又没超时） */
+    private fun isPauseActive(): Boolean =
+        paused && System.currentTimeMillis() < pausedUntil
 
     /** 当前执行的协程，暂停时要取消它 */
     private var job: kotlinx.coroutines.Job? = null
@@ -132,7 +170,15 @@ class PunchForegroundService : Service() {
             // 用户还能从悬浮窗点"继续"或者"取消"。
             Log.i(TAG, "收到暂停指令")
             paused = true
+            pausedUntil = System.currentTimeMillis() + PAUSE_MAX_MS
             job?.cancel()
+
+            // 【关键】暂停期间必须立刻释放唤醒锁。
+            //
+            // 暂停的语义就是"先别动"，再占着 PARTIAL_WAKE_LOCK 纯属耗电。
+            // 恢复时会重新 acquire（见 ACTION_RESUME）。
+            releaseWakeLock()
+
             updateNotification(buildPausedNotification())
             return START_STICKY
         }
@@ -140,6 +186,9 @@ class PunchForegroundService : Service() {
         if (action == ACTION_RESUME) {
             Log.i(TAG, "收到继续指令")
             paused = false
+            pausedUntil = 0L
+            // 暂停时释放了唤醒锁，继续时要拿回来
+            acquireWakeLock()
             // 【关键】继续时**不要**再走 prewarm 分支，也不要重新等待目标时刻。
             //
             // 之前的实现是 startPunchFlow(pendingKind, pendingTargetAt)，
@@ -151,6 +200,20 @@ class PunchForegroundService : Service() {
             // 现在的语义：继续 = 重新走一次完整流程，但跳过预热等待。
             // 时间闸门会用当前真实时间重新判定，这是正确的 ——
             // 如果暂停期间已经错过窗口，就应该拒绝而不是硬打。
+            // 恢复前核对一次参数有效性。
+            //
+            // pendingTargetAt 是暂停那一刻的目标时刻。如果用户隔了很久才点
+            // "继续"，时间闸门大概率会拒绝 —— 那是正确行为，但更早一步
+            // 判断可以避免白跑一趟解锁 + 拉钉钉的完整流程。
+            val stillInWindow = pendingTargetAt <= 0L ||
+                AlarmScheduler.withinRetryWindow(System.currentTimeMillis(), pendingTargetAt)
+            if (!stillInWindow) {
+                Log.i(TAG, "恢复时已超出可打卡窗口，放弃并收尾")
+                cleanup()
+                running = false
+                stopSelf()
+                return START_NOT_STICKY
+            }
             startPunchFlow(pendingKind, pendingTargetAt, prewarm = false)
             return START_STICKY
         }
@@ -163,6 +226,17 @@ class PunchForegroundService : Service() {
         val kind = runCatching { PunchKind.valueOf(kindName) }.getOrDefault(PunchKind.CLOCK_IN)
         val targetAt = intent?.getLongExtra(PunchAlarmReceiver.EXTRA_TARGET_AT, 0L) ?: 0L
         val prewarm = intent?.getBooleanExtra(EXTRA_PREWARM, false) ?: false
+
+        // 暂停已超时但服务还吊着（用户没点继续也没点取消）：
+        // 让本次新请求接管，否则这一整天都打不了卡。
+        if (!isPauseActive() && paused) {
+            Log.i(TAG, "暂停已超时，放弃暂停态交由本次请求接管")
+            paused = false
+            pausedUntil = 0L
+            job?.cancel()
+            running = false
+            startForeground(NOTIFICATION_ID, buildPreparingNotification())
+        }
 
         if (running) {
             // 【关键】不要 stopForeground！
@@ -214,7 +288,15 @@ class PunchForegroundService : Service() {
                 log("流程被中断（暂停或取消）")
                 throw c
             } finally {
-                if (!paused) {
+                // 暂停状态保持服务存活（用户还能点"继续"或"取消"），
+                // 但必须同时检查是否已超时 —— 否则一个被遗忘的暂停会
+                // 让 running 永远为 true，后续闹钟全部被忽略。
+                if (isPauseActive()) {
+                    // 保持暂停态：只释放唤醒锁，不清理通知
+                    releaseWakeLock()
+                } else {
+                    paused = false
+                    pausedUntil = 0L
                     cleanup()
                     running = false
                     stopSelf()
@@ -282,6 +364,41 @@ class PunchForegroundService : Service() {
 
         // 发通知
         PunchNotifier.notifyResult(applicationContext, result, kind, finishedAt)
+
+        // 【关键】在**当前屏幕上**再显示一次结果，3 秒后自动淡出。
+        //
+        // 打卡时人是看着钉钉的，系统通知在状态栏里根本不会被注意到。
+        // 结果必须在眼前出现一次，才算用户真的知情。
+        // 迟到：上班打卡且完成时刻已过「目标 + 1 分钟宽限」。
+        // 这与 PunchEngine 的判定口径一致（LATE_GRACE_MS = 60s）。
+        val isLate = result.success &&
+            kind == PunchKind.CLOCK_IN &&
+            targetAt > 0 &&
+            finishedAt - targetAt >= 60_000L
+
+        val hudTitle = when {
+            isLate -> "⏰ 上班打卡成功（迟到）"
+            result.success && kind == PunchKind.CLOCK_IN -> "✅ 上班打卡成功"
+            result.success && kind == PunchKind.CLOCK_OUT -> "✅ 下班打卡成功"
+            result.success -> "✅ 打卡成功"
+            else -> "⚠️ 打卡失败"
+        }
+        val hudTone = when {
+            isLate -> ControlHudOverlay.Tone.LATE
+            result.success -> ControlHudOverlay.Tone.SUCCESS
+            else -> ControlHudOverlay.Tone.FAILURE
+        }
+        val hudSubtitle = if (result.success) {
+            java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.CHINA).format(java.util.Date(finishedAt))
+        } else {
+            (result.stage.label + " · " + result.message).take(26)
+        }
+        ControlHudOverlay.showStatus(
+            context = applicationContext,
+            tone = hudTone,
+            title = hudTitle,
+            subtitle = hudSubtitle,
+        )
 
         // 【关键】成功后立刻重排闹钟。
         //

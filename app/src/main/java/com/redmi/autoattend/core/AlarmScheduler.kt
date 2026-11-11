@@ -182,7 +182,7 @@ object AlarmScheduler {
         // 到点闹钟仍会再打一次（用户明确反馈过的问题）。
         val completed = completedSlotsToday(context, now)
 
-        val slot = PunchSchedule.nextSlot(
+        var slot = PunchSchedule.nextSlot(
             nowMillis = now,
             settings = AppConfig.settings.value,
             skippedDateKeys = AppConfig.skippedDateKey
@@ -190,7 +190,28 @@ object AlarmScheduler {
                 ?.let { setOf(it) }
                 ?: emptySet(),
             completedSlots = completed,
-        ) ?: run {
+        )
+
+        // 【防自激】如果算出来的正是刚刚触发过的那一班，说明它还在
+        // 补执行窗口里。把它当作已完成跳过，让 nextSlot 给出**下一班**。
+        if (slot != null && isJustFired(slot)) {
+            Log.i(TAG, "跳过刚触发的槽位 target=" + PunchSchedule.formatTime(slot.targetAtMillis))
+            val expanded = completed + PunchSchedule.CompletedSlot(
+                PunchSchedule.dateKey(slot.targetAtMillis),
+                slot.kind,
+            )
+            slot = PunchSchedule.nextSlot(
+                nowMillis = now,
+                settings = AppConfig.settings.value,
+                skippedDateKeys = AppConfig.skippedDateKey
+                    .takeIf { it != 0 }
+                    ?.let { setOf(it) }
+                    ?: emptySet(),
+                completedSlots = expanded,
+            )
+        }
+
+        slot ?: run {
             Log.i(TAG, "no upcoming slot")
             // 没有可调度项时也要把旧闹钟撤掉，
             // 否则残留的旧闹钟会按旧时间再触发一次。
@@ -287,6 +308,51 @@ object AlarmScheduler {
     @Volatile
     var lastScheduled: NextPunchSlot? = null
         private set
+
+    /**
+     * 刚刚触发过的槽位（防止同一班次被反复重排）。
+     *
+     * ## 为什么需要
+     *
+     * [PunchSchedule.nextSlot] 的语义是"当前时刻之后的下一个打卡点"，
+     * 并且为了支持补执行，它会把**仍在补执行窗口内**的已过时间点也算进来
+     * （effectiveTrigger = now）。
+     *
+     * 于是出现这个循环：FIRE 触发 → onReceive 里重排 →
+     * nextSlot 又返回**同一个班次**（因为还在窗口内）→
+     * 立刻又排一个 FIRE → FIRE 触发 …
+     *
+     * 正常情况下这个循环会被"成功后跳过已完成班次"打断，
+     * 但如果本次执行失败、或者服务因 "已有执行在进行" 被忽略，
+     * estimated 就会一直空转到窗口结束。
+     *
+     * 这里显式记住"这一班已经触发过"，重排时跳过它。
+     */
+    @Volatile
+    private var justFiredTargetAt: Long = 0L
+
+    @Volatile
+    private var justFiredKind: String? = null
+
+    /**
+     * 标记某个槽位刚刚被触发。
+     *
+     * 只记录"最近一次"，不做长期记账 —— 长期记账由数据库里的
+     * SUCCESS 记录负责（见 completedSlotsToday）。
+     */
+    fun markJustFired(targetAt: Long, kind: com.redmi.autoattend.data.db.PunchKind) {
+        justFiredTargetAt = targetAt
+        justFiredKind = kind.name
+    }
+
+    /** 清掉"刚刚触发"标记（跨天或手动改配置时调用） */
+    fun clearJustFired() {
+        justFiredTargetAt = 0L
+        justFiredKind = null
+    }
+
+    private fun isJustFired(slot: NextPunchSlot): Boolean =
+        slot.targetAtMillis == justFiredTargetAt && slot.kind.name == justFiredKind
 
     // ---------- lastScheduled 持久化 ----------
 

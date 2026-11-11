@@ -95,8 +95,20 @@ object AccessibilityKeeper {
         )
         RootShell.exec("settings put secure accessibility_enabled 1", 5_000)
 
-        // 给系统一点时间重新 bind
-        runCatching { Thread.sleep(1_200) }
+        // 给系统一点时间重新 bind。
+        //
+        // 【启动性能】这里原来是 Thread.sleep(1_200) —— 一个纯阻塞的 1.2 秒。
+        // 如果调用方在主线程（BootReceiver / KeepAliveService 的某些路径），
+        // 就会直接卡住界面 1.2 秒。
+        //
+        // 改成轮询等待：每 150ms 查一次，一旦生效立刻返回。
+        // 大多数情况下系统 200~400ms 内就 bind 好了，平均等待远低于 1.2 秒。
+        // 注意调用方必须确保自己在后台线程（见 BootReceiver 的 goAsync 改造）。
+        val deadline = System.currentTimeMillis() + 1_800L
+        while (System.currentTimeMillis() < deadline) {
+            if (isEnabled(context)) break
+            runCatching { Thread.sleep(150) }
+        }
 
         val ok = isEnabled(context)
         Log.i(TAG, if (ok) "无障碍已通过 root 重新启用" else "无障碍自动恢复失败，需要手动开启")

@@ -48,7 +48,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.redmi.autoattend.ui.glass.LiquidGlassPanel
+import androidx.compose.foundation.background
+import com.redmi.autoattend.ui.glass.LocalBackdropLayer
 import com.redmi.autoattend.ui.theme.GlassTheme
 import kotlinx.coroutines.launch
 import kotlin.math.abs
@@ -426,61 +427,195 @@ fun GlassTabBar(
         //
         // 真玻璃必须做两件事：
         //   1. **采样背后的真实内容**（LocalBackdropLayer 提供的录制层）；
-        //   2. 对采样结果做模糊 + 折射 + 色散（PrismalGlassSurface 完成）。
+        //   2. 对采样结果做模糊 + 折射 + 色散（由 Kyant0/AndroidLiquidGlass 完成）。
         //
         // 用 LiquidGlassPanel 而不是自己画背景，就是拿到这套光学管线。
         // 这也是 iOS 底栏"能透出底下内容"的真正原因 —— 不是透明度，
         // 是**折射**。
-        LiquidGlassPanel(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(barHeight)
-                .onSizeChanged { barWidthPx = it.width },
-            cornerRadius = barHeight / 2,
-            // 底栏面积大、又是纯装饰性容器，模糊可以比卡片更强一点，
-            // 让背后图标变成柔和的色块而不是可辨认的形状（避免视觉干扰）。
-            // ---- 模糊 ----
-            //
-            // 用户先反馈"能透出字"，随后又要求"但要有玻璃的折射效果"。
-            // 这两件事其实是矛盾的：太透 = 少了材质感。
-            // 平衡点在于**降一点模糊、加满折射与色散**：
-            //   · 模糊 18dp —— 文字仍能辨认轮廓，但不会像隔着清水那么硬；
-            //   · 折射/色散拉满 —— 边缘的透镜形变和红蓝分离提供"玻璃"的实感。
-            // 单纯调模糊永远调不出玻璃感，材质感来自**边缘的折射形变**。
-            // ---- 模糊 ----
-            //
-            // 用户要求「底栏也需要同步加上液态玻璃那种模糊和折射」。
-            //
-            // 之前 18dp 模糊 + 14dp 透镜带，底栏看起来偏"清透的塑料条"，
-            // 缺少 iOS 26 那种厚重的玻璃体积感。
-            //
-            // iOS 26 底栏的观感特征：
-            //   1. 背后内容被明显模糊（但不是糊成一块色），
-            //      仍能看出"有东西在后面移动"；
-            //   2. 边缘有强烈的透镜形变 —— 内容在贴近边缘时被推开；
-            //   3. 上下边缘的高光描边定义了「厚度」。
-            //
-            // 所以：模糊加深、透镜带加宽、外推量加大。
-            // 底栏只有 52dp 高，透镜带不能宽到吞掉中间观察区，
-            // 24dp 是上限附近的值（中间仍留约 1/4 清晰区）。
-            blurRadius = 26.dp,
-            // ---- 着色 ----
-            // 降回 0x1A(10%)：既然模糊和折射都加强了，
-            // 着色再重就会变成"磨砂实心条"，把折射效果盖掉。
-            // 玻璃的通透感靠"折射 + 高光"，不是靠填充。
-            tint = if (colors.isDark) Color(0x0FFFFFFF) else Color(0x1AFFFFFF),
-            tintAlpha = if (colors.isDark) 0.014f else 0.048f,
-            // ---- 折射：玻璃感的真正来源 ----
-            refractionHeightOverride = 24.dp,
-            refractionAmountOverride = 44.dp,
-            // 色散保持较高：红蓝分离是"厚度"的心理暗示。
-            dispersionOverride = if (colors.isDark) 0.30f else 0.26f,
-            sampleOffsetX = 0.5f,
-            sampleOffsetY = 0.92f,
-        ) {
-            // 内容为空 —— 文字和指示器都画在它上面
-            Box(Modifier.fillMaxWidth().height(barHeight))
+        // ================= 第一层：液态玻璃容器 =================
+        //
+        // 【第十一轮】换成 Kyant0/AndroidLiquidGlass（4600 星）。
+        //
+        // 之前用 PrismalAGSL 时，blurRadius 在本机完全不生效 ——
+        // 14dp / 60dp / 200dp 三张截图逐像素一致，背后文字始终锐利。
+        // 试过 RenderEffect 链、RenderNode 中转、Bitmap 拷贝、
+        // 录制层预模糊等七八种绕过方案，全部卡在同一个物理限制上：
+        // Compose 的 GraphicsLayer 无法在绘制阶段同步读成像素。
+        //
+        // 新库自带 Backdrop 录制 + 库内模糊/折射，不走 Compose 效果链，
+        // 所以那一环终于能生效。
+        val liquidBackdrop = com.redmi.autoattend.ui.glass.LocalLiquidBackdrop.current
+        if (liquidBackdrop != null) {
+            com.redmi.autoattend.ui.glass.LiquidGlassPanel(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(barHeight)
+                    .onSizeChanged { barWidthPx = it.width },
+                cornerRadius = barHeight / 2,
+                // 模糊：28dp ≈ 91px。实测 14dp 太弱（背后文字一望即知），
+                // 28dp 才能把笔画糊成团块、需要凑近辨认。
+                // 官方 LiquidBottomTabs 用 8dp；弹窗用 16dp（浅）/ 8dp（深）。
+                // 这个库的 blur 本来就是"轻微柔化"，不是"糊成团块" ——
+                // 所有官方示例的半径都在 2–16dp 之间。
+                blurRadius = if (colors.isDark) 8.dp else 16.dp,
+                // 【关键】tintAlpha 决定"下层内容直接透出多少"。
+                //
+                // tint 留空 → 由 LiquidGlassPanel 按主题自动选：
+                //   浅色 = 亮白（0xFFFAFAFA）
+                //   深色 = 近黑（0xFF121212）
+                //
+                // 【为什么不能写死白色】
+                //
+                // 深色主题下，白 tint 叠在深蓝紫背景上，数学上必然趋向灰 ——
+                // 底栏会变成一块灰紫色，和旁边蓝青色的卡片完全不搭。
+                // 这正是"深色下风格不统一"的根因。
+                //
+                // 深色改用近黑 tint 后，玻璃只压暗不泛灰，
+                // 色相仍由背后的内容决定，于是和卡片自然同色系。
+                // tint 走默认值（深色近黑 / 浅色亮白），色相交给主题决定。
+                //
+                // 但 tintAlpha 要**比卡片更轻**：
+                //
+                // 深度上，底栏位于屏幕最下方，而流动背景是「上蓝下紫」的渐变，
+                // 底部本来就是最暗最紫的一段。卡片在中部采到亮蓝，
+                // 底栏在底部采到深紫 —— 同样的 0.40 叠上去，
+                // 底栏会明显更黑更沉，和卡片不像一个体系。
+                //
+                // 把底栏的 tint 降到 0.28，让它多透出一些背景色，
+                // 亮度就能和卡片拉近，同时仍压得住下层文字。
+                // 深色下显式指定一个偏蓝的 tint，把底栏从背景的紫色里拉回来。
+                // 背景渐变在屏幕底部本来就是紫的，只靠中性黑压不住色相。
+                tint = if (colors.isDark) Color(0xFF0E1B33) else Color(0xFFFAFAFA),
+                tintAlpha = if (colors.isDark) 0.45f else 0.40f,
+                // 关掉边缘高光：它画在内容之上，会盖住贴边的「设置」文字。
+                highlightAlpha = 0f,
+                dispersionOverride = if (colors.isDark) 0.45f else 0.38f,
+            ) {
+                // 内容为空 —— 文字和指示器都画在它上面
+                Box(Modifier.fillMaxWidth().height(barHeight))
+            // ================= 第三层：文字 + 手势 =================
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(barHeight)
+                    .pointerInput(barWidthPx, tabs.size) {
+                        detectHorizontalDragGestures(
+                            onDragStart = { offset ->
+                                isDragging = true
+                                val maxX = (barWidthPx - indicatorWidthPx).coerceAtLeast(0f)
+                                dragX = (offset.x - indicatorWidthPx / 2f).coerceIn(0f, maxX)
+                                scope.launch {
+                                    scaleAnim.animateTo(
+                                        dragScale,
+                                        tween(
+                                            durationMillis = PRESS_MS,
+                                            easing = IosEaseOut,
+                                        ),
+                                    )
+                                }
+                            },
+                            onHorizontalDrag = { change, amount ->
+                                change.consume()
+                                val maxX = (barWidthPx - indicatorWidthPx).coerceAtLeast(0f)
+                                dragX = (dragX + amount).coerceIn(0f, maxX)
+                            },
+                            onDragEnd = {
+                                val nearest = nearestTabFor(dragX)
+                                isDragging = false
+
+                                scope.launch {
+                                    scaleAnim.animateTo(
+                                        1f,
+                                        tween(
+                                            durationMillis = RELEASE_MS,
+                                            easing = IosEaseOut,
+                                        ),
+                                    )
+                                }
+
+                                if (nearest != currentSelected) {
+                                    // 【关键】先把 xAnim 对齐到松手位置，
+                                    // 这样 LaunchedEffect 重算 distance 时是 0，
+                                    // 不会因为读到旧位置而多拉一次。
+                                    scope.launch { xAnim.snapTo(dragX) }
+                                    pendingSwipeSettle = true
+                                    currentOnSelect(nearest, true)
+                                } else {
+                                    // 拖回原位：只做一次轻微的拉伸回弹。
+                                    scope.launch { xAnim.snapTo(dragX) }
+                                    settleTo(nearest, dragX)
+                                }
+                            },
+                            onDragCancel = {
+                                isDragging = false
+                                scope.launch {
+                                    scaleAnim.animateTo(
+                                        1f,
+                                        tween(RELEASE_MS, easing = IosEaseOut),
+                                    )
+                                }
+                                scope.launch { xAnim.snapTo(dragX) }
+                                // 取消拖拽是回到原位，不需要拉伸。
+                                settleTo(currentSelected, dragX, stretch = false)
+                            },
+                        )
+                    },
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                tabs.forEachIndexed { index, label ->
+                    val selected = index == selectedIndex
+
+                    // 未选中项的颜色要**自己定**，不能直接用 textTertiary。
+                    //
+                    // 原因：textTertiary 的 alpha 只有 43%（深色 0x6E）/ 50%（浅色 0x80），
+                    // 它原本是画在不透明底色上的；现在底栏是半透明玻璃，
+                    // 再叠加一层半透明文字就几乎看不见 —— 实测「设置」直接消失。
+                    //
+                    // 所以这里给一个足够实的颜色：仍然弱于选中项（靠字重和色相区分），
+                    // 但保证在玻璃上清晰可读。
+                    val contentColor by animateColorAsState(
+                        targetValue = if (selected) {
+                            if (colors.isDark) colors.textPrimary else Color(0xFF1A73E8)
+                        } else {
+                            if (colors.isDark) Color(0xCCD8E2F0) else Color(0xCC2A3140)
+                        },
+                        animationSpec = tween(COLOR_MS, easing = IosEaseInOut),
+                        label = "tab-color",
+                    )
+
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(barHeight)
+                            .ClickableNoRipple {
+                                if (index != selectedIndex) onSelect(index, false)
+                            },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            text = label,
+                            color = contentColor,
+                            fontSize = 13.sp,
+                            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                            letterSpacing = 0.3.sp,
+                        )
+                    }
+                }
+            }
+            }
+        } else {
+            // 采样源还没准备好时的兜底，避免首帧闪一下空白
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .height(barHeight)
+                    .background(
+                        color = Color.White.copy(alpha = 0.10f),
+                        shape = androidx.compose.foundation.shape.RoundedCornerShape(barHeight / 2),
+                    ),
+            )
         }
+
 
         // ================= 第二层：指示器（不裁剪，浮在外围之上） =================
         val hDp = with(density) { hAnim.value.toDp() }
@@ -526,107 +661,6 @@ fun GlassTabBar(
             }
         }
 
-        // ================= 第三层：文字 + 手势 =================
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(barHeight)
-                .pointerInput(barWidthPx, tabs.size) {
-                    detectHorizontalDragGestures(
-                        onDragStart = { offset ->
-                            isDragging = true
-                            val maxX = (barWidthPx - indicatorWidthPx).coerceAtLeast(0f)
-                            dragX = (offset.x - indicatorWidthPx / 2f).coerceIn(0f, maxX)
-                            scope.launch {
-                                scaleAnim.animateTo(
-                                    dragScale,
-                                    tween(
-                                        durationMillis = PRESS_MS,
-                                        easing = IosEaseOut,
-                                    ),
-                                )
-                            }
-                        },
-                        onHorizontalDrag = { change, amount ->
-                            change.consume()
-                            val maxX = (barWidthPx - indicatorWidthPx).coerceAtLeast(0f)
-                            dragX = (dragX + amount).coerceIn(0f, maxX)
-                        },
-                        onDragEnd = {
-                            val nearest = nearestTabFor(dragX)
-                            isDragging = false
-
-                            scope.launch {
-                                scaleAnim.animateTo(
-                                    1f,
-                                    tween(
-                                        durationMillis = RELEASE_MS,
-                                        easing = IosEaseOut,
-                                    ),
-                                )
-                            }
-
-                            if (nearest != currentSelected) {
-                                // 【关键】先把 xAnim 对齐到松手位置，
-                                // 这样 LaunchedEffect 重算 distance 时是 0，
-                                // 不会因为读到旧位置而多拉一次。
-                                scope.launch { xAnim.snapTo(dragX) }
-                                pendingSwipeSettle = true
-                                currentOnSelect(nearest, true)
-                            } else {
-                                // 拖回原位：只做一次轻微的拉伸回弹。
-                                scope.launch { xAnim.snapTo(dragX) }
-                                settleTo(nearest, dragX)
-                            }
-                        },
-                        onDragCancel = {
-                            isDragging = false
-                            scope.launch {
-                                scaleAnim.animateTo(
-                                    1f,
-                                    tween(RELEASE_MS, easing = IosEaseOut),
-                                )
-                            }
-                            scope.launch { xAnim.snapTo(dragX) }
-                            // 取消拖拽是回到原位，不需要拉伸。
-                            settleTo(currentSelected, dragX, stretch = false)
-                        },
-                    )
-                },
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            tabs.forEachIndexed { index, label ->
-                val selected = index == selectedIndex
-
-                val contentColor by animateColorAsState(
-                    targetValue = if (selected) {
-                        if (colors.isDark) colors.textPrimary else Color(0xFF1A73E8)
-                    } else {
-                        if (colors.isDark) colors.textTertiary else Color(0xFF3A4049)
-                    },
-                    animationSpec = tween(COLOR_MS, easing = IosEaseInOut),
-                    label = "tab-color",
-                )
-
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(barHeight)
-                        .ClickableNoRipple {
-                            if (index != selectedIndex) onSelect(index, false)
-                        },
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Text(
-                        text = label,
-                        color = contentColor,
-                        fontSize = 13.sp,
-                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-                        letterSpacing = 0.3.sp,
-                    )
-                }
-            }
-        }
     }
     }
 }

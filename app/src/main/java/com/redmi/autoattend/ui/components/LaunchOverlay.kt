@@ -77,8 +77,16 @@ fun LaunchOverlay(
         if (!visible) return@LaunchedEffect
         if (!everReady) {
             everReady = true
-            delay(240)
-            alpha.animateTo(0f, tween(300, easing = FastOutSlowInEasing))
+            // 【第五轮】240ms 硬等待 → 90ms。
+            //
+            // 这 240ms 是**纯延迟**：它不等待任何 IO，只是让弧线转够一圈再淡出。
+            // 但它直接加在"用户看到完整界面"的时间上 —— 属于拿性能换观感，
+            // 而且转 0.2 圈和转 1.4 圈在主观上并没有区别。
+            //
+            // 90ms 足够让首帧稳定（此时首页已经完成第一次布局），
+            // 又不会让人感觉到"卡了一下才出现"。
+            delay(90)
+            alpha.animateTo(0f, tween(280, easing = FastOutSlowInEasing))
             present = false
             onFadeOutFinished()
         }
@@ -114,15 +122,19 @@ fun LaunchOverlay(
         modifier = modifier
             .fillMaxSize()
             .graphicsLayer { this.alpha = alpha.value }
-            .background(
-                Brush.linearGradient(
-                    listOf(
-                        Color(0xFF04070F),
-                        Color(0xFF0A1526),
-                        Color(0xFF071320),
-                    ),
-                ),
-            ),
+            // 【第七轮】背景必须跟随**当前主题**，不能写死深色。
+            //
+            // 之前这里硬编码 Color(0xFF04070F)，于是浅色主题下用户会看到
+            // "一块纯黑盖在浅色界面上"，再淡出成浅色 —— 非常突兀。
+            //
+            // 现在取 GlassTheme.colors.backgroundDeep：
+            //   · 深色 → #04070F（与 values-night 的 splash/窗口背景一致）
+            //   · 浅色 → #E8F0FB（与 values 的 splash/窗口背景一致）
+            //
+            // 冷启动的顺畅感取决于这条链路上**没有任何一次视觉跳变**：
+            //   系统 Splash → 窗口背景 → 本遮罩 → 首页光斑
+            // 前三个用同一个颜色，最后一次才是有意的淡出。
+            .background(com.redmi.autoattend.ui.theme.GlassTheme.colors.backgroundDeep),
         contentAlignment = Alignment.Center,
     ) {
         Box(
@@ -168,7 +180,8 @@ fun LaunchOverlay(
 
                 Text(
                     text = "钉钉GO",
-                    color = Color(0xFFF4F7FC).copy(alpha = 0.92f),
+                    // 跟随主题的文字色：深色主题浅字，浅色主题深字
+                    color = com.redmi.autoattend.ui.theme.GlassTheme.colors.textPrimary.copy(alpha = 0.92f),
                     fontSize = 13.sp,
                     fontWeight = FontWeight.Medium,
                     letterSpacing = 2.5.sp,

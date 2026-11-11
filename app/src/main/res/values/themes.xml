@@ -2,23 +2,21 @@
 <resources>
 
     <!--
-      应用主题。
+      应用主题（浅色 · 默认）。
 
-      启动性能的关键点：
-      1. windowBackground 设成和首页流动背景接近的深蓝，而不是默认的白色/黑色。
-         这样从点击图标到 Compose 首帧之间，用户看到的是"接近成品"的底色，
-         不会出现白闪或长时间黑屏。
-      2. windowIsTranslucent=false —— 透明窗口反而会多一次绘制，更慢。
-      3. windowDisablePreview=false —— 保留系统预览窗口，冷启动更快出画。
-      4. windowSplashScreenAnimatedIcon / Background 用 API 31 的系统 SplashScreen，
-         它由系统在进程启动前就画出来，是最快的"首帧"。
+      启动链路必须与主题一致，否则会出现"深色闪一下再变浅色"的跳变：
+        系统 Splash（纯色）→ Activity windowBackground → LaunchOverlay → 首页
+      这四个环节的颜色必须来自**同一套主题**。
+
+      浅色用 #E8F0FB（GlassColors.backgroundDeep），
+      深色版本在 values-night/themes.xml 里覆盖。
     -->
-    <style name="Theme.AutoAttend" parent="android:Theme.Material.NoActionBar">
+    <style name="Theme.AutoAttend" parent="android:Theme.Material.Light.NoActionBar">
         <item name="android:windowBackground">@drawable/bg_app_window</item>
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
-        <item name="android:windowLightStatusBar">false</item>
-        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
         <item name="android:windowDrawsSystemBarBackgrounds">true</item>
         <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
     </style>
@@ -26,20 +24,14 @@
     <!--
       系统 SplashScreen（API 31+）。
 
-      注意：**不设置 windowSplashScreenAnimatedIcon**。
-
-      原因（真机踩坑）：该图标会被系统做成"启动动画"，
-      在某些 ROM 上如果同时开启了窗口模糊（FLAG_BLUR_BEHIND），
-      系统会在动画结束前一直等待合成完成，表现为**黑屏 + 中间一个转圈**，
-      而且进程是活的、没有 ANR 日志，非常难排查。
-
-      去掉图标后，系统 Splash 只画一个纯色背景，
-      进程起来后立即被 Compose 内容替换——这才是最快的路径。
-      实测从点图标到首帧约 200~400ms，视觉上是"无缝"的。
+      windowSplashScreenAnimationDuration = 0：图标静止显示，不做缩放动画。
+      这样既有视觉锚点，又不会因为动画排期拖慢窗口切换。
     -->
     <style name="Theme.AutoAttend.Splash" parent="Theme.AutoAttend">
-        <item name="android:windowSplashScreenBackground">#04070F</item>
+        <item name="android:windowSplashScreenBackground">#E8F0FB</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/ic_splash_logo</item>
         <item name="android:windowSplashScreenAnimationDuration">0</item>
+        <item name="android:windowSplashScreenIconBackgroundColor">@android:color/transparent</item>
     </style>
 
 </resources>

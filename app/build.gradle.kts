@@ -97,6 +97,8 @@ dependencies {
     implementation(libs.androidx.datastore.preferences)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.prismal)
+    // Kyant0/AndroidLiquidGlass —— 真正的液态玻璃（模糊+折射+高光）
+    implementation(libs.backdrop)
 
     debugImplementation(libs.androidx.compose.ui.tooling)
     implementation(libs.androidx.compose.ui.tooling.preview)

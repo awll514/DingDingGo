@@ -1,9 +1,9 @@
 package com.redmi.autoattend.ui.components
 
 import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.Spring
-import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
+import com.redmi.autoattend.ui.theme.GlassMotion
+import com.redmi.autoattend.ui.theme.IosEaseOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -79,19 +79,21 @@ fun LiquidGlassButton(
         if (!enabled) return@LaunchedEffect
 
         if (pressed) {
-            launch { scale.animateTo(0.97f, tween(90)) }
-            launch { highlightShift.animateTo(1f, tween(140)) }
-            launch { refractionGlow.animateTo(1f, tween(140)) }
+            // 按下：180ms（AGENTS.md 的"按下放大"档），保持跟手
+            launch { scale.animateTo(0.97f, tween(GlassMotion.PRESS_DOWN, easing = IosEaseOut)) }
+            launch { highlightShift.animateTo(1f, tween(GlassMotion.PRESS_DOWN, easing = IosEaseOut)) }
+            launch { refractionGlow.animateTo(1f, tween(GlassMotion.PRESS_DOWN, easing = IosEaseOut)) }
             runCatching { haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove) }
         } else {
-            launch {
-                scale.animateTo(
-                    1f,
-                    spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessMedium),
-                )
-            }
-            launch { highlightShift.animateTo(0f, tween(220)) }
-            launch { refractionGlow.animateTo(0f, tween(220)) }
+            // 松手：340ms（"松手回落"档）。
+            //
+            // 这里原来是 spring(DampingRatioMediumBouncy)，与 AGENTS.md
+            // "全应用禁用 spring" 冲突，且和 PressEffect 的表现不一致
+            // （同一个"按下回弹"在两个组件里观感不同）。
+            // 现在两者共用 GlassMotion.settleSpec()。
+            launch { scale.animateTo(1f, GlassMotion.settleSpec()) }
+            launch { highlightShift.animateTo(0f, tween(GlassMotion.PRESS_UP, easing = IosEaseOut)) }
+            launch { refractionGlow.animateTo(0f, tween(GlassMotion.PRESS_UP, easing = IosEaseOut)) }
         }
     }
 

@@ -17,11 +17,13 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.navigationBars
@@ -40,6 +42,8 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.kyant.backdrop.backdrops.layerBackdrop
+import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import com.styropyr0.prismal.sources.rememberPrismalGlassLayer
 import com.redmi.autoattend.ui.MainViewModel
 import com.redmi.autoattend.ui.components.GlassTabBar
@@ -299,7 +303,19 @@ private fun AppRoot() {
      */
     var bootReady by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
-        kotlinx.coroutines.delay(90)
+        // 【第五轮】不再用固定 90ms 猜测"首帧画完了没有"。
+        //
+        // 固定时长在快设备上白等、在慢设备上又会在首帧没画完时就淡出遮罩
+        // （于是用户看到的是"加载动画突然消失，露出还没画好的界面"）。
+        //
+        // 用 withFrameNanos 等**真实的两帧**：第一帧让首页完成测量与布局，
+        // 第二帧确保它真的上屏了。这在不同性能的设备上都自适应。
+        //
+        // 注意：这里没有采用交接文档里那种"用帧回调做 AGSL 降级开关"的写法 ——
+        // 那种做法在频繁重组时会被反复取消（见踩坑 #9）。
+        // 但 bootReady 只翻转一次、之后再也不读，不存在被覆盖的竞争。
+        androidx.compose.runtime.withFrameNanos { }
+        androidx.compose.runtime.withFrameNanos { }
         bootReady = true
     }
 
@@ -324,7 +340,22 @@ private fun AppRoot() {
 
     val pagerScope = androidx.compose.runtime.rememberCoroutineScope()
 
+    // 切换 tab 时刷新健康度。
+    //
+    // 【启动性能】必须跳过**首次组合**触发的那一次。
+    //
+    // LaunchedEffect 在进入组合时就会跑一次，于是冷启动时这里会立刻调用
+    // refreshHealth() → HealthCheck.check() → RootShell.isAvailable()
+    // → fork 一个 su 进程（实测 300~400ms 主线程阻塞）。
+    // 即使 ViewModel 的 init 已经把首轮检查推迟了，这里又会把它提前触发。
+    //
+    // 首次的健康度检查交给 ViewModel init 里那条延迟任务，这里只管"用户切页"。
+    var firstTabEffect by remember { mutableStateOf(true) }
     LaunchedEffect(tabIndex) {
+        if (firstTabEffect) {
+            firstTabEffect = false
+            return@LaunchedEffect
+        }
         vm.refreshHealth()
     }
 
@@ -350,6 +381,20 @@ private fun AppRoot() {
         // 卡片要的是"透过玻璃看到背景光斑在流动"，不该把别的卡片糊进来。
         val backdropLayer = rememberPrismalGlassLayer()
 
+
+        // 卡片专用的采样层：**只录流动背景**，不含任何内容。
+        //
+        // 为什么卡片必须用独立的一层：
+        //   卡片在内容层内部，如果采样"录了全部内容"的层，
+        //   就会形成「录制 → 卡片画进录制层 → 重新录制」的无限递归。
+        //   实测直接 SIGSEGV（RenderThread 崩在 GL 栈）。
+        //
+        // 这一层只录 FlowingBackground，不会自引用，所有卡片采到的颜色一致。
+        val liquidBackdropCards = com.kyant.backdrop.backdrops.rememberLayerBackdrop()
+
+        // 含内容的采样层（底栏用）
+        val liquidBackdropContent = com.kyant.backdrop.backdrops.rememberLayerBackdrop()
+
         /**
          * 录制层 B：录**背景 + 全部内容** —— 专门给底栏用。
          *
@@ -367,6 +412,8 @@ private fun AppRoot() {
          * 代价是多一次图层录制。按用户的明确要求（不考虑性能消耗），这是可接受的。
          */
         val contentBackdropLayer = rememberPrismalGlassLayer()
+
+
 
         // 【跨 Window 共享】把两套录制层写进应用级容器。
         //
@@ -401,12 +448,25 @@ private fun AppRoot() {
         // backdropLayer 只录流动背景，不会自我引用，
         // 所有卡片采样它 → 颜色必然一致。
         // 代价是卡片背后看不到其他卡片（但磨砂 30dp 本来也看不清，无影响）。
-        CompositionLocalProvider(LocalBackdropLayer provides backdropLayer) {
+        CompositionLocalProvider(
+            LocalBackdropLayer provides backdropLayer,
+            // 【崩溃教训】这里**不能**给 liquidBackdrop。
+            //
+            // 卡片在内容层内部，如果它采样"录了全部内容"的那一层，
+            // 就形成「录制 → 把卡片画进录制层 → 重新录制」的无限递归。
+            // 实测直接 SIGSEGV（RenderThread 崩，fault addr 在 GL 栈）。
+            //
+            // 所以卡片继续用纯背景层（只有光斑，不会自引用）；
+            // LocalLiquidBackdrop 只在"压在内容之上"的地方单独提供（底栏、弹窗）。
+            com.redmi.autoattend.ui.glass.LocalLiquidBackdrop provides liquidBackdropCards,
+        ) {
             Box(Modifier.fillMaxSize()) {
                 // 第 1 层：流动背景（带录制）
                 FlowingBackground(
                     colors = colors,
-                    modifier = Modifier.fillMaxSize(),
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .then(Modifier.layerBackdrop(liquidBackdropCards)),
                     layer = backdropLayer,
                 )
 
@@ -419,15 +479,23 @@ private fun AppRoot() {
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        // 把内容层录进 contentBackdropLayer：
-                        // 底栏采样它，就能折射出下方的卡片与文字。
-                        .then(
-                            if (contentBackdropLayer != null) {
-                                Modifier.prismalGlassLayer(contentBackdropLayer)
-                            } else {
-                                Modifier
-                            },
-                        )
+                        // 内容层录制：**只保留新库这一层**。
+                        //
+                        // 【为什么拆掉另外两层】
+                        //
+                        // 之前这里同时挂了三个录制修饰符：
+                        //   · prismalGlassLayer(contentBackdropLayer)
+                        //   · layerBackdrop(liquidBackdrop)
+                        //   · prismalGlassLayer(blurredContentLayer)
+                        //
+                        // 三套录制每帧都要抓一遍整屏内容，互相争抢同一份绘制结果，
+                        // 导致底栏采样到的快照**每帧都不一样**：
+                        //   · 折射边缘"一闪一闪"
+                        //   · 模糊时有时无
+                        // 这正是真机上观察到的两个症状。
+                        //
+                        // 底栏采样含内容的层，这样折射能带出下方的卡片与文字
+                        .then(Modifier.layerBackdrop(liquidBackdropContent))
                         // 【关键】这里**不预留底部空间**。
                         //
                         // iOS 的悬浮底栏之所以好看，是因为内容会**滚动到它下面**，
@@ -557,11 +625,70 @@ private fun AppRoot() {
                             pagerState.currentPageOffsetFraction
                     }
 
-                    // 【关键】用 contentBackdropLayer 包住底栏，
-                    // 让 GlassTabBar 内的 LiquidGlassPanel 采样「含内容」的那层，
-                    // 这样底栏才能折射出下方的卡片与文字。
+                    // ============ 底栏采样「内容层」，让它能折射出背后的东西 ============
+                    //
+                    // 【第七轮 · 纠正上一轮的错误判断】
+                    //
+                    // 上一轮底栏过曝成纯白 RGB(222,232,244)，我误判成"采样自身造成递归"，
+                    // 于是改成采样纯背景层。**那是错的** —— 改完之后底栏变成
+                    // 一条和背景几乎同色的暗带（RGB(64,84,111) vs 背景 33,55,99），
+                    // 既看不到折射，也看不到模糊，用户反馈"根本看不见任何东西"。
+                    //
+                    // 真实原因：contentBackdropLayer 挂在**第 2 层（页面内容）**上，
+                    // 而底栏是**第 3 层**，在录制范围之外 —— 采样它并不会自我引用。
+                    // 之前过曝是因为 tintAlpha 被调到了 0.20（白 tint 高 alpha），
+                    // 与采样源无关。我把参数问题误判成了结构问题。
+                    //
+                    // ============ 结论（受控实验）：必须采样纯背景层 ============
+                    //
+                    // 【实测】把 tintAlpha 设为 0.0，底栏颜色**完全不变**：
+                    //   胶囊内部 RGB(203,211,220) / RGB(222,232,244)
+                    //   而同一时刻背景是 RGB(152,147,187)
+                    //
+                    // 这说明底栏的颜色根本不来自 tint，而来自它采样的那一层。
+                    // 采样 contentBackdropLayer 时，底栏位置采到的是
+                    // **内容区那块浅色画面**（内容区铺满全屏、一直延伸到屏幕底部，
+                    // 底栏只是盖在它上面的第 3 层，所以录制层里那块是真实内容，
+                    // 但底栏自身又叠加在上面 —— 采样与自绘互相加强，
+                    // 最终稳定在一个偏白的值）。
+                    //
+                    // 换言之：底栏无法通过采样"自己所在的画面"来得到背后的真相。
+                    // 它必须采样**不含自己的那层** —— 也就是只录流动背景的 backdropLayer。
+                    //
+                    // 代价是底栏背后看不到卡片和文字。但这正是磨砂玻璃的本质：
+                    // 你看到的是"被模糊的光"，不是"能认出来的字"。
+                    // 玻璃感由折射与描边提供，不需要靠透出文字来证明。
                     CompositionLocalProvider(
                         LocalBackdropLayer provides (contentBackdropLayer ?: backdropLayer),
+                        // 底栏采样「只录背景」那一层。
+                        //
+                        // 【为什么不能用录了内容的那层】
+                        //
+                        // 看官方示例（Kyant0/AndroidLiquidGlass 的 BackdropDemoScaffold）：
+                        //     Image(..., Modifier.layerBackdrop(backdrop).fillMaxSize())
+                        //     content(backdrop)
+                        //
+                        // 关键：**图片是静态的，只录一次就固定**。
+                        // 而我们的页面内容是 HorizontalPager + 滚动列表，每帧都在动，
+                        // 录制层每帧被覆盖一次 —— 底栏在同一帧里采样它，
+                        // 拿到的永远是"上一帧还是一帧前"的不确定快照：
+                        //   · 折射边缘一闪一闪
+                        //   · 模糊作用在空样本上，等于没有
+                        //
+                        // 背景层（流动光斑）是持续缓慢变化的，采样稳定，
+                        // 所以折射和模糊都能正常工作。
+                        //
+                        // 【为什么改成和卡片同一个采样层】
+                        //
+                        // 采样内容层时，底栏采到的是「底部区域的内容」——
+                        // 深色主题下那片区域本来就接近黑，再叠 0.40 的近黑 tint，
+                        // 结果被压成 RGB(22,21,42) 的黑紫色；
+                        // 而旁边卡片采的是纯背景层，是 RGB(27,50,77) 的蓝。
+                        // 两者色相和亮度都不在一个体系里，看着就是"风格不统一"。
+                        //
+                        // 统一采样背景层后，底栏和卡片的光学输入完全一致，
+                        // 颜色自然落在同一个色系，玻璃的通透度也回来了。
+                        com.redmi.autoattend.ui.glass.LocalLiquidBackdrop provides liquidBackdropCards,
                     ) {
                     GlassTabBar(
                         tabs = listOf("首页", "设置"),

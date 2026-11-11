@@ -373,6 +373,20 @@ fun SettingsScreen(
             )
 
             SettingsDivider()
+            SettingsRow(
+                title = "测试结果提示",
+                subtitle = "依次演示成功 / 失败 / 迟到三种状态，各显示 3 秒",
+                danger = false,
+                onClick = {
+                    if (canOverlay) {
+                        com.redmi.autoattend.exec.ControlHudOverlay.testStatus(context)
+                    } else {
+                        openOverlaySettings(context)
+                    }
+                },
+            )
+
+            SettingsDivider()
             // 常驻通知开关：
             // 关掉后保活服务仍然运行，只是通知栏不留那一行。
             var showPersistent by remember {
@@ -471,7 +485,18 @@ fun SettingsScreen(
             )
         }
 
+        Spacer(Modifier.height(18.dp))
+
         // ---------- 权限与保活 ----------
+        //
+        // 【间距修正】这里原本**没有**前置 Spacer。
+        //
+        // 上面每一个分组都是「Spacer(18dp) + SettingsGroup(...)」的固定节奏，
+        // 只有这一组直接从上一个分组的底边开始，于是它的小标题
+        // 「权限与保活」紧紧贴在上一个分组卡片的下边缘上，比其他分组窄了 18dp。
+        //
+        // 用户反馈"权限与保活上边距不对"指的就是这个 ——
+        // 不是卡片内部的内边距问题，而是分组之间的节奏断了。
         SettingsGroup(title = "权限与保活") {
             val items = state.health?.items ?: emptyList()
             items.forEachIndexed { index, item ->
