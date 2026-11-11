@@ -889,11 +889,29 @@ private fun AppRoot() {
                                 }
                             }
                         },
-                        // 拖拽：同步把位移喂给 pager。
-                        // dispatchRawDelta 是非挂起函数，逐帧调用不会排队、不丢帧，
-                        // pager 因此真正跟手 → liveOffset 连续 → 指示器跟手。
-                        onRawDelta = { dx ->
-                            runCatching { pagerState.dispatchRawDelta(dx) }
+                        // 拖拽：把手指**绝对位置**换算成浮点页位，同步 scrollToPage。
+                        //
+                        // scrollToPage 是挂起函数，但包在 launch 里执行时，
+                        // 后来的调用会自然覆盖先前的目标 —— 因为我们传的是绝对位置,
+                        // 所以即使中间帧被跳过，最终位置依然正确，不会累积漂移。
+                        //
+                        // 这解决了 dispatchRawDelta 的「被 snap 吸回」问题：
+                        // 绝对定位每帧重新指定目标，与历史无关。
+                        onDragTo = { fingerX ->
+                            val tw = if (tabCount > 0) barWidthPxForDrag / tabCount else 0f
+                            if (tw > 0f) {
+                                val frac = (fingerX / tw - 0f)
+                                    .coerceIn(0f, (tabCount - 1).toFloat())
+                                pagerScope.launch {
+                                    runCatching {
+                                        val basePage = kotlin.math.floor(frac).toInt()
+                                        pagerState.scrollToPage(
+                                            page = basePage,
+                                            pageOffsetFraction = frac - basePage,
+                                        )
+                                    }
+                                }
+                            }
                         },
                         onBarWidth = { barWidthPxForDrag = it },
                         modifier = Modifier.fillMaxWidth(),

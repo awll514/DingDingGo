@@ -133,22 +133,20 @@ fun GlassTabBar(
      */
     onPressTab: (index: Int) -> Unit = {},
     /**
-     * 把手指位移**同步**送给 pager（上游实现：pagerState.dispatchRawDelta(delta)）。
+     * 拖拽中把手指位置**同步**告诉上游（上游用 scrollToPage 绝对定位）。
      *
-     * ## 为什么是 dispatchRawDelta 而不是 scrollToPage
+     * ## 为什么用绝对位置而不是增量
      *
-     * `dispatchRawDelta` 是**非挂起**函数，同步把位移应用到滚动状态，
-     * 因此可以在手势循环里逐帧调用，页面真正跟手。
+     * 用 dispatchRawDelta（增量）实测有问题：快速拖拽时单帧位移很大，
+     * 但 pager 的 snap 机制会在事件间隙把位置吸回最近的页，
+     * 累计位移被吃掉，导致「拖不过去、回到原页」。
      *
-     * 之前试过每帧 `scope.launch { scrollToPage(...) }`：那是异步的，
-     * 60 帧会排出 60 个协程，被调度器合并/丢弃 → 拖拽丢失中间动画、瞬移。
-     * 也试过纯本地 dragFrac：指示器跟手了，但 pager 没动，
-     * 松手时 liveOffset 还是旧值 → 指示器瞬移回首页再播动画。
+     * 用绝对位置 scrollToPage 就没有这个问题：每一帧直接指定
+     * 「现在应该在哪个浮点位置」，不受历史累积影响，也不会被吸回。
      *
-     * dispatchRawDelta 同时解决两者：pager 跟手 → liveOffset 连续 →
-     * 指示器（liveOffset 的纯函数）自然跟手，松手时也无缝衔接。
+     * 位置用**手指 x** 换算，而不是增量累加 —— 天然无漂移。
      */
-    onRawDelta: (deltaXPx: Float) -> Unit = {},
+    onDragTo: (fingerXPx: Float) -> Unit = {},
     /** 底栏宽度回写（像素）。当前未使用，保留给上游做自定义换算。 */
     onBarWidth: (px: Float) -> Unit = {},
     modifier: Modifier = Modifier,
@@ -641,41 +639,45 @@ fun GlassTabBar(
                             }
 
                             // ===== 按下 ===== 
-                            // 1) 放大；
-                            // 2) 让 pager 平滑滑到手指所在的 tab ——
-                            //    指示器因为跟随 liveOffset，会连着一起滑过去，
-                            //    这正是用户要的「长按时指示器滑过来」。
+                            //
+                            // 只放大，**不碰 pager**。
+                            //
+                            // 之前这里调 onPressTab 让 pager 在按下瞬间就开始
+                            // animateScrollToPage。结果：
+                            //   · 那个动画会和随后的 dispatchRawDelta 抢滚动状态 →
+                            //     快速拖拽时页面对抗、停在原地（用户实测拖不过去）；
+                            //   · 纯点按时它会先切一次，松手再判定一次 → 重复。
+                            //
+                            // 现在按下只做视觉反馈：放大。是否切换、切到哪，
+                            // 全部在松手时用**手指位置**一次性决定。
                             scope.launch {
                                 scaleAnim.animateTo(
                                     dragScale,
                                     tween(PRESS_MS, easing = IosEaseOut),
                                 )
                             }
-                            val pressTab = tabFor(down.position.x)
-                            if (pressTab != currentSelected) {
-                                onPressTab(pressTab)
-                            }
 
                             // ===== 移动 ===== 
-                            // 逐帧把位移同步喂给 pager。
-                            // 用 positionChange() 而不是自己算绝对位置：
-                            // 这样与 pager 自身的滚动坐标系天然一致。
+                            //
+                            // 每帧把**手指绝对位置**同步告诉上游，由它 scrollToPage 定位。
+                            //
+                            // 为什么不用增量（dispatchRawDelta）：pager 的 snap 机制会在
+                            // 事件间隙把位置吸回最近的页，快速拖拽时累计位移被吃掉 →
+                            // 「拖不过去、回原页」。绝对位置每帧重新指定目标，不受影响。
                             var dragged = false
+                            var lastX = down.position.x
                             val slop = viewConfiguration.touchSlop
-                            var accumulated = 0f
                             while (true) {
                                 val ev = awaitPointerEvent()
                                 val ch = ev.changes.firstOrNull() ?: break
                                 if (!ch.pressed) break
-                                val dx = ch.positionChange().x
-                                accumulated += dx
-                                if (!dragged && kotlin.math.abs(accumulated) > slop) {
+                                lastX = ch.position.x
+                                if (!dragged && kotlin.math.abs(lastX - down.position.x) > slop) {
                                     dragged = true
                                 }
                                 if (dragged) {
                                     ch.consume()
-                                    // 同步应用位移：pager 立即跟手
-                                    onRawDelta(dx)
+                                    onDragTo(lastX)
                                 }
                             }
 
@@ -687,17 +689,26 @@ fun GlassTabBar(
                                 )
                             }
 
-                            // 拖拽过才需要落位；纯点按已由 onPressTab 处理完。
-                            if (dragged) {
-                                val target = (liveOffset ?: currentSelected.toFloat())
-                                    .roundToInt().coerceIn(0, tabs.lastIndex)
-                                if (target != currentSelected) {
-                                    pendingSwipeSettle = true
-                                    currentOnSelect(target, true)
-                                } else {
-                                    // 拖回原位：吸回当前页
-                                    currentOnSelect(currentSelected, true)
-                                }
+                            // 目标 tab **只由手指落点决定**，与 pager 当前状态无关。
+                            //
+                            // 这样：
+                            //   · 点按 → 手指在哪就切到哪，一次到位；
+                            //   · 拖拽 → 落到松手时最近的那一侧；
+                            //   · 点当前页 → target == currentSelected，什么都不做。
+                            val target = if (dragged) {
+                                // 拖拽：按松手时手指所在的一侧决定
+                                tabFor(lastX)
+                            } else {
+                                // 点按：按按下位置决定
+                                tabFor(down.position.x)
+                            }
+
+                            if (target != currentSelected) {
+                                pendingSwipeSettle = true
+                                currentOnSelect(target, dragged)
+                            } else if (dragged) {
+                                // 拖回原位：吸回当前页，不切页
+                                currentOnSelect(currentSelected, true)
                             }
                         }
                     },
