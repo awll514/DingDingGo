@@ -178,16 +178,57 @@ object AlarmScheduler {
             return null
         }
 
+        // 【关键】把"今天已经打完的班"带上，否则手动打卡后
+        // 到点闹钟仍会再打一次（用户明确反馈过的问题）。
+        val completed = completedSlotsToday(context, now)
+
         val slot = PunchSchedule.nextSlot(
             nowMillis = now,
             settings = AppConfig.settings.value,
+            skippedDateKeys = AppConfig.skippedDateKey
+                .takeIf { it != 0 }
+                ?.let { setOf(it) }
+                ?: emptySet(),
+            completedSlots = completed,
         ) ?: run {
             Log.i(TAG, "no upcoming slot")
+            // 没有可调度项时也要把旧闹钟撤掉，
+            // 否则残留的旧闹钟会按旧时间再触发一次。
+            readLastScheduled(context)?.let { cancelAll(context, it) }
             return null
         }
 
         render(context, slot)
         return slot
+    }
+
+    /**
+     * 查出"今天已经成功打完的班次"。
+     *
+     * 只认 SUCCESS 记录：失败的那次不能吃掉当天的闹钟，
+     * 否则一次失败就再也不会自动重试了。
+     */
+    private fun completedSlotsToday(context: Context, now: Long): Set<PunchSchedule.CompletedSlot> {
+        // runBlocking 在这里是安全的：
+        // 1. scheduleNext 的所有调用点都在后台线程（协程的 IO 派发器、
+        //    BroadcastReceiver.goAsync 的协程、Service 的协程）；
+        // 2. 查询是本地 SQLite 的两次索引查找，耗时亚毫秒级；
+        // 3. 如果这里不用同步方式，就必须把整个 scheduleNext 改成 suspend，
+        //    会波及 BootReceiver / PunchAlarmReceiver / KeepAliveService
+        //    等一串调用方，改动面远大于收益。
+        val rows = runCatching {
+            kotlinx.coroutines.runBlocking {
+                val dao = com.redmi.autoattend.data.db.AppDatabase.get(context).punchLogDao()
+                val startOfToday = PunchSchedule.startOfDay(now, 0)
+                listOfNotNull(
+                    dao.lastSuccessSince(PunchKind.CLOCK_IN, startOfToday),
+                    dao.lastSuccessSince(PunchKind.CLOCK_OUT, startOfToday),
+                )
+            }
+        }.getOrDefault(emptyList())
+
+        val done = rows.map { it.kind to it.startedAt }
+        return PunchSchedule.completedSlotsForToday(now, done)
     }
 
     /**

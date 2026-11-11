@@ -196,10 +196,24 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         // 【跳过】把被跳过的日期传进去，nextSlot 会整日略过，
         // 于是"下一次打卡"自动顺延到下一个生效日，界面日期同步更新。
         val skippedDate = AppConfig.skippedDateKey
+
+        // 【已完成】把今天已经打完的班带上，界面上的"下一次"
+        // 才会跳过已完成的班次 —— 和 AlarmScheduler 保持一致，
+        // 否则界面显示下次是下班、而闹钟实际已排到明天。
+        val completed = runCatching {
+            val startOfToday = PunchSchedule.startOfDay(now)
+            val done = listOfNotNull(
+                db.punchLogDao().lastSuccessSince(PunchKind.CLOCK_IN, startOfToday),
+                db.punchLogDao().lastSuccessSince(PunchKind.CLOCK_OUT, startOfToday),
+            ).map { it.kind to it.startedAt }
+            PunchSchedule.completedSlotsForToday(now, done)
+        }.getOrDefault(emptySet())
+
         val slot = PunchSchedule.nextSlot(
             nowMillis = now,
             settings = settings,
             skippedDateKeys = if (skippedDate != 0) setOf(skippedDate) else emptySet(),
+            completedSlots = completed,
         )
 
         val startOfToday = PunchSchedule.startOfDay(now)

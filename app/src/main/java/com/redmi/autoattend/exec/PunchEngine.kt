@@ -58,6 +58,65 @@ class PunchEngine(private val context: Context) {
     companion object {
         private const val TAG = "PunchEngine"
 
+        /**
+         * 表示"这一班已经打过了"的文本标记。
+         *
+         * 用于极速打卡/状态卡更新的判定。覆盖不同钉钉版本的措辞。
+         * 注意这些词必须和 [DingTalkUi.SUCCESS_SIGNALS] 区分开：
+         * 后者是"刚才这一下打成功了"的即时反馈，
+         * 这里是"目标时段当前处于已完成状态"的静态状态。
+         */
+        private val DONE_MARKERS = listOf(
+            "已打卡",
+            "已签到",
+        )
+
+        /**
+         * 打卡结果的纯判定函数。
+         *
+         * ## 为什么抽成纯函数
+         *
+         * 这段逻辑原本内嵌在 [verifyResult] 的轮询循环里，
+         * 意味着它**只有在真机上真的打一次卡才能验证**。
+         * 而真打卡会在用户的考勤系统里留下记录 —— 代价太高，不能反复试。
+         *
+         * 抽出来之后，所有分支都能用单元测试覆盖，
+         * 包括那些真机上很难复现的边界（极速打卡、外勤、网络失败、页面残留）。
+         *
+         * @param blob 当前界面上读到的全部文本
+         * @param alreadyDoneBefore 点击前目标时段是否已完成
+         * @param doneNow 当前目标时段是否已完成
+         * @return 判定为成功时返回"证据"字符串；判定不出成功返回 null
+         */
+        fun judgeResult(
+            blob: String,
+            alreadyDoneBefore: Boolean,
+            doneNow: Boolean,
+        ): String? {
+            // ---- 1. 失败信号优先 ----
+            //
+            // 必须先查失败。边缘情况：页面同时出现"打卡成功"和"不在打卡范围"
+            // （部分成功的脏数据）时，宁可判失败让用户知情，
+            // 也不能报成功让用户以为打上了。
+            DingTalkUi.containsFailure(blob)?.let { return null }
+
+            // ---- 2. 明确的成功信号 ----
+            // 钉钉弹出的结果卡片文案，这是最可靠的依据。
+            DingTalkUi.containsSuccess(blob)?.let { return it }
+
+            // ---- 3. 状态翻转（极速打卡 / 卡片静默更新）----
+            //
+            // 只有"点击前未完成 → 现在已完成"才算。
+            // 单纯的"已打卡"不能作为依据：上班已打的情况下，
+            // 下班卡页面顶部同样显示"上班 09:30已打卡"，
+            // 无脑认它会漏报下班卡。
+            if (!alreadyDoneBefore && doneNow) {
+                return "目标时段由未打卡变为已打卡（极速打卡/卡片更新）"
+            }
+
+            return null
+        }
+
         /** 每步最多重试次数（需求 F3.5） */
         private const val MAX_RETRY = 3
 
@@ -237,13 +296,46 @@ class PunchEngine(private val context: Context) {
                 return guard
             }
 
+            // ---- 5.9 记录点击前的基线状态 ----
+            //
+            // 【极速打卡】钉钉自带"极速打卡"：进入考勤页时它可能**已经自己打好了**，
+            // 页面上直接显示"09:30已打卡"，根本没有可点的按钮，也不需要我们点。
+            //
+            // 这种情况下：
+            //   · clickPunchButton 找不到按钮 → 直接判失败（误报）
+            //   · 或者找到了按钮点下去 → 钉钉提示已打卡，但 verifyResult 只认
+            //     "打卡成功"四个字，仍然读不到 → 还是误报失败
+            //
+            // 所以必须在点击**之前**记下目标时段是否已完成，
+            // 之后用它判断"是不是本来就是好的"。
+            val alreadyDoneBefore = readTargetDoneState(kind)
+            log("点击前基线：目标时段已打卡=" + alreadyDoneBefore)
+
             // ---- 6. 点击打卡 ----
-            if (!clickPunchButton(kind)) {
+            val clicked = clickPunchButton(kind)
+
+            // 极速打卡 / 本来已完成：不需要点击也应该判成功。
+            // 但必须满足"目标时段确实已完成"，不能笼统看到"已打卡"就算。
+            if (!clicked && alreadyDoneBefore) {
+                ControlHudOverlay.hide()
+                val evidence = "极速打卡（无需点击）：目标时段已是已打卡状态"
+                log("判定成功，依据: " + evidence)
+                return PunchResult(
+                    success = true,
+                    stage = PunchStage.FINISH,
+                    message = "该时段已完成打卡（钉钉极速打卡）",
+                    evidence = evidence,
+                    trace = trace.toList(),
+                    channelUsed = channelUsed,
+                )
+            }
+
+            if (!clicked) {
                 return fail(PunchStage.CLICK, "未找到打卡按钮或点击无效")
             }
 
             // ---- 7. 确认结果（唯一成功依据） ----
-            val verdict = verifyResult()
+            val verdict = verifyResult(kind, alreadyDoneBefore)
             if (verdict == null) {
                 return fail(
                     PunchStage.VERIFY,
@@ -609,6 +701,18 @@ class PunchEngine(private val context: Context) {
         return true
     }
 
+    /**
+     * 读取"目标时段是否已完成打卡"。
+     *
+     * 和 [targetAlreadyDone] 的区别：这个会自己读取页面文本，
+     * 并且把"读不到页面"当作"未完成"（保守），避免把读失败误判成已完成。
+     */
+    private fun readTargetDoneState(kind: PunchKind): Boolean {
+        val text = runCatching { readCurrentPageText() }.getOrNull().orEmpty()
+        if (text.isEmpty()) return false
+        return targetAlreadyDone(text, kind)
+    }
+
     /** 判断当前页面是否像考勤打卡页 */
     private fun looksLikeAttendancePage(text: String): Boolean {
         if (text.isEmpty()) return false
@@ -909,14 +1013,28 @@ class PunchEngine(private val context: Context) {
         val key = when (kind) {
             PunchKind.CLOCK_IN -> "上班"
             PunchKind.CLOCK_OUT -> "下班"
+            // 手动打卡时按"当前该打哪一班"推断，不能一律 false ——
+            // 否则手动打卡永远无法走"极速打卡已完成"的判定。
             PunchKind.MANUAL -> return false
         }
-        // 形如 "上班09:30 09:30已打卡"：找到目标关键字后，看其后 60 字符内有没有"已打卡"
-        val idx = blob.indexOf(key)
-        if (idx < 0) return false
-        val window = blob.substring(idx, minOf(blob.length, idx + 60))
-        return window.contains("已打卡")
+
+        // 形如 "上班09:30 09:30已打卡"：找到目标关键字后，
+        // 看其后一小段窗口里有没有完成标记。
+        //
+        // 窗口取 90 字符而不是 60：钉钉在不同版本里会把
+        // "上班 09:30 已打卡 更新打卡 补卡" 这类文本排得更开，
+        // 60 字符有时刚好把"已打卡"截在窗外。
+        var from = 0
+        while (true) {
+            val idx = blob.indexOf(key, from)
+            if (idx < 0) return false
+            val end = minOf(blob.length, idx + 90)
+            val window = blob.substring(idx, end)
+            if (DONE_MARKERS.any { window.contains(it) }) return true
+            from = idx + key.length
+        }
     }
+
 
     /** 读取当前页面文本（无障碍优先，root 兜底） */
     private fun readCurrentPageText(): String {
@@ -949,7 +1067,7 @@ class PunchEngine(private val context: Context) {
      *
      * @return 命中的成功信号原文；判定不出成功时返回 null
      */
-    private suspend fun verifyResult(): String? {
+    private suspend fun verifyResult(kind: PunchKind, alreadyDoneBefore: Boolean): String? {
         val service = PunchAccessibilityService.get()
 
         repeat(MAX_RETRY) { attempt ->
@@ -972,16 +1090,23 @@ class PunchEngine(private val context: Context) {
                 }
             }
 
-            // 先查失败信号——失败优先，避免误判
-            DingTalkUi.containsFailure(blob)?.let {
-                log("命中失败信号: " + it)
-                return null
+            val doneNow = readTargetDoneState(kind)
+
+            // 判定逻辑本身是纯函数（judgeResult），这里只负责取证与重试。
+            judgeResult(blob, alreadyDoneBefore, doneNow)?.let { evidence ->
+                if (evidence.contains("未打卡变为已打卡")) {
+                    log("判定依据：状态翻转")
+                }
+                return evidence
             }
 
-            // 再查成功信号
-            DingTalkUi.containsSuccess(blob)?.let { return it }
-
-            log("第 " + (attempt + 1) + " 次确认未读到成功信号，继续等待")
+            if (DingTalkUi.containsFailure(blob) != null) {
+                log("命中失败信号，判定失败")
+            }
+            log(
+                "第 " + (attempt + 1) + " 次确认未读到成功信号" +
+                    "（点击前=" + alreadyDoneBefore + " 现在=" + doneNow + "），继续等待"
+            )
         }
         return null
     }

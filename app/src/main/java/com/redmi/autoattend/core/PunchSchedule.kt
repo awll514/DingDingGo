@@ -41,6 +41,22 @@ object PunchSchedule {
     data class Override(val dateKey: Int, val kind: PunchKind, val minuteOfDay: Int)
 
     /**
+     * 一个"已经完成"的打卡槽位。
+     *
+     * ## 为什么必须有这个（用户反馈的核心问题）
+     *
+     * 用户原话：「手动打卡成功后必须替换掉自动打卡的时间节点」。
+     *
+     * 之前 [nextSlot] 只看时间和星期，完全不看"今天这一班是不是已经打过了"。
+     * 于是手动打卡成功后，到点闹钟照样会再打一次 ——
+     * 而重复打卡在考勤系统里可能是异常记录。
+     *
+     * 现在把"今日已完成的 (日期, 班次)"传进来，命中就跳过，
+     * 下一次打卡自动顺延到下一班。
+     */
+    data class CompletedSlot(val dateKey: Int, val kind: PunchKind)
+
+    /**
      * 计算当前时刻之后的下一个打卡点。
      *
      * 会同时考虑今天剩余的班次和接下来 7 天内的班次，取最早的一个。
@@ -56,6 +72,7 @@ object PunchSchedule {
         overrides: List<Override> = emptyList(),
         includeRetryWindow: Boolean = true,
         skippedDateKeys: Set<Int> = emptySet(),
+        completedSlots: Set<CompletedSlot> = emptySet(),
     ): NextPunchSlot? {
         if (settings.activeDays.isEmpty()) return null
 
@@ -79,6 +96,12 @@ object PunchSchedule {
                 // 覆盖日即使是休息日也要执行
                 val active = override != null || dayOfWeek in settings.activeDays
                 if (!active) continue
+
+                // 【已完成】这一班已经打过了（手动或自动成功），跳过。
+                //
+                // 判定粒度是 (日期, 班次)，不是笼统的"今天打过卡"：
+                // 早上打了上班卡，不能影响下午的下班卡。
+                if (CompletedSlot(dateKey, kind) in completedSlots) continue
 
                 val minuteOfDay = override?.minuteOfDay ?: when (kind) {
                     PunchKind.CLOCK_IN -> settings.clockInMinute
@@ -115,6 +138,34 @@ object PunchSchedule {
         }
 
         return best
+    }
+
+    /**
+     * 从"今日已完成记录"构造已完成槽位集合。
+     *
+     * 与数据库解耦：调用方只需传入 (班次, 完成时间戳) 的列表，
+     * 本函数判断它们是否属于**今天**，从而得出今天哪些班已经打完。
+     *
+     * 之所以要求传时间戳而不是布尔值：
+     * 凌晨 0 点前后，昨天的下班卡记录不能算作今天的。
+     *
+     * @param nowMillis 当前时刻，用于确定"今天"的范围
+     * @param done 已完成记录：班次 → 完成时刻（毫秒）
+     */
+    fun completedSlotsForToday(
+        nowMillis: Long,
+        done: List<Pair<PunchKind, Long>>,
+    ): Set<CompletedSlot> {
+        val todayStart = startOfDay(nowMillis, 0)
+        val tomorrowStart = startOfDay(nowMillis, 1)
+        return done.mapNotNull { (kind, at) ->
+            when {
+                // 手动打卡记在 CLOCK_IN/CLOCK_OUT 上，MANUAL 不作为槽位
+                kind == PunchKind.MANUAL -> null
+                at in todayStart until tomorrowStart -> CompletedSlot(dateKey(todayStart), kind)
+                else -> null
+            }
+        }.toSet()
     }
 
     /** 今天是否是需要打卡的生效日 */

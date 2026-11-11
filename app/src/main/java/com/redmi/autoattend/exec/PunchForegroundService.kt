@@ -12,6 +12,7 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
 import com.redmi.autoattend.MainActivity
+import com.redmi.autoattend.core.AlarmScheduler
 import com.redmi.autoattend.core.AppConfig
 import com.redmi.autoattend.core.PunchSchedule
 import com.redmi.autoattend.data.db.AppDatabase
@@ -139,8 +140,18 @@ class PunchForegroundService : Service() {
         if (action == ACTION_RESUME) {
             Log.i(TAG, "收到继续指令")
             paused = false
-            // 重新起一次协程继续流程
-            startPunchFlow(pendingKind, pendingTargetAt)
+            // 【关键】继续时**不要**再走 prewarm 分支，也不要重新等待目标时刻。
+            //
+            // 之前的实现是 startPunchFlow(pendingKind, pendingTargetAt)，
+            // prewarm 默认 false 所以不会等待 —— 这部分是对的。
+            // 但整个 runPunch 会从"点亮屏幕"开始**重新执行一遍**：
+            // 已经在考勤页了又去重新导航、时间闸门重新判定（可能因超时直接拒绝），
+            // 表现为"点了继续，打卡却没有发生"。
+            //
+            // 现在的语义：继续 = 重新走一次完整流程，但跳过预热等待。
+            // 时间闸门会用当前真实时间重新判定，这是正确的 ——
+            // 如果暂停期间已经错过窗口，就应该拒绝而不是硬打。
+            startPunchFlow(pendingKind, pendingTargetAt, prewarm = false)
             return START_STICKY
         }
 
@@ -271,6 +282,18 @@ class PunchForegroundService : Service() {
 
         // 发通知
         PunchNotifier.notifyResult(applicationContext, result, kind, finishedAt)
+
+        // 【关键】成功后立刻重排闹钟。
+        //
+        // 用户原话：「手动打卡成功后必须替换掉自动打卡的时间节点」。
+        //
+        // scheduleNext 现在会读"今天已成功的班次"，所以重排后
+        // 刚打完的这一班会被跳过，下一次自动打卡自动顺延到下一班。
+        // 不重排的话，已经注册的旧闹钟仍会按原时间触发。
+        if (result.success) {
+            runCatching { AlarmScheduler.scheduleNext(applicationContext) }
+                .onFailure { Log.w(TAG, "重排闹钟失败: " + it.javaClass.simpleName) }
+        }
     }
 
     /** 暂停状态的通知：告诉用户"已暂停，还能继续" */

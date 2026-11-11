@@ -1,6 +1,7 @@
 package com.redmi.autoattend.core
 
 import android.content.Context
+import android.util.Log
 import android.content.SharedPreferences
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
@@ -53,6 +54,15 @@ object AppConfig {
     private const val SECURE_PREFS_NAME = "autoattend_secure"
     private const val SECURE_KEY_PASSWORD = "lock_password"
 
+    /** EncryptedSharedPreferences 默认使用的 master key 别名 */
+    private const val MASTER_KEY_ALIAS = "_androidx_security_master_key_"
+
+    private const val TAG_SECURE = "SecurePrefs"
+
+    /** 加密存储实例缓存，避免每次读写都重建 key */
+    @Volatile
+    private var cachedSecurePrefs: SharedPreferences? = null
+
     private const val KEY_IN_MINUTE = "clock_in_minute"
     private const val KEY_OUT_MINUTE = "clock_out_minute"
     private const val KEY_ACTIVE_DAYS = "active_days"
@@ -95,6 +105,15 @@ object AppConfig {
     /** 密码位数（不暴露明文），用于 UI 提示与解锁流程判断 */
     private val _passwordLength = MutableStateFlow(6)
     val passwordLength: StateFlow<Int> = _passwordLength.asStateFlow()
+
+    /**
+     * 加密存储是否已降级为普通存储。
+     *
+     * true 表示 Keystore 不可用、自愈也失败，密码只能明文存。
+     * 这不是正常状态，UI 必须显式告知用户，不能假装一切正常。
+     */
+    private val _secureStorageDegraded = MutableStateFlow(false)
+    val secureStorageDegraded: StateFlow<Boolean> = _secureStorageDegraded.asStateFlow()
 
     /** 外观模式：浅色 / 深色 / 跟随系统 */
     private val _themeMode = MutableStateFlow(ThemeMode.SYSTEM)
@@ -188,8 +207,54 @@ object AppConfig {
     private fun prefs(): SharedPreferences =
         requireNotNull(appContext).getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
+    /**
+     * 加密存储实例。
+     *
+     * ## 自愈逻辑（真机踩过）
+     *
+     * 小米/HyperOS 上有一种确实会发生的故障：
+     * ```
+     * the master key android-keystore://_androidx_security_master_key_
+     * exists but is unusable
+     * ```
+     * Keystore 里存在那个 master key 条目，但已经不可用（系统升级、
+     * 数据迁移、备份恢复都可能造成）。此时 [EncryptedSharedPreferences.create]
+     * 直接抛异常，密码永远存不进去 —— 用户看到的就是"配不了密码"。
+     *
+     * 处理方式：捕获后**清掉损坏的 key 与加密文件，重建一套**。
+     * 这是安全的：损坏的 key 本来就解不开任何数据，重建只会丢失
+     * 那一个本来就不可读的密码条目。
+     *
+     * 重建仍失败时降级到 [plainPrefs]，并在 UI 上明确告知用户
+     * "已降级存储"（[secureStorageDegraded]），不隐瞒。
+     */
     private fun securePrefs(): SharedPreferences {
         val ctx = requireNotNull(appContext)
+        cachedSecurePrefs?.let { return it }
+
+        // 第一次尝试
+        runCatching { createSecurePrefs(ctx) }.getOrNull()?.let {
+            cachedSecurePrefs = it
+            return it
+        }
+
+        // 失败 → 清掉损坏状态后重试一次
+        Log.w(TAG_SECURE, "加密存储不可用，尝试自愈")
+        wipeBrokenSecureStorage(ctx)
+        runCatching { createSecurePrefs(ctx) }.getOrNull()?.let {
+            cachedSecurePrefs = it
+            _secureStorageDegraded.value = false
+            Log.i(TAG_SECURE, "加密存储已重建")
+            return it
+        }
+
+        // 仍然失败 → 降级
+        Log.e(TAG_SECURE, "加密存储重建失败，降级为普通存储")
+        _secureStorageDegraded.value = true
+        return plainPrefs()
+    }
+
+    private fun createSecurePrefs(ctx: Context): SharedPreferences {
         val masterKey = MasterKey.Builder(ctx)
             .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
             .build()
@@ -201,6 +266,29 @@ object AppConfig {
             EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
         )
     }
+
+    /**
+     * 清掉损坏的 master key 与加密首选项文件。
+     *
+     * 只删这两个具体文件/别名，不动任何其它数据。
+     */
+    private fun wipeBrokenSecureStorage(ctx: Context) {
+        runCatching {
+            ctx.getSharedPreferences(SECURE_PREFS_NAME, Context.MODE_PRIVATE).edit().clear().commit()
+        }
+        runCatching {
+            ctx.deleteSharedPreferences(SECURE_PREFS_NAME)
+        }
+        runCatching {
+            val ks = java.security.KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+            if (ks.containsAlias(MASTER_KEY_ALIAS)) ks.deleteEntry(MASTER_KEY_ALIAS)
+        }
+        cachedSecurePrefs = null
+    }
+
+    /** 降级时的普通存储（与主配置分开，避免混在一起） */
+    private fun plainPrefs(): SharedPreferences =
+        requireNotNull(appContext).getSharedPreferences(SECURE_PREFS_NAME + "_plain", Context.MODE_PRIVATE)
 
     fun reload() {
         val p = prefs()
@@ -287,7 +375,18 @@ object AppConfig {
         require(password.all { it.isDigit() }) { "锁屏密码只支持纯数字" }
         require(password.length in 4..16) { "密码长度需在 4~16 位之间" }
 
-        securePrefs().edit().putString(SECURE_KEY_PASSWORD, password).apply()
+        val target = securePrefs()
+
+        // 必须用 commit 而不是 apply：
+        // apply 是异步落盘，失败不会反馈。密码这种"存了就必须真存上"的数据，
+        // 需要同步确认写入成功，否则界面显示已保存、实际没写进去。
+        val ok = target.edit().putString(SECURE_KEY_PASSWORD, password).commit()
+        require(ok) { "密码写入失败（存储不可写）" }
+
+        // 回读校验：确认真的能读出来
+        val readBack = target.getString(SECURE_KEY_PASSWORD, null)
+        require(readBack == password) { "密码写入后校验失败" }
+
         prefs().edit().putInt(KEY_PWD_LEN, password.length).apply()
 
         _hasPassword.value = true
@@ -295,7 +394,7 @@ object AppConfig {
     }
 
     fun clearLockPassword() {
-        securePrefs().edit().remove(SECURE_KEY_PASSWORD).apply()
+        runCatching { securePrefs().edit().remove(SECURE_KEY_PASSWORD).commit() }
         _hasPassword.value = false
     }
 
