@@ -124,16 +124,6 @@ private const val BarDragScale = 1.40f
 /** 按下反馈时长（仅用于 animatePosTo 的分支判断，实际由 lensLift 弹簧决定） */
 private const val BarPressMs = 320
 
-/**
- * 按住多久才认定「长按」并开始放大。
- *
- * 这是**意图判定**，不是动画延迟 —— 快速点击（< 此值）全程零缩放，
- * 只有真正按住了才放大。取 200ms：
- *   · 比 Android 的 long-press（500ms）短，这里不需要菜单语义；
- *   · 比双击间隔（300ms）短，不影响正常点击节奏。
- */
-private const val BarLongPressMs = 200L
-
 /** 发光上涨（0.1s 临界阻尼） */
 private fun <T> glowRise(): androidx.compose.animation.core.FiniteAnimationSpec<T> =
     spring(dampingRatio = 1f, stiffness = 3947.8f)
@@ -499,40 +489,18 @@ fun GlassTabBar(
 
                         // ---------- 按下 ----------
                         //
-                        // 只把指示器滑到手指所在 tab，**不放大**。
-                        //
-                        // ## 为什么按下不放大（用户反馈「先鼓一下再滑，看着别扭」）
-                        //
-                        // 按下时无法预知意图，之前统一放大 -> 快速点击时
-                        // 放大动画刚起步就被松手打断并缩回，就是「鼓一下又瘪掉」。
-                        //
-                        // 试过「延迟 120ms 放大」，长按的放大也跟着迟钝（已回退）；
-                        // 试过「松手时 snapTo 归位」，放大已在几十毫秒内动了，仍有轻微鼓包。
-                        //
-                        // ## 最终方案：放大由「意图信号」触发，不由按下触发
-                        //
-                        // 两个信号，任一出现才放大：
-                        //   ① 手指开始移动（超 touchSlop）-> 确定是拖拽
-                        //   ② 按住超过 BarLongPressMs 仍未松手 -> 确定是长按
-                        //
-                        // 快速点击两个信号都不会出现，**全程零缩放**。
-                        // 长按/拖拽的放大几乎不受影响：移动是即时触发的，
-                        // 而长按本来就要按一会儿才有意义。
+                        // 立刻把指示器滑到手指所在 tab 并放大。
+                        // 用 320ms（比点击位移略快）：按下的反馈要「跟手」，
+                        // 不能等太久，否则手感是「点了没反应」。
                         phase = Phase.Pressed
                         dragPos = Float.NaN
-                        // ②信号：按住超时 -> 认定为长按，放大
-                        // 注意：这里**不能用 phase == Phase.Pressed 判断**。
-                        // animatePosTo 内部会把 phase 改成 Settling（位置在动），
-                        // 导致这个条件永远不成立 —— 长按放大就会完全失效。
-                        // 用一个只表示「手指还按着」的独立标志。
-                        var fingerDown = true
-                        val longPressGrowJob = scope.launch {
-                            kotlinx.coroutines.delay(BarLongPressMs)
-                            if (fingerDown) {
-                                scaleAnim.animateTo(BarDragScale, lensLift())
-                                glowAnim.animateTo(0.9f, lensLift())
-                            }
+                        scope.launch {
+                            scaleAnim.animateTo(BarDragScale, lensLift())
                         }
+                        scope.launch {
+                            glowAnim.animateTo(0.9f, lensLift())
+                        }
+                        // 按下即移动到手指处（这是「长按跟手」的核心）
                         animatePosTo(downPos, BarPressMs, lensLift())
 
                         var dragged = false
@@ -551,13 +519,6 @@ fun GlassTabBar(
                                 moveToken = Any()
                                 moveJob?.cancel()
                                 moveJob = null
-                                // ①信号：手指开始移动 -> 确定是拖拽，立即放大
-                                // （长按的延迟任务作废，避免重复放大）
-                                longPressGrowJob.cancel()
-                                scope.launch {
-                                    scaleAnim.animateTo(BarDragScale, lensLift())
-                                    glowAnim.animateTo(0.9f, lensLift())
-                                }
                             }
                             if (dragged) {
                                 ch.consume()
@@ -567,52 +528,14 @@ fun GlassTabBar(
                         }
 
                         // ---------- 松手 ----------
-                        // 快速点击走这里：两个放大信号都没出现，长按任务直接作废，
-                        // 指示器全程零缩放 —— 只有平移，干净。
-                        fingerDown = false
-                        longPressGrowJob.cancel()
                         val targetTab = if (dragged) fingerToTab(lastX) else downTab
                         val fromPos = if (dragged && !dragPos.isNaN()) dragPos else posAnim.value
 
-                        // ============ 缩放与发光：点击路径不参与 ============
-                        //
-                        // ## 为什么单独处理缩放（用户反馈「先鼓一下再滑，看着别扭」）
-                        //
-                        // 按下时无法预知用户是要「快速点」还是「长按」，所以统一放大了。
-                        // 但快速点击时「按下 -> 松手」只隔几十毫秒，
-                        // 放大动画刚起步就被打断、紧接着缩回 ——
-                        // 视觉上就是「瞬间鼓一下又瘪掉」。
-                        //
-                        // ## 解法：按意图分流
-                        //
-                        // 试过「延迟 120ms 再放大」，但长按的放大也跟着变迟钝了
-                        // （延迟期间用户已经按着，手感反而更差）。已回退。
-                        //
-                        // 现在改成**松手时判断意图**：
-                        //   · 未拖拽的点击 -> snapTo 瞬间归位，不播缩回动画。
-                        //     缩放最多存在几十毫秒，肉眼几乎看不到，
-                        //     点击就只剩干净的平移。
-                        //   · 拖拽 -> 正常播放缩回落位（不变）。
-                        //
-                        // 三条路径彻底解耦：
-                        //   点击  -> 不缩放（本次改动）
-                        //   长按  -> 放大（按下逻辑不变，未松手就一直放大）
-                        //   拖拽  -> 放大 + 缩回落位（不变）
-                        if (dragged) {
-                            // 拖拽：正常播放缩回落位
-                            scope.launch {
-                                scaleAnim.animateTo(1f, lensTravel())
-                                glowAnim.animateTo(0f, glowFall())
-                            }
-                        } else {
-                            // 点击：全程没有放大过，这里只需要确保是 1.0。
-                            // 用 snapTo 而不是 animateTo —— 万一长按任务刚好
-                            // 在临界点触发了放大，也立刻收干净，不留尾巴。
-                            scope.launch {
-                                scaleAnim.snapTo(1f)
-                                glowAnim.snapTo(0f)
-                            }
+                        scope.launch {
+                            scaleAnim.animateTo(1f, lensTravel())
+                            glowAnim.animateTo(0f, glowFall())
                         }
+
                         // 无移动的点按：指示器已在按下时移到位，这里直接落位
                         // 有移动的拖拽：从手指位置滑到目标 tab 中心
                         dragPos = Float.NaN
