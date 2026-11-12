@@ -318,6 +318,83 @@ java.lang.IllegalArgumentException: Padding must be non-negative
 
 ---
 
+### 0.11.8 第七轮补丁（17:00–17:15）—— 两个新问题
+
+重构后用户复测，报了这两个。**都是重构引入的**，已修。
+
+#### 问题 2：在页面上左右滑动，指示器原地不动
+
+**根因：闭包捕获旧值。**
+
+```kotlin
+LaunchedEffect(Unit) {          // 只启动一次
+    snapshotFlow { liveOffset } // 捕获首帧的 liveOffset
+        .collect { off ->
+            if (phase == Phase.Idle && requestedIndex == selectedIndex) ...
+                                      // ↑ 也是首帧的值
+        }
+}
+```
+
+`LaunchedEffect(Unit)` 永不重启，闭包里的 `liveOffset` / `selectedIndex`
+是**首帧的值**：
+
+- `liveOffset` 首帧是 0.0 → `snapshotFlow` 永远只发出 0.0，从不触发
+- `selectedIndex` 首帧是 0 → 在设置页时条件永远不成立
+
+**修法**：用 `rememberUpdatedState` 包成 State 容器，闭包读 `.value` 永远最新。
+
+同时引入 `selfDriven` 显式标记区分两种 pager 变化来源：
+
+| 来源 | selectedIndex 变 | liveOffset 变 | 指示器该不该跟 |
+|---|---|---|---|
+| 用户直接滑页面 | 是 | 是 | **要跟手** |
+| 点击/长按底栏切页 | 是 | 是 | 不要跟（状态机驱动）|
+
+光看数值分不出来，必须由发起方主动打标记。
+
+#### 问题 1：点击动画卡顿
+
+代码内逐帧打点拿到确切数据：
+
+```
+17:03:05.432
+17:03:05.434
+17:03:05.434
+17:03:05.588   <- 154ms 空档
+```
+
+原因是 `beyondViewportPageCount` **仍是 0** —— 上一轮写的修改没有落到文件里
+（用 `Select-String` 核对时才发现）。设置页首次组合的 147ms
+依然在点击时同步发生。
+
+改成 1 后：
+
+```
+28.285 pos=0.000
+28.319 pos=0.027  (16ms)
+28.327 pos=0.057  (8ms)
+28.335 pos=0.100
+28.343 pos=0.144
+...帧间隔稳定 8~18ms，位置匀速递增
+```
+
+#### 又一次踩到构建坑（补 §0.11.7 的 39 条）
+
+42. **`packageDebug` 会被判定 `UP-TO-DATE` 而跳过，即使 APK 文件不存在**
+    本轮出现多次：`build/outputs` 是空的，Gradle 却说 `BUILD SUCCESSFUL`、
+    39 个任务全部 up-to-date。原因是任务输出缓存的记录和磁盘实际文件脱节。
+    `--rerun-tasks --no-build-cache` 也未必够。**唯一可靠做法**：
+    ```
+    .\gradlew.bat :app:packageDebug --console=plain --no-daemon --rerun-tasks
+    # 然后必须显式检查：
+    if (Test-Path app\build\outputs\apk\debug\app-debug.apk) { ... } else { 失败 }
+    ```
+    **每次装包前都要核对 APK 时间戳与设备 lastUpdateTime 一致**，
+    本轮至少 3 次因为装了旧包而测出假数据、白排查。
+
+---
+
 ## 0.10 第六轮（2026-11-12 14:00–14:20）—— 底栏两个交互缺陷
 
 > 用户反馈：「点一下直接瞬移过去」+「刚切换界面的 0.5 秒左右无法点击或拖拽底栏」。
