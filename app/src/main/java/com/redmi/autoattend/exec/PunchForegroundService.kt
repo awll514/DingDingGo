@@ -457,10 +457,24 @@ class PunchForegroundService : Service() {
             targetAtMillis = targetAt,
             kind = kind,
         )
+        // 【P0】太早被拒不能算「这一班已处理」。
+        //
+        // 真机复现（2026-11-12 12:48）：提前触发的下班卡被时间闸门正确拒绝，
+        // 但这里把 rejectedTooEarly 当成了 abandonedByGate，于是
+        // onPunchFinished(markFired=true) → scheduleNext 跳到下一班 →
+        // cancelAll 把**今天 18:30** 的 PREWARM / FIRE / RETRY 全部取消，
+        // 当天真正的下班卡静默漏打。
+        //
+        // 现在的口径：
+        //   · 成功            → 标记已处理，顺延下一班
+        //   · 主动放弃(迟到/外勤超时) → 标记已处理，顺延下一班
+        //   · 太早被拒        → **不标记**，本班闹钟原样保留
+        //   · 执行失败        → 不标记，让 RETRY 兜底
         AlarmScheduler.onPunchFinished(
             context = applicationContext,
             slot = slot,
-            markFired = result.success || result.abandonedByGate,
+            markFired = result.success ||
+                (result.abandonedByGate && !result.rejectedTooEarly),
         )
     }
 

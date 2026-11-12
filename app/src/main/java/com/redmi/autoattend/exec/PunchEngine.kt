@@ -60,6 +60,28 @@ data class PunchResult(
      * 并且不再为这一班保留补执行机会（本来就不该打）。
      */
     val abandonedByGate: Boolean = false,
+
+    /**
+     * 本次是「来得太早」而不是「这一班已经交代完毕」。
+     *
+     * ## 为什么必须和 abandonedByGate 分开（真机复现的 P0 漏卡）
+     *
+     * 服务在结果收尾时用 `markFired = result.success || result.abandonedByGate`
+     * 决定是否把本班标记为「已处理」，标记后 scheduleNext 会跳到**下一班**。
+     *
+     * 原来「距下班时间还有 341 分 19 秒，已阻止提前打下班卡」也带
+     * abandonedByGate=true，于是：
+     *   · 今天 12:48 触发了一次下班卡（提前，正确拒绝）
+     *   · 结果被当成「这一班处理完了」→ 重排时把**今天 18:30** 的
+     *     PREWARM / FIRE / RETRY 三段闹钟全部取消，排到了明天 09:30
+     *   · 当天真正的下班卡**静默漏打**
+     *
+     * 真机证据（2026-11-12 12:48）：拒绝后 dumpsys alarm 里 18:30 三段消失，
+     * 只剩 RTC_WAKEUP 明天 09:30。
+     *
+     * 语义修正：太早被拒 = 什么都没改变，该班的闹钟必须原样保留。
+     */
+    val rejectedTooEarly: Boolean = false,
 )
 
 /**
@@ -1424,6 +1446,9 @@ class PunchEngine(private val context: Context) {
                     trace = trace.toList(),
                     channelUsed = channelUsed,
                     abandonedByGate = true,
+                    // 【P0】太早 ≠ 这一班已处理。带上这个标记，收尾时不会取消
+                    // 今天 18:30 的闹钟（真机实测会漏打，见字段注释）。
+                    rejectedTooEarly = true,
                 )
             }
 
@@ -1436,6 +1461,7 @@ class PunchEngine(private val context: Context) {
                     trace = trace.toList(),
                     channelUsed = channelUsed,
                     abandonedByGate = true,
+                    rejectedTooEarly = true,
                 )
             }
 
@@ -1508,6 +1534,9 @@ class PunchEngine(private val context: Context) {
                         trace = trace.toList(),
                         channelUsed = channelUsed,
                         abandonedByGate = true,
+                        // 同闸门 1：外勤等待后仍然"太早"也不代表这一班已处理，
+                        // 不能让收尾逻辑把这班标记掉（否则当天闹钟被取消）。
+                        rejectedTooEarly = true,
                     )
                 }
             }

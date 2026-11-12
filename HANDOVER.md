@@ -2,9 +2,13 @@
 
 > 生成时间：2026-11-11 · 设备：Redmi K90 至尊版（M332BF / warsaw / HyperOS V816 / Android 16 / API 36）
 >
-> **最后更新：2026-11-12 09:40（第四轮：底栏手势彻底重构 + 打卡识别 P0 修复，详见 §0.8）**
+> **最后更新：2026-11-12 12:55（第五轮：真机全链路验证 + 漏卡 P0 修复，详见 §0.9）**
 >
-> 分支：`fix/p0-punch-chain` · HEAD `91c07f3` · 已推送 origin
+> 分支：`fix/p0-punch-chain` · 基于 `91c07f3`
+>
+> ⚠️ **第五轮是唯一一次"真机跑通整条链路"的记录**。前四轮全部止步于
+> 编译 + 单元测试，从未在锁屏状态下走完 点亮→解锁→钉钉→考勤页。
+> 本轮实测暴露了 3 个只在真机出现的缺陷，其中 1 个会**直接漏打当天卡**。
 **从 `PrismalAGSL`（50 星）换成 `Kyant0/AndroidLiquidGlass`（4600 星）**
 
 ```kotlin
@@ -139,6 +143,237 @@ showStatus(context, tone, title, subtitle, holdMs = 3000L)
 | 4 | `LiquidGlassPanel` 的 `sampleOffsetX/Y` | 死参数 | 签名里保留但函数体从未使用，是旧 Prismal 遗留 |
 | 5 | `SettingsScreen` / `LaunchOverlay` 的裸 `tween()` | 未迁移 | 仍有多处 `tween(220)` / `tween(280)` 未走 `GlassMotion` |
 | 6 | 深色首页两个大卡片偏黑 | 用户说不急 | 第二轮遗留 |
+
+
+## 0.9 第五轮（2026-11-12 12:20–13:00）—— 真机全链路验证
+
+> 本轮首次在**真实设备、真实锁屏、真实密码**条件下跑完整条打卡链路。
+> 设备：M332BF / Android 16 / API 36（与文档目标机型一致）。
+
+### 0.9.1 【P0】「太早被拒」会取消当天闹钟 → 当天漏卡（已修复）
+
+**这是本轮最重要的发现，且已在真机上复现。**
+
+复现步骤：12:48 手动触发一次下班卡（目标 18:30，当前 12:48）。
+
+日志（真机）：
+```
+安全闸门：kind=CLOCK_OUT 目标=18:30:00 偏差=-20477秒
+拒绝：下班时间未到，还差 341 分 19 秒
+```
+
+**拒绝本身是正确的**（下班前绝不能打下班卡）。但收尾时：
+
+```kotlin
+// PunchForegroundService.runPunch()
+markFired = result.success || result.abandonedByGate   // ← 旧代码
+```
+
+于是这次「提前拒绝」被当成「这一班已处理完毕」：
+`onPunchFinished(markFired=true)` → `scheduleNext()` 顺延下一班 →
+`render()` 先 `cancelAll(previous)` —— **当天 18:30 的
+PREWARM / FIRE / RETRY 三段闹钟被一起取消**。
+
+真机证据（`dumpsys alarm`）：
+```
+拒绝前：RTC_WAKEUP #34 origWhen 1794479325000  (今天 18:28:45 PREWARM)
+        RTC_WAKEUP #35 origWhen 1794479400000  (今天 18:30:00 FIRE)
+        RTC_WAKEUP #36 origWhen 1794479520000  (今天 18:32:00 RETRY)
+拒绝后：RTC_WAKEUP #80 origWhen 1794533325000  (明天 09:28:45 PREWARM) ← 全跳到明天
+```
+
+**后果**：当天真正的下班卡静默漏打，界面上完全看不出来。
+
+**修法**：`PunchResult` 增加 `rejectedTooEarly`，语义是
+「太早 ≠ 这一班处理完了，而是什么都没发生，闹钟必须原样保留」。
+
+| 结果类型 | markFired | 理由 |
+|---|---|---|
+| 成功 | true | 顺延下一班 |
+| 迟到边界后主动放弃 | true | 本班确实处理完了 |
+| **太早被拒（下班未到/上班未到）** | **false** | 什么都没发生，闹钟必须保留 |
+| 执行失败 | false | 留 RETRY 兜底 |
+
+改了 4 处口径（闸门 1 的下班太早、上班太早；外勤复查后同样两种）。
+
+**回归测试**：新增 `TooEarlyGateTest`（6 例），把上述契约钉死。
+
+### 0.9.2 【P0】无 root 时「点亮屏幕」必然失败（已确认，靠 root 规避）
+
+真机实测：连续 3 次触发，全部死在第一步：
+
+```
+[44742] 开始执行 kind=CLOCK_OUT 通道偏好=AUTO
+[44742] root 不可用，尝试用 Activity 唤醒屏幕
+[48855] 失败于 [点亮屏幕] 无法点亮屏幕
+```
+
+`PunchEngine.prepareScreen()` 三条方案在**无 root** 时全部无效：
+
+| 方案 | 无 root 时 | 原因 |
+|---|---|---|
+| A. `RootShell.wakeUp()` (input keyevent 224) | 不可用 | 需要 su |
+| B. 拉 MainActivity（turnScreenOn） | **无效** | Activity 已在栈顶时 intent 被直接投递，不重新触发 turnScreenOn |
+| C. 充电保持唤醒 | 不适用 | 用户未开启 |
+
+**验证**：KernelSU 给 App 授权后（`RootShell: root available = true`），
+同一条链路立刻跑通：
+
+```
+[12817] root 点亮屏幕 input keyevent 224     ✅
+[12862] 无障碍上滑                            ✅
+[13663] 输入锁屏密码，第 1 次                 ✅ 一次就过
+[13949] 启动钉钉                              ✅
+[22326] 钉钉前台就绪=true                     ✅
+[22378] 顶部快捷入口：当前已在考勤页           ✅
+[22378] 安全闸门：目标=18:30:00 偏差=-20477秒  ✅ 正确拒绝
+```
+
+> **结论**：这台设备上 **root 是必需项，不是可选项**。
+> 设置页的「执行后端」不要选「仅无障碍」—— 那样点亮屏幕就会失败。
+> `prepareScreen()` 方案 B 需要用 `FLAG_ACTIVITY_CLEAR_TASK` 或先 `finish()`
+> 才能重建 Activity 触发 turnScreenOn，目前未修（有 root 时不走这条路）。
+
+### 0.9.2b 装机脚本（第五轮验证通过的完整流程）
+
+按顺序执行，缺任何一步都会在真机上失败：
+
+```powershell
+$adb = 'C:\AndroidTools\sdk\platform-tools\adb.exe'
+$pkg = 'com.redmi.autoattend.debug'
+$svc = "$pkg/com.redmi.autoattend.exec.PunchAccessibilityService"
+$base = "li.songe.gkd/...:io.github.ccch1mneyyy.dsh_app/.phone.a11y.PhoneA11yService"
+
+# 1. 装包（必须先开 开发者选项 → USB 安装）
+& $adb install -r app\build\outputs\apk\debug\app-debug.apk
+
+# 2. 无障碍（install -r 会解绑，必须重写；保留原有的 GKD 等服务）
+& $adb shell ("settings put secure enabled_accessibility_services '" + $base + ":" + $svc + "'")
+& $adb shell "settings put secure accessibility_enabled 1"
+
+# 3. 通知权限 —— 【最容易漏，漏了必然解锁失败】
+& $adb shell "pm grant $pkg android.permission.POST_NOTIFICATIONS"
+& $adb shell "appops set $pkg POST_NOTIFICATION allow"
+
+# 4. 悬浮窗（重装后会被重置成 ignore）
+& $adb shell "appops set $pkg SYSTEM_ALERT_WINDOW allow"
+
+# 5. 精确闹钟
+& $adb shell "appops set $pkg SCHEDULE_EXACT_ALARM allow"
+
+# 6. 电池白名单
+& $adb shell "dumpsys deviceidle whitelist +$pkg"
+
+# 7. MIUI 自启动 / 后台弹出 / 锁屏显示
+& $adb shell "cmd appops set $pkg 10021 allow"   # 自启动
+& $adb shell "cmd appops set $pkg 10020 allow"   # 后台弹出界面
+& $adb shell "cmd appops set $pkg 10023 allow"   # 显示在锁屏上
+
+# 8. 种锁屏密码（debug 构建专用）
+& $adb shell "am broadcast -n $pkg/com.redmi.autoattend.exec.DebugPasswordSeedReceiver ``
+    -a com.redmi.autoattend.debug.SEED_PASSWORD --es password <你的密码>"
+# 日志应出现: DebugPwdSeed: seed password: OK
+
+# 9. root（KernelSU 里给 App 授权，然后确认）
+& $adb shell "am start -n $pkg/com.redmi.autoattend.MainActivity" | Out-Null
+& $adb logcat -d | Select-String "root available"   # 必须为 true
+```
+
+**验证闹钟**：
+```powershell
+& $adb shell "dumpsys alarm" | Select-String "autoattend" | Select-String "origWhen"
+# 用 [DateTimeOffset]::FromUnixTimeMilliseconds(<值>) 解码，应看到今天的上下班时刻
+```
+
+### 0.9.3 KernelSU 授权范围（重要，排查时别浪费时间）
+
+KernelSU 的授权是**按 UID** 的，实测现象：
+
+| 谁 | `su -c id` | 说明 |
+|---|---|---|
+| adb shell (uid 2000) | **不可用** | `/system/bin/sh: su: inaccessible or not found` |
+| App 进程 (uid 10305) | **可用** | `RootShell: root available = true` |
+
+所以：**不能用 `adb shell su` 来判断 root 是否可用**，
+必须看 logcat 里 `RootShell: root available = ?`，或看功能是否真的走通。
+
+另外 `/data/adb` 对 shell 是 `Permission denied`，属正常。
+
+### 0.9.4 TRIGGER_PUNCH 广播链路真相（§4.6 结案）
+
+原文档说「`result=0` 但没写 punch_log 行，链路断在哪儿没查」。本轮查清：
+
+1. **`result=0` 完全不能证明 receiver 被调用** —— 没有任何 receiver
+   匹配时 `am broadcast` 同样返回 `result=0`。之前的推断是错的。
+2. 必须用 **`-n` 显式指定组件**：
+   ```
+   adb shell am broadcast -n com.redmi.autoattend.debug/com.redmi.autoattend.exec.DebugPasswordSeedReceiver \
+       -a com.redmi.autoattend.debug.TRIGGER_PUNCH --es kind CLOCK_OUT
+   ```
+   只写 action 有时会因隐式广播限制/包名解析不到而不投递。
+3. 链路本身**没有断**。修好调用方式后，每一次都正常写入了 punch_log，
+   并跑完整条流程。
+
+> 也就是说 §4.6 是**排查方法错误**造成的误判，不是代码缺陷。
+> 已在本轮证明可稳定复现执行。
+
+### 0.9.5 本轮的真机环境结论
+
+| 项 | 实测值 |
+|---|---|
+| 设备 | `d65730c5` / M332BF / warsaw / Android 16 / API 36 |
+| 排班 | 09:30 上班 / 18:30 下班 / 周一至周六（`active_days=2,3,4,5,6,7`） |
+| 锁屏密码 | 已通过 `SEED_PASSWORD` 广播加密写入，`seed password: OK` |
+| root | ✅ KernelSU v3.3.1，App 已授权 |
+| 无障碍 | ✅ 已绑定（与 GKD 共存） |
+| 悬浮窗 | ✅ `SYSTEM_ALERT_WINDOW: allow` |
+| 电池白名单 | ✅ `user,com.redmi.autoattend.debug,10305` |
+| 闹钟 | ✅ PREWARM / FIRE / RETRY 三段齐备 |
+| 编译 | ✅ BUILD SUCCESSFUL（JDK 17 够用，无需 JDK 21） |
+
+### 0.9.6 本轮踩到的新坑（补进 §11）
+
+29. **MIUI/HyperOS 的「USB 安装」开关会挡住 `adb install`** ——
+    报 `INSTALL_FAILED_USER_RESTRICTED: Install canceled by user`。
+    `pm install-create / install-write` 能成功写入，但 `install-commit` 照样被拒。
+    必须去 **开发者选项 → USB 安装** 手动打开。
+    （settings put 那几个 verifier 开关都绕不过去，别浪费时间。）
+
+30. **签名不一致时只能卸载重装** ——
+    `INSTALL_FAILED_UPDATE_INCOMPATIBLE`。代价是清空 App 数据：
+    锁屏密码、排班、打卡日志全部丢失，装完必须重新种密码。
+
+31. **`am force-stop` 会解绑无障碍** —— 和 `install -r` 一样。
+    重装/强停之后必须重新 `settings put secure enabled_accessibility_services`。
+
+32. **`dumpsys alarm` 的 `origWhen` 是毫秒时间戳**，
+    用 `[DateTimeOffset]::FromUnixTimeMilliseconds()` 解码比猜时间靠谱得多。
+    排查漏卡时这是最快的一条证据。
+
+33. **通知权限弹窗会卡在锁屏上，导致解锁 100% 失败** ——
+    连续 4 次真机测试全部死在「输入锁屏密码，第 1/2/3 次」，
+    现象看起来像"密码错了"，实际是：
+    - `POST_NOTIFICATIONS` 是 `granted=false`（`pm grant` 首次没生效）
+    - App 启动时 `requestNotificationPermission()` 弹的**系统弹窗浮在锁屏之上**
+    - 上滑 → 焦点落在弹窗的「拒绝/始终允许」按钮上，不是密码键盘
+    - 密码数字全部打进了无效位置 → 三次尝试全失败
+
+    修法（装机后必做）：
+    ```
+    adb shell pm grant com.redmi.autoattend.debug android.permission.POST_NOTIFICATIONS
+    adb shell appops set com.redmi.autoattend.debug POST_NOTIFICATION allow
+    ```
+    并确认 `dumpsys package ... | grep POST_NOTIFICATIONS:` 是 `granted=true`。
+    **只设 appops 不够，权限本身也必须是 granted。**
+
+34. **`appops set <pkg> SYSTEM_ALERT_WINDOW allow` 重装后会被重置成 `ignore`** ——
+    重装/卸载重装后必须重新设一次，否则打卡时悬浮窗提示不出现。
+
+35. **单元测试真实数字是 99 passed + 5 skipped，不是 104** ——
+    `@Test` 共 104 个，但 `@Ignore` 是 **5 个**（不是文档曾说的 12 个），
+    分布在 `SafetyGateTest`(2) / `SchedulerGuardTest`(3)。
+    104 = 99 通过 + 5 跳过。第五轮新增 `TooEarlyGateTest` 6 例后为 110/105+5。
+
 
 ### 0.8 第四轮迭代（2026-11-12）—— 底栏手势彻底重构 + 打卡识别 P0
 
