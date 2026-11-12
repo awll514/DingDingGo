@@ -2,7 +2,7 @@
 
 > 生成时间：2026-11-11 · 设备：Redmi K90 至尊版（M332BF / warsaw / HyperOS V816 / Android 16 / API 36）
 >
-> **最后更新：2026-11-12 14:20（第六轮：底栏点击瞬移 + 0.5 秒点不动，详见 §0.10）**
+> **最后更新：2026-11-12 16:45（第七轮：底栏动画层重构，详见 §0.11）**
 >
 > 分支：`fix/p0-punch-chain` · 基于 `91c07f3`
 >
@@ -144,6 +144,179 @@ showStatus(context, tone, title, subtitle, holdMs = 3000L)
 | 5 | `SettingsScreen` / `LaunchOverlay` 的裸 `tween()` | 未迁移 | 仍有多处 `tween(220)` / `tween(280)` 未走 `GlassMotion` |
 | 6 | 深色首页两个大卡片偏黑 | 用户说不急 | 第二轮遗留 |
 
+
+## 0.11 第七轮（2026-11-12 15:57–16:45）—— 底栏动画层重构
+
+用户原话：「越修越差了，重构整个底栏动画，但别动底栏已经实现好的液态玻璃材质」。
+
+### 0.11.1 旧架构为什么必然出 bug
+
+旧实现同时维护**五个位置来源**，渲染时按优先级挑一个用：
+
+```
+pressX（拖拽） slideX（点击平移） settledX（落位锚点）
+liveOffset（pager 进度） xAnim（兜底）
+```
+
+这不是参数没调好，是**结构问题**：每加一个来源就多一组
+「何时交接、谁先谁后」的时序歧义。实测连续 4 轮修复，
+每轮都修好一处、弄坏另一处：
+
+| 轮次 | 修了 | 弄坏了 |
+|---|---|---|
+| 1 | 点击瞬移 | 松手复读 |
+| 2 | 松手复读 | 长按不跟手 |
+| 3 | 长按不跟手 | 松手回弹 |
+| 4 | 松手回弹 | 起步抽搐 |
+
+### 0.11.2 新架构：一个真值 + 一个状态机
+
+```kotlin
+posAnim: Animatable<Float>   // 唯一位置（tab 单位，0.0~lastIndex）
+phase: Idle / Pressed / Dragging / Settling  // 谁在驱动它
+```
+
+所有路径（按下、拖拽、点击、落位、pager 同步）**都只写 posAnim**，
+渲染端只读它 —— 结构上不可能出现「两个值对不上」。
+
+`liveOffset` 只有**一个**注入入口（`snapshotFlow`），且仅在
+`requestedIndex == selectedIndex`（无待处理切页）时生效。
+
+拖拽跟手仍然用普通 float state（`dragPos`）覆盖，因为
+`Animatable.snapTo` 是挂起函数，逐帧调用必然产生 20~40ms 调度延迟。
+
+### 0.11.3 参数换成 iOS 26 逐帧实测值
+
+数据源：Codename One motion-probe（XCUITest 真触摸驱动真实
+`UITabBarController`，逐帧记录 layer position/transform，
+用闭式弹簧公式反解 ω 和 ζ）+ UIKitCore 逆向。
+
+```kotlin
+// 位移 / 松手吸附（同一条）
+spring(dampingRatio = 0.85f, stiffness = 246.7f)    // 过冲 0.63%
+// 拖拽跟手
+spring(dampingRatio = 0.903f, stiffness = 1024f)
+// 按下抬升（临界阻尼 0.25s）
+spring(dampingRatio = 1f, stiffness = 631.7f)
+```
+
+**这条研究与项目规则冲突，需要显式记录**：AGENTS.md 写「全应用禁用 spring」，
+但 iOS 26 底栏指示器**就是弹簧驱动的**（UIKit 甚至不挂 CAAnimation，
+每帧自己写 layer position）。正确的分工是：
+**材质/指示器层用弹簧，页面切换与弹层用 bezier**。
+
+原来的 `cubic-bezier(0.32, 0.72, 0, 1)` 偏差有多大：
+
+| 时刻 | 旧 bezier | iOS 实测 |
+|---|---|---|
+| 84ms | 0.656 | 0.413 |
+| 126ms | 0.847 | 0.647 |
+| 210ms | 0.955 | 0.914 |
+
+最大偏差 25%（84ms 处）—— 这就是「啪一下弹过去、后面慢慢蹭」的来源。
+
+### 0.11.4 「抽搐」的真正根因（atrace 实测）
+
+不是动画参数问题，是**主线程被组合器占满**：
+
+```
+Choreographer#doFrame  total=164.3ms
+└─ AndroidOwner:measureAndLayout  147.4ms
+   ├─ Compose:recompose            39.3ms
+   ├─ Compose:applyChanges         32.7ms
+   └─ TextStringSimpleNode::measure × 74   27.8ms
+```
+
+关键点：
+
+1. 这 147ms 里**没有任何 AGSL / RenderEffect 切片** ——
+   玻璃渲染不是原因（设置页用的全是轻量 `FrostedPanel`）。
+   别再往着色器方向排查。
+2. 这段组合跑在 **`AndroidOwner:onTouch`** 里，即输入分发路径上同步执行，
+   Choreographer 的下一帧回调根本排不进去。
+3. 冷进程首次切页 147ms，同进程第 2 次降到 4.5ms、第 3 次 1.7ms ——
+   典型的「首次组合」一次性成本。
+4. 反向切回首页只要 16ms（首页是 pager 初始页，本来就组合好了）。
+
+### 0.11.5 三个修复
+
+**① 页面瞬时切换 + 预渲染相邻页**
+
+```kotlin
+// MainActivity: onSelect 里
+pagerScope.launch { runCatching { pagerState.scrollToPage(target) } }
+// HorizontalPager
+beyondViewportPageCount = 1,   // 原来是 0
+```
+
+iOS 原生 `UITabBarController` 切 tab 时**页面内容没有任何过渡动画**，硬切。
+整段运动只有指示器在动。这是 Apple 的设计意图：让 lens 成为唯一被注意的运动。
+
+`beyondViewportPageCount = 1` 把那 147ms 从「用户点击时」挪到「启动遮罩还在时」。
+代价：冷启动 +150ms（543ms → ~700ms）、设置页节点树常驻（Java Heap +2MB）。
+
+**② liveOffset 注入加守卫**
+
+长按把指示器滑到设置后，动画结束进 `Idle`，但 pager 的 `liveOffset` 仍是 0。
+无条件 `snapTo(off)` 会让位置从 `0.998` 跳回 `0.000`：
+
+```
+JUMPS=68: 0.998/Settling -> 0.000/Idle
+```
+
+修法：只在 `requestedIndex == selectedIndex` 时同步。
+
+**③ 修掉一个崩溃**
+
+```
+java.lang.IllegalArgumentException: Padding must be non-negative
+    at GlassTabBar.kt:619
+```
+
+`scale = 1.40` 时 `hDp = 56dp > barHeight = 52dp`，
+`padding(top = (52-56)/2) = -2dp` → 崩溃。真机表现是「按住就退回桌面」。
+
+改成**固定高度布局 + graphicsLayer 缩放**：`graphicsLayer` 的 scale 以自身中心为轴，
+不改变布局尺寸，放大后自然上下溢出、不会被裁剪。
+
+### 0.11.6 验证方式：代码内逐帧采样
+
+录屏目测在这个量级（520ms、每帧 8px）上极不可靠 —— 本轮多次误判。
+改用**内存缓冲采样**（渲染路径写 `ArrayList`，动画结束一次性 `Log.i`，
+零逐帧 I/O），拿到了可判定的序列：
+
+| 场景 | 序列 | 跳变 |
+|---|---|---|
+| 点击设置 | 0.000→0.007→0.100→0.144→0.191→…→1.000 | 无 |
+| 点击首页 | 1.000→0.943→0.900→0.856→0.809→…→0.000 | 无 |
+| 长按设置 | 0.000→0.018→0.062→0.123→0.201→…→0.998 | 无 |
+| 拖拽往返 | 0.073→0.092→0.115→…→0.791 | 无 |
+
+判据：相邻帧位移 > 0.15 tab（约 54px）记为跳变。
+
+### 0.11.7 新增真机坑
+
+39. **Gradle 增量编译对这个项目不可靠**
+    本轮至少 5 次「改了代码但 APK 时间戳没变」，导致装了旧包、
+    测出假结果、白排查。`--rerun-tasks` 也不行。
+    唯一可靠做法：`Remove-Item -Recurse -Force app\build` 后全量重建。
+    改完必须核对两个时间戳：
+    ```
+    (Get-Item app\build\outputs\apk\debug\app-debug.apk).LastWriteTime
+    adb shell dumpsys package <pkg> | grep lastUpdateTime
+    ```
+
+40. **重装会重置锁屏显示权限，App 启动不了**
+    日志特征：`MIUILOG- Show when locked PermissionDenied`。
+    表现是 `am start` 返回 `LaunchState: UNKNOWN (0)`、`TotalTime: 0`，
+    进程存在但没有 resumed activity。
+    修复：`adb shell cmd appops set <pkg> 10023 allow`
+
+41. **`input swipe` 起点终点相同 ≠ 长按**
+    系统会把它合并成点击或直接丢弃，Compose 收不到长按。
+    实测有效：`input motionevent DOWN x y` … 等待 … `input motionevent UP x y`。
+
+---
 
 ## 0.10 第六轮（2026-11-12 14:00–14:20）—— 底栏两个交互缺陷
 
