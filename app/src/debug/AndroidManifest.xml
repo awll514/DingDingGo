@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  仅 debug 构建生效的覆盖 manifest。
+
+  ## 为什么把密码种子接收器放在这里
+
+  锁屏密码是 EncryptedSharedPreferences 里的密文，密钥由 AndroidKeyStore 持有。
+  adb 无法直接写 prefs（密文搬不过去，Keystore 里的密钥不会跟着走），
+  唯一正确的写入路径是 AppConfig.saveLockPassword()。
+
+  真机联调需要一次性把密码种进去，所以提供了一个广播入口。
+  但它能在不打开界面的情况下改变锁屏密码，放在 main manifest 里等于
+  在 release 包里留了一个任何应用都能改密码的后门（exported true）。
+
+  Android 的 source set 优先级保证：app/src/debug/AndroidManifest.xml 里的组件
+  只会合并进 debug 构建，release 构建完全不包含它。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <application>
+        <receiver
+            android:name=".exec.DebugPasswordSeedReceiver"
+            android:exported="true"
+            tools:ignore="ExportedReceiver">
+            <intent-filter>
+                <action android:name="com.redmi.autoattend.debug.SEED_PASSWORD" />
+                <action android:name="com.redmi.autoattend.debug.TRIGGER_PUNCH" />
+            </intent-filter>
+        </receiver>
+    </application>
+
+</manifest>
