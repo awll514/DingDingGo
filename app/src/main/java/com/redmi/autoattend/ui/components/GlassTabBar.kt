@@ -124,17 +124,6 @@ private const val BarDragScale = 1.40f
 /** 按下反馈时长（仅用于 animatePosTo 的分支判断，实际由 lensLift 弹簧决定） */
 private const val BarPressMs = 320
 
-/**
- * 按多久才放大。
- *
- * 快速点击（< 这值时长的「按下→松手」）完全不放大，只有平移 ——
- * 否则放大动画刚起步就被松手打断，视觉上是「鼓一下又瘪掉」，很毛躁。
- *
- * 120ms 是常见触摸库区分 tap 与 long-press 的量级（Android 自身是 500ms，
- * 但那是「长按菜单」的语义；这里只需要区分「快速点」与「按住」）。
- */
-private const val BarPressGrowDelayMs = 120L
-
 /** 发光上涨（0.1s 临界阻尼） */
 private fun <T> glowRise(): androidx.compose.animation.core.FiniteAnimationSpec<T> =
     spring(dampingRatio = 1f, stiffness = 3947.8f)
@@ -500,30 +489,16 @@ fun GlassTabBar(
 
                         // ---------- 按下 ----------
                         //
-                        // 指示器立刻滑到手指所在 tab（这是点击切换动画的起点），
-                        // 但**不放大小**。
-                        //
-                        // ## 为什么按下不放大
-                        //
-                        // 原来是按下就 scaleAnim.animateTo(1.40)。
-                        // 但快速点击时「按下 → 松手」只隔几十毫秒，
-                        // 放大动画刚起步 3~4 帧就被松手打断，紧接着又缩回去 ——
-                        // 视觉上就是「瞬间鼓一下又瘪掉」，非常毛躁。
-                        // 点击越快点，这一下越明显。
-                        //
-                        // 现在改为**延迟放大**：手指按住超过 BarPressGrowDelayMs
-                        // 还不动，才认定是长按/犹豫，此时才放大。
-                        // 快速点击完全不放缩，只有滑动 —— 干脆利落。
+                        // 立刻把指示器滑到手指所在 tab 并放大。
+                        // 用 320ms（比点击位移略快）：按下的反馈要「跟手」，
+                        // 不能等太久，否则手感是「点了没反应」。
                         phase = Phase.Pressed
                         dragPos = Float.NaN
-                        // 延迟放大的任务，松手或开始拖拽时取消
-                        val pressGrowJob = scope.launch {
-                            kotlinx.coroutines.delay(BarPressGrowDelayMs)
-                            // 只有仍然按着、且没进入拖拽，才放大
-                            if (phase == Phase.Pressed) {
-                                scaleAnim.animateTo(BarDragScale, lensLift())
-                                glowAnim.animateTo(0.9f, lensLift())
-                            }
+                        scope.launch {
+                            scaleAnim.animateTo(BarDragScale, lensLift())
+                        }
+                        scope.launch {
+                            glowAnim.animateTo(0.9f, lensLift())
                         }
                         // 按下即移动到手指处（这是「长按跟手」的核心）
                         animatePosTo(downPos, BarPressMs, lensLift())
@@ -544,12 +519,6 @@ fun GlassTabBar(
                                 moveToken = Any()
                                 moveJob?.cancel()
                                 moveJob = null
-                                // 真的拖起来了 —— 这时候放大是必要的（玻璃被拎起来）
-                                pressGrowJob.cancel()
-                                scope.launch {
-                                    scaleAnim.animateTo(BarDragScale, lensLift())
-                                    glowAnim.animateTo(0.9f, lensLift())
-                                }
                             }
                             if (dragged) {
                                 ch.consume()
@@ -559,9 +528,6 @@ fun GlassTabBar(
                         }
 
                         // ---------- 松手 ----------
-                        // 快速点击走这里：放大任务还没到点就被取消，
-                        // 指示器全程不缩放 —— 只有平移，干净。
-                        pressGrowJob.cancel()
                         val targetTab = if (dragged) fingerToTab(lastX) else downTab
                         val fromPos = if (dragged && !dragPos.isNaN()) dragPos else posAnim.value
 
