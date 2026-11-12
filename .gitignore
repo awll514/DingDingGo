@@ -30,3 +30,7 @@ keystore.properties
 
 # ---- 截图与录屏（本地调试产物）----
 _shots/
+
+# ---- 本地调试产物（adb 截图 / UI dump / 视觉分析中间文件）----
+.tmp-ui/
+.dsh-vision-router/
