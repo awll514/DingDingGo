@@ -13,7 +13,15 @@ if ! command -v adb >/dev/null 2>&1; then
   exit 1
 fi
 
-DEVICES=$(adb devices | grep -c "device$")
+# 【必现 bug 修正】原写法是 grep -c "device$"。
+#
+# 在 Windows / MSYS（Git Bash）下 adb 的输出是 CRLF，每行末尾残留 \r，
+# 于是行尾最后一个字符是 \r 而不是行结束 —— $ 锚点永远对不上，
+# 计数恒为 0，脚本**每次都判定"没有已连接的设备"**，哪怕手机插着。
+#
+# \s* 把行尾的 \r 吃掉再锚 $。GNU grep（含 MSYS 自带的那份）支持 \s；
+# 想改成严格 POSIX 的话等价写法是 grep -cE "device[[:space:]]*$"。
+DEVICES=$(adb devices | grep -c "device\s*$")
 if [ "$DEVICES" -eq 0 ]; then
   echo "❌ 没有已连接的设备，请先连上手机或启动模拟器"
   exit 1
@@ -71,7 +79,16 @@ fi
 echo
 
 echo "── 6. 最近执行日志 ─────────────────────────"
-adb logcat -d -s PunchEngine:* PunchService:* PunchAlarmReceiver:* 2>/dev/null | tail -25
+# tag 取自各类里的 private const val TAG，一一对应：
+#   PunchEngine / PunchService / PunchAlarmReceiver —— 打卡链路本身
+#   AlarmScheduler —— 闹钟注册/取消（"闹钟没排上"是最常见的故障点）
+#   KeepAlive      —— 常驻保活服务（闹钟自检、进程复活）
+#   RootShell      —— su 通道可用性与命令执行
+#   A11yKeeper     —— 无障碍服务的启用/保持
+# 少了后四个 tag 时，一旦出问题只能看到"打卡失败"这条结果，
+# 看不到它上游的闹钟/保活/通道状态，排查基本靠猜。
+adb logcat -d -s PunchEngine:* PunchService:* PunchAlarmReceiver:* \
+    AlarmScheduler:* KeepAlive:* RootShell:* A11yKeeper:* 2>/dev/null | tail -25
 echo
 
 echo "════════════════════════════════════════════"

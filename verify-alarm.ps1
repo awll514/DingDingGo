@@ -29,7 +29,16 @@ if (-not $adb) {
     exit 1
 }
 
-$devices = & $adb devices | Select-String "device$"
+# 【必现 bug 修正】这里原来写的是 "device$"。
+#
+# adb 的输出是 **CRLF**，PowerShell 把整行读进来时行尾的 \r 会保留在字符串里，
+# 于是行末尾的真实字符是 \r 而不是 \n —— $ 锚点永远对不上，
+# Select-String 一条都匹配不到，脚本**每次都报告"没有已连接的设备"**，
+# 哪怕手机就好端端插着。
+#
+# 用 \s*$ 吞掉行尾的 \r（也可以写成 -match 'device'，但那样会把
+# "offline"/"unauthorized" 也匹配进来，反而掩盖"设备在但没授权"这种真问题）。
+$devices = & $adb devices | Select-String "device\s*$"
 if (-not $devices) {
     Write-Host "❌ 没有已连接的设备，请先连上手机或启动模拟器" -ForegroundColor Red
     exit 1
@@ -58,11 +67,20 @@ Write-Host ""
 
 # ── 2. 进程是否存活 ──
 Write-Host "── 2. 进程是否存活 ──────────────────────────" -ForegroundColor Yellow
-$pid = (& $adb shell pidof $Package 2>$null | Out-String).Trim()
-if ([string]::IsNullOrWhiteSpace($pid)) {
+# 【必现 bug 修正】变量原来叫 $pid。
+#
+# $PID 是 PowerShell 的**只读自动变量**（当前进程自己的 PID）。
+# $ErrorActionPreference = "Continue" 之下，赋值失败只写一条错误就继续，
+# 所以 $pid 永远是**脚本宿主 powershell.exe 自己的进程号**，
+# 判断永远走 "正在运行" 分支，打印出的是无关的 PID ——
+# 这项检查实际上从来没有检查过任何东西。
+#
+# 改名成 $appPid 后语义清楚，也不会再撞自动变量。
+$appPid = (& $adb shell pidof $Package 2>$null | Out-String).Trim()
+if ([string]::IsNullOrWhiteSpace($appPid)) {
     Write-Host "⚠️  App 进程未运行（这不一定是问题：闹钟靠静态 Receiver 触发）" -ForegroundColor Yellow
 } else {
-    Write-Host "✅ App 正在运行，PID = $pid" -ForegroundColor Green
+    Write-Host "✅ App 正在运行，PID = $appPid" -ForegroundColor Green
 }
 Write-Host ""
 
@@ -96,7 +114,16 @@ Write-Host ""
 
 # ── 6. 最近日志 ──
 Write-Host "── 6. 最近执行日志 ─────────────────────────" -ForegroundColor Yellow
-& $adb logcat -d -s PunchEngine:* PunchService:* PunchAlarmReceiver:* 2>$null |
+# tag 取自各类里的 private const val TAG，一一对应：
+#   PunchEngine / PunchService / PunchAlarmReceiver —— 打卡链路本身
+#   AlarmScheduler —— 闹钟注册/取消（"闹钟没排上"是最常见的故障点）
+#   KeepAlive      —— 常驻保活服务（闹钟自检、进程复活）
+#   RootShell      —— su 通道可用性与命令执行
+#   A11yKeeper     —— 无障碍服务的启用/保持
+# 少了后四个 tag 时，一旦出问题只能看到"打卡失败"这一条结果，
+# 看不到它上游的闹钟/保活/通道状态，排查基本靠猜。
+& $adb logcat -d -s PunchEngine:* PunchService:* PunchAlarmReceiver:* `
+    AlarmScheduler:* KeepAlive:* RootShell:* A11yKeeper:* 2>$null |
     Select-Object -Last 25 |
     ForEach-Object { Write-Host $_ }
 Write-Host ""
