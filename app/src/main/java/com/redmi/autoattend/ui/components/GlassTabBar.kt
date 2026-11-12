@@ -434,13 +434,20 @@ fun GlassTabBar(
      * slideAnim 高于 liveOffset，所以指示器走自己的曲线，不受 pager 抖动影响。
      * 动画结束后 slideAnim 复位为 NaN，控制权交还 liveOffset（两者数值一致，无跳变）。
      */
-    fun slideTo(target: Int, fromX: Float) {
+    /**
+     * 把指示器从 [fromX] 平滑移到 [toX]（都是像素）。
+     *
+     * @param durationMs 动画时长。按下跟手用 PRESS_SLIDE_MS，
+     *        松手落位用 RELEASE_MS，点击切换用 INDICATOR_MOVE_MS。
+     */
+    fun slideToX(toX: Float, fromX: Float, durationMs: Int) {
         val from = fromX
-        val to = centerXFor(target)
+        val to = toX
         if (abs(to - from) < 1f) return
         if (barWidthPx == 0) return
         if (slideJob != null && slideJob!!.isActive) slideJob?.cancel()
         // 【关键】同步写入，本帧立刻可见。绝不放进 launch 里 await。
+        // 同步写入起点：本帧就生效，不会出现"上一段动画的残留位置闪一下"
         slideX = from
         slideJob = scope.launch {
             try {
@@ -449,17 +456,24 @@ fun GlassTabBar(
                 var done = false
                 while (!done) {
                     withFrameNanos { now ->
-                        val t = ((now - start) / 1_000_000f / INDICATOR_MOVE_MS)
-                            .coerceIn(0f, 1f)
+                        val elapsed = (now - start) / 1_000_000f
+                        val t = (elapsed / durationMs.toFloat()).coerceIn(0f, 1f)
                         slideX = from + (to - from) * IosEaseOut.transform(t)
                         if (t >= 1f) done = true
                     }
                 }
+                // 落点对齐：让 xAnim 记录最终位置，供下一次 currentRenderX() 使用
+                xAnim.snapTo(to)
             } finally {
                 slideX = Float.NaN
                 slideJob = null
             }
         }
+    }
+
+    /** 点击切换：从 [fromX] 滑到目标 tab 中心（标准时长） */
+    fun slideTo(target: Int, fromX: Float) {
+        slideToX(centerXFor(target), fromX, INDICATOR_MOVE_MS)
     }
 
     /**
@@ -854,6 +868,26 @@ fun GlassTabBar(
                                 )
                             }
 
+                            // ============ 按下即跟手 ============
+                            //
+                            // 用户反馈：「在首页长按设置，指示器会原地放大而不是跟手」。
+                            //
+                            // 根因：pressX 只在 dragged == true（移动超过 touchSlop）
+                            // 时才被写入。长按不动 → 永远不写 → 指示器位置毫无变化，
+                            // 只有缩放动画在跑，看起来就是"原地放大"。
+                            //
+                            // 正确模型：按下瞬间就请求把指示器移到手指所在的 tab，
+                            // 用一段从容的运镜（PRESS_SLIDE_MS，比点击位移更长）——
+                            // 这正是需求里写的「按下 → 指示器滑到手指处并放大」。
+                            //
+                            // 之后一旦真的拖起来，pressX 会接管逐帧跟手；
+                            // 若只是长按，就停在 target 上等松手。
+                            val downTarget = tabFor(down.position.x)
+                            if (downTarget != currentSelected) {
+                                val toX = centerXFor(downTarget)
+                                slideToX(toX, pressStartX, PRESS_SLIDE_MS)
+                            }
+
                             // ---------- 移动：同步跟手 ----------
                             var dragged = false
                             var lastX = down.position.x
@@ -868,6 +902,13 @@ fun GlassTabBar(
                                 }
                                 if (dragged) {
                                     ch.consume()
+                                    // 真拖起来时，取消「按下跟手」那段运镜，
+                                    // 完全交给 pressX 逐帧驱动（否则两者抢写会打架）。
+                                    if (slideJob != null && slideJob!!.isActive) {
+                                        slideJob?.cancel()
+                                        slideX = Float.NaN
+                                        slideJob = null
+                                    }
                                     // 同步写入普通 state：本帧立即生效，绝不掉帧
                                     pressX = xFor(lastX)
                                 }
@@ -901,34 +942,28 @@ fun GlassTabBar(
                                 pendingSwipeSettle = true
                                 pendingTarget = target
 
-                                // 【关键修正】不要再 pressX = centerXFor(target) 瞬间赋值。
+                                // ============ 松手：先接住位置，再切页 ============
                                 //
-                                // 那是「点一下就瞬移」的**直接原因**：
-                                // pressX 是同步写入的普通 state，赋值当帧就渲染，
-                                // 指示器位置从当前点直接跳到目标位置，中间没有任何过渡。
+                                // ## 为什么不能直接 pressX = Float.NaN（拖拽复读的根因）
                                 //
-                                // 上一轮之所以这么写，是为了绕开"松手后 pressX 清空 →
-                                // 渲染回落到 liveOffset（还是旧值）→ 先跳回原页"的问题。
-                                // 但正确的解法不是瞬移到目标，而是**先清空 pressX，
-                                // 再让指示器按上一轮就有的平移规则从当前位置滑过去** ——
-                                // 见下面渲染处的 slideFromX。
+                                // 清空 pressX 后，渲染立刻回落到 liveOffset ——
+                                // 而此刻 pager 还没开始翻页，liveOffset 仍是**旧页**位置。
+                                // 于是指示器先"跳回原页"，然后才被翻页动画带着走一遍。
+                                // 用户看到的就是「松手后复读动画」。
+                                //
+                                // ## 正确顺序
+                                //
+                                //   ① 用当前真实显示位置作为起点启动平移动画
+                                //      （slideX 同步写入当帧生效，视觉上连续）；
+                                //   ② 再请求切页；
+                                //   ③ 动画结束后 slideX 清空，此时 liveOffset 已到终点，
+                                //      交还时数值一致，无跳变。
+                                //
+                                // 拖拽的起点 = 手指最后位置（pressX），
+                                // 点击的起点 = 按下那一刻的位置（pressStartX）。
+                                val fromX = if (dragged && !pressX.isNaN()) pressX else pressStartX
                                 pressX = Float.NaN
-
-                                // 【关键】点击必须在**这一帧**就启动平移动画。
-                                // 拖拽不需要：指示器已经在手指位置，
-                                // 松手只需让 pager 翻过去，指示器静默归位即可。
-                                if (!dragged) {
-                                    // 起点必须是**点击之前**指示器所在的位置。
-                                    //
-                                    // 不能在里面再读一次 currentRenderX()：
-                                    // 点击瞬间 liveOffset 已经开始向目标页滑动，
-                                    // xAnim 也被那两条 LaunchedEffect 同步过去了，
-                                    // 读出来 ≈ 终点 → abs(to-from) < 1 → 直接 return，
-                                    // 动画根本不启动（真机录屏 179 帧零位移的真因）。
-                                    //
-                                    // pressStartX 是按下那一刻捕获的，稳定可靠。
-                                    slideTo(target, pressStartX)
-                                }
+                                slideToX(centerXFor(target), fromX, RELEASE_MS)
                                 currentOnSelect(target, dragged)
                             } else {
                                 // 目标就是当前页：直接把跟手值交还给 liveOffset。

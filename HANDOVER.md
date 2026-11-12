@@ -250,6 +250,68 @@ barW = 717px    tabW = 358.5px
 
 ---
 
+### 0.10.5 第六轮补丁（14:30）—— 拖拽复读 + 长按不跟手
+
+用户复测后又报了这两个，都属于 §0.10 修复引入的**回归**，一并修掉。
+
+#### 问题 A：拖拽松手后又「复读」一遍动画
+
+**根因**：松手时先执行 `pressX = Float.NaN`，渲染立刻回落到 `liveOffset`，
+而此刻 pager 还没开始翻页、`liveOffset` 仍是**旧页**位置 →
+指示器先「跳回原页」，再被翻页动画带着走一遍，看起来就是复读。
+
+**修法**（GlassTabBar 松手处）：
+
+```kotlin
+// ① 先取真实显示位置作为起点
+val fromX = if (dragged && !pressX.isNaN()) pressX else pressStartX
+// ② 清空跟手值，同时用滑动动画接住（slideX 同步写入，视觉连续）
+pressX = Float.NaN
+slideToX(centerXFor(target), fromX, RELEASE_MS)
+// ③ 再请求切页
+currentOnSelect(target, dragged)
+```
+
+关键是 **slideX 同步写入当帧生效**，中间不会有一帧回落到旧 liveOffset。
+
+#### 问题 B：长按设置，指示器原地放大而不跟手
+
+**根因**：`pressX` 只在 `dragged == true`（移动超过 touchSlop）时才写。
+长按不动 → 永远不写 → 指示器位置毫无变化，只有缩放动画在跑。
+
+**修法**：按下瞬间就请求把指示器移到手指所在 tab：
+
+```kotlin
+val downTarget = tabFor(down.position.x)
+if (downTarget != currentSelected) {
+    slideToX(centerXFor(downTarget), pressStartX, PRESS_SLIDE_MS)
+}
+```
+
+`PRESS_SLIDE_MS = 520`（比点击的 420 更从容，符合「按下 → 滑到手指处并放大」）。
+真拖起来时立刻取消这段运镜，完全交给 `pressX` 逐帧跟手，避免两者抢写。
+
+#### 真机验证
+
+| 场景 | 结果 |
+|---|---|
+| 首页长按设置（不移动，1.5s） | ✅ 指示器从首页平滑滑到设置上方 |
+| 首页慢速拖到设置（1.2s） | ✅ 拖拽期间跟手，松手后无复读，最终停在设置 |
+
+#### 又一个真机坑
+
+38. **`gradlew assembleDebug` 成功后必须先确认 APK 时间戳再 install** ——
+    本轮遇到过「以为装的是新包，实际设备上还是 14:25 的旧包」，
+    于是日志一条都不打印，白排查了一轮。核对方式：
+
+    ```
+    Get-Item app\build\outputs\apk\debug\app-debug.apk | % LastWriteTime
+    adb shell "dumpsys package <pkg> | grep lastUpdateTime"
+    ```
+    两者不一致说明装的是旧包。
+
+---
+
 ## 0.9 第五轮（2026-11-12 12:20–13:00）—— 真机全链路验证
 
 > 本轮首次在**真实设备、真实锁屏、真实密码**条件下跑完整条打卡链路。
