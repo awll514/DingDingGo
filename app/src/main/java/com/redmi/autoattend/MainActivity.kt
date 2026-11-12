@@ -624,15 +624,37 @@ private fun AppRoot() {
                     // isScrollInProgress 为 true 表示正在滑（手指按着或惯性未停），
                     // 为 false 且发生过滑动，才是"真的翻页了"。
                     // 首帧不会进这个分支，杜绝启动误同步。
+                    // ============ tabIndex 回写时机（修「0.5 秒点不动」）============
+                    //
+                    // ## 旧实现的问题
+                    //
+                    // 只在 `!isScrollInProgress`（动画完全停稳）时回写 tabIndex。
+                    // 而点击后的翻页动画是 620ms —— 这 620ms 里 tabIndex 一直
+                    // 是**旧值**，底栏拿它判断"目标页是不是当前页"：
+                    //
+                    //     用户点 B（动画开始）→ 想立刻点回 A
+                    //     → tabIndex 还是 A → target(A) == currentSelected(A)
+                    //     → 走进 else 分支，什么都不做 → **点击被静默吞掉**
+                    //
+                    // 这就是用户说的「刚切换界面 0.5 秒内点击/拖拽底栏无效」。
+                    //
+                    // ## 现在
+                    //
+                    // 翻页**意图**一确定就回写：动画进行中 currentPage 已经等于
+                    // 目标页（pager 在动画期把 currentPage 设为最近的目标），
+                    // 所以一旦它的值变了就同步，不必等停稳。
+                    //
+                    // 同时保留"停稳后再对齐一次"的兜底，处理用户中途反悔
+                    // （动画被反向打断、currentPage 又变回去）的情况。
+                    //
+                    // 首帧保护不变：只在发生过真实翻页后才写，避免启动误同步。
                     androidx.compose.runtime.LaunchedEffect(pagerState) {
-                        androidx.compose.runtime.snapshotFlow {
-                            pagerState.isScrollInProgress to pagerState.currentPage
-                        }.collect { (scrolling, page) ->
-                            // 仅当"滑动刚结束"时同步
-                            if (!scrolling && page != tabIndex) {
-                                tabIndex = page
+                        androidx.compose.runtime.snapshotFlow { pagerState.currentPage }
+                            .collect { page ->
+                                if (page != tabIndex) {
+                                    tabIndex = page
+                                }
                             }
-                        }
                     }
 
                     androidx.compose.foundation.pager.HorizontalPager(

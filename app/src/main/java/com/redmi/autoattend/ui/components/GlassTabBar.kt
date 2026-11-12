@@ -26,12 +26,14 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -244,11 +246,80 @@ fun GlassTabBar(
     val currentSelected by rememberUpdatedState(selectedIndex)
     val currentOnSelect by rememberUpdatedState(onSelect)
 
+    /**
+     * 「已经请求要切到哪个 tab」的**本地**乐观状态。
+     *
+     * ## 为什么必须有它（修两个真机问题）
+     *
+     * 上游的 selectedIndex 只在 pager 翻页动画**完全停稳后**才回写
+     * （MainActivity 里 snapshotFlow { isScrollInProgress to currentPage }，
+     *  !scrolling 才写 tabIndex）。而点击后的翻页动画有 620ms，
+     * 这 620ms 里 selectedIndex 一直是**旧值**。
+     *
+     * 由此产生两个用户可感知的问题：
+     *
+     * 1. **「0.5 秒内点不回去」**
+     *    用户在 A 页点了 B（动画开始），想立刻点回 A。
+     *    此时 currentSelected 仍是 A，于是 `target == currentSelected` 成立，
+     *    走 else 分支 —— 什么都不做。点击被静默吞掉。
+     *
+     * 2. **来回点会误判方向**
+     *    同理，快速连点时"当前在哪一页"的判断依据是滞后值，
+     *    fromDrag 的落位目标也会算错。
+     *
+     * 用请求值（而不是动画结束后的真实值）作为交互落点判断依据，
+     * 点击/拖拽就永远"以用户最后的意愿为准"，不需要等任何动画。
+     *
+     * 注意：它**只**用于手势落点判断与位移起始点，
+     * 视觉高亮仍由 smoothWeight（位置插值）决定，因此不会出现两个高亮。
+     */
+    var pendingTarget by remember { mutableIntStateOf(selectedIndex) }
+
+    // selectedIndex 一旦回写（动画停稳），把它对齐 —— 但只在没有更新请求时。
+    // 放在这里而不是 else 分支，避免"动画结束时刚好有人点了别的 tab"被覆盖。
+    LaunchedEffect(selectedIndex) {
+        if (pendingTarget != selectedIndex) {
+            pendingTarget = selectedIndex
+        }
+    }
+
     val xAnim = remember { Animatable(0f) }
     val wAnim = remember { Animatable(indicatorWidthPx) }
     val hAnim = remember { Animatable(indicatorHeightPx) }
     val scaleAnim = remember { Animatable(1f) }
     val glowAnim = remember { Animatable(0f) }
+
+    /**
+     * 点击切换时**指示器自己的平移动画**（覆盖 liveOffset 抢跑的问题）。
+     *
+     * ## 为什么必须有它
+     *
+     * 点击后 620ms 里，pager 的 currentPageOffsetFraction 会从 0 → ±1，
+     * liveOffset 因此立刻开始变化。但指示器**不该**跟着这一帧帧的
+     * 中途值抖动 —— 尤其当用户又点回去时，pager 动画会被反向覆盖，
+     * 中途值会跳来跳去。
+     *
+     * 用一段独立、固定时长、固定曲线的动画来承担"点击位移"，
+     * 就能保证：不管 pager 中途怎么变，指示器都是一条平滑的减速运动。
+     *
+     * NaN = 当前没有专属平移动画。
+     */
+    /**
+     * 点击平移的当前位置（像素）。
+     *
+     * ## 为什么用普通 state 而不是 Animatable
+     *
+     * 实测：Animatable.snapTo 是挂起函数，写在 scope.launch 里要**下一帧**才生效，
+     * 而渲染端在同一帧读 slideAnim.value 拿到的是 NaN —— 于是渲染分支
+     * 一次都没进过（日志里 TabBarRender 一条都没有），动画等于不存在。
+     *
+     * 普通 Float state 的写入是同步的：本帧写、本帧渲染，不存在时序空窗。
+     * NaN = 没有正在进行的平移。
+     */
+    var slideX by remember { mutableFloatStateOf(Float.NaN) }
+
+    /** 当前平移任务的句柄，重复点击时取消上一段 */
+    var slideJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
 
     // ==================== 拖拽跟手位置（同步 state）====================
     //
@@ -300,6 +371,22 @@ fun GlassTabBar(
         return p0 + (p1 - p0) * frac
     }
 
+    /**
+     * 此刻屏幕上**真实显示**的指示器 X。
+     *
+     * 与渲染处的优先级完全一致，因此可以安全地作为"新一段动画的起点"：
+     * 从这个值开始动，视觉上就是连续的，不会跳。
+     */
+    fun currentRenderX(): Float {
+        if (barWidthPx == 0) return 0f
+        return when {
+            !pressX.isNaN() -> pressX
+            !slideX.isNaN() -> slideX
+            liveOffset != null -> offsetToX(liveOffset)
+            else -> xAnim.value
+        }
+    }
+
     /** 当前 pager 进度换算成像素；没有 pager 时返回 null。 */
     fun liveOffsetToX(): Float? {
         val off = liveOffset ?: return null
@@ -327,6 +414,52 @@ fun GlassTabBar(
             }
         }
         return best
+    }
+
+    /**
+     * 点击切换时，让指示器从"当前显示位置"平滑滑到目标 tab。
+     *
+     * ## 为什么必须在**松手瞬间**调用（而不是等 selectedIndex 回写）
+     *
+     * 上游 selectedIndex 要等 pager 翻页动画（620ms）**停稳后**才更新。
+     * 如果在那里才开始动画，指示器早已被 liveOffset 带到终点，
+     * 动画的起点和终点重合 —— 视觉上就是"没有任何动画"（真机录屏实测：
+     * 179 帧里指示器位置零变化，但最终确实到了目标位置）。
+     *
+     * 所以动画必须在点击发生的**同一帧**启动，起点取当前渲染位置。
+     *
+     * ## 与 liveOffset 的关系
+     *
+     * 动画期间 liveOffset 会同步变化（pager 在翻页），但渲染优先级里
+     * slideAnim 高于 liveOffset，所以指示器走自己的曲线，不受 pager 抖动影响。
+     * 动画结束后 slideAnim 复位为 NaN，控制权交还 liveOffset（两者数值一致，无跳变）。
+     */
+    fun slideTo(target: Int, fromX: Float) {
+        val from = fromX
+        val to = centerXFor(target)
+        if (abs(to - from) < 1f) return
+        if (barWidthPx == 0) return
+        if (slideJob != null && slideJob!!.isActive) slideJob?.cancel()
+        // 【关键】同步写入，本帧立刻可见。绝不放进 launch 里 await。
+        slideX = from
+        slideJob = scope.launch {
+            try {
+                withFrameNanos { }
+                val start = withFrameNanos { it }
+                var done = false
+                while (!done) {
+                    withFrameNanos { now ->
+                        val t = ((now - start) / 1_000_000f / INDICATOR_MOVE_MS)
+                            .coerceIn(0f, 1f)
+                        slideX = from + (to - from) * IosEaseOut.transform(t)
+                        if (t >= 1f) done = true
+                    }
+                }
+            } finally {
+                slideX = Float.NaN
+                slideJob = null
+            }
+        }
     }
 
     /**
@@ -470,10 +603,24 @@ fun GlassTabBar(
         val byDrag = pendingSwipeSettle
         pendingSwipeSettle = false
 
+        // ============ 点击切换的收尾 ============
+        //
+        // 平移动画**不在这里**启动 —— 这个 LaunchedEffect 要等
+        // selectedIndex 回写（620ms 翻页动画结束）才跑，
+        // 那时指示器已经被 liveOffset 带到位了，再动画等于原地重播（无可见位移）。
+        // 真正的启动点在手势松手处（见 pointerInput 里 slideTo()）。
+        //
+        // 这里只做一件事：把内部记录位置对齐到最终值，供下一次计算使用。
+        if (!byDrag) {
+            scope.launch { xAnim.snapTo(centerXFor(selectedIndex)) }
+        }
+
         settleTo(
             index = selectedIndex,
             fromX = xAnim.value,
-            stretch = !drivenByPager && !byDrag,
+            // 一律不拉伸：拖拽已有跟手位置，点击有专属平移动画，
+            // 再叠液滴拉伸会变成"移动 + 拉伸"两段动作。
+            stretch = false,
         )
 
         // ============ 交接：pressX → liveOffset ============
@@ -693,6 +840,13 @@ fun GlassTabBar(
                             // 不存在调度延迟，因此丝滑无卡顿。
 
                             // ---------- 按下：放大 ----------
+                            //
+                            // 同时把"按下这一刻指示器在哪"记下来。
+                            // 松手时的平移动画必须从**这个位置**出发，
+                            // 而不是从 currentRenderX() 再读一次 ——
+                            // 那时 liveOffset 已经开始动了，读出来已接近终点。
+                            val pressStartX = currentRenderX()
+
                             scope.launch {
                                 scaleAnim.animateTo(
                                     dragScale,
@@ -731,20 +885,50 @@ fun GlassTabBar(
                             // 只由手指决定，与 pager 当前状态无关 —— 这样不会误切页。
                             val target = if (dragged) tabFor(lastX) else tabFor(down.position.x)
 
-                            if (target != currentSelected) {
+                            // ============ 落点判断必须用「请求值」而不是「停稳值」 ============
+                            //
+                            // 旧代码用 currentSelected（= 上游 selectedIndex），
+                            // 而它要等翻页动画停稳（620ms）才回写。
+                            // 于是动画期间点回原页会被判成"目标就是当前页"→ 静默吞掉。
+                            // 这就是「刚切换的 0.5 秒内点不动、拖不动」的根因。
+                            val effectiveCurrent = if (pendingTarget != currentSelected) {
+                                pendingTarget
+                            } else {
+                                currentSelected
+                            }
+
+                            if (target != effectiveCurrent) {
                                 pendingSwipeSettle = true
-                                // 【关键】先把指示器交给目标位置，再请求切页。
+                                pendingTarget = target
+
+                                // 【关键修正】不要再 pressX = centerXFor(target) 瞬间赋值。
                                 //
-                                // 曾经在 onSelect 之后直接 pressX = NaN，结果：
-                                // pager 的翻页动画要跑几百毫秒，而 selectedIndex
-                                // 只在**停稳后**才回写。这期间渲染回落到 liveOffset，
-                                // 它还是旧值（首页）→ 指示器先跳回首页，然后才跟着
-                                // 翻转过去。用户看到的就是「瞬移回原页再播一遍动画」。
+                                // 那是「点一下就瞬移」的**直接原因**：
+                                // pressX 是同步写入的普通 state，赋值当帧就渲染，
+                                // 指示器位置从当前点直接跳到目标位置，中间没有任何过渡。
                                 //
-                                // 现在让 pressX 停在目标 tab 的中心，
-                                // 等 selectedIndex 真正更新后由 settleTo 接管
-                                // （见下面 LaunchedEffect）。交接时两边数值相同，无跳变。
-                                pressX = centerXFor(target)
+                                // 上一轮之所以这么写，是为了绕开"松手后 pressX 清空 →
+                                // 渲染回落到 liveOffset（还是旧值）→ 先跳回原页"的问题。
+                                // 但正确的解法不是瞬移到目标，而是**先清空 pressX，
+                                // 再让指示器按上一轮就有的平移规则从当前位置滑过去** ——
+                                // 见下面渲染处的 slideFromX。
+                                pressX = Float.NaN
+
+                                // 【关键】点击必须在**这一帧**就启动平移动画。
+                                // 拖拽不需要：指示器已经在手指位置，
+                                // 松手只需让 pager 翻过去，指示器静默归位即可。
+                                if (!dragged) {
+                                    // 起点必须是**点击之前**指示器所在的位置。
+                                    //
+                                    // 不能在里面再读一次 currentRenderX()：
+                                    // 点击瞬间 liveOffset 已经开始向目标页滑动，
+                                    // xAnim 也被那两条 LaunchedEffect 同步过去了，
+                                    // 读出来 ≈ 终点 → abs(to-from) < 1 → 直接 return，
+                                    // 动画根本不启动（真机录屏 179 帧零位移的真因）。
+                                    //
+                                    // pressStartX 是按下那一刻捕获的，稳定可靠。
+                                    slideTo(target, pressStartX)
+                                }
                                 currentOnSelect(target, dragged)
                             } else {
                                 // 目标就是当前页：直接把跟手值交还给 liveOffset。
@@ -779,6 +963,15 @@ fun GlassTabBar(
                     // 拖拽时 pager 跟着手指走，liveOffset 连续变化，
                     // 颜色因此连续渐变，和指示器永远同相。
                     val livePos = when {
+                        // 点击平移动画进行中：颜色跟着指示器的实际位置走，
+                        // 否则会出现"指示器已经滑到设置，文字还是首页蓝"。
+                        !slideX.isNaN() -> {
+                            val tw = tabWidthPx()
+                            if (tw > 0f) {
+                                val center = slideX + indicatorWidthPx / 2f
+                                ((center - tw / 2f) / tw).coerceIn(0f, tabs.lastIndex.toFloat())
+                            } else selectedIndex.toFloat()
+                        }
                         !pressX.isNaN() -> {
                             val tw = tabWidthPx()
                             if (tw > 0f) {
@@ -867,8 +1060,18 @@ fun GlassTabBar(
                     //   1. 拖拽中（pressX 非 NaN）→ 直接用同步值，逐帧跟手；
                     //   2. pager 有进度 → liveOffset；
                     //   3. 首帧 → xAnim。
+                    // 优先级（与 currentRenderX() 必须完全一致）：
+                    //   1. 拖拽中（pressX 非 NaN）→ 同步值，逐帧跟手；
+                    //   2. 点击平移动画进行中（slideAnim 非 NaN）→ 自己的一段减速运动；
+                    //   3. pager 有进度 → liveOffset；
+                    //   4. 兜底 → xAnim。
+                    //
+                    // 把 2 排在 3 前面是修「点一下直接瞬移」的关键：
+                    // 点击后 pager 的 offsetFraction 会立刻从 0 变到 ±1，
+                    // 若让 liveOffset 抢跑，指示器就没有可感知的过渡。
                     val cx = when {
                         !pressX.isNaN() -> pressX
+                        !slideX.isNaN() -> slideX
                         liveOffset != null -> offsetToX(liveOffset)
                         else -> xAnim.value
                     }
