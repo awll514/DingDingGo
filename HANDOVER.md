@@ -482,6 +482,76 @@ Number Slow issue draw commands: 0
 
 ---
 
+### 0.11.11 点击与拖拽/长按的缩放解耦（17:53–18:15）
+
+用户原话：「算了，先回退吧，点击能单独改吗，不然一定会影响到拖拽长按的」。
+
+#### 为什么之前改不了（用户的担心是对的）
+
+三条路径共用 `scaleAnim`，且**点击与长按在「按下」时刻无法区分** ——
+所以只能统一放大。这就是「改一处牵连三条路径」的根源。
+
+#### 两次失败的尝试（均已回退，记录以免重犯）
+
+| 尝试 | 结果 |
+|---|---|
+| 延迟 120ms 再放大 | 长按的放大也跟着迟钝，手感变差 |
+| 松手时 `snapTo(1f)` 归位 | 放大已在几十毫秒内动了，仍有轻微鼓包 |
+
+#### 最终方案：放大由「意图信号」触发，不由按下触发
+
+```kotlin
+// 按下：只平移，不缩放
+phase = Phase.Pressed
+animatePosTo(downPos, BarPressMs, lensLift())
+
+// 信号②：按住超时 -> 长按
+var fingerDown = true
+val longPressGrowJob = scope.launch {
+    delay(BarLongPressMs)          // 200ms
+    if (fingerDown) {              // 注意不是判断 phase！
+        scaleAnim.animateTo(BarDragScale, lensLift())
+    }
+}
+
+// 信号①：手指开始移动 -> 拖拽，立即放大
+if (!dragged && abs(lastX - down.position.x) > touchSlop) {
+    longPressGrowJob.cancel()
+    scaleAnim.animateTo(BarDragScale, lensLift())
+}
+
+// 松手：作废长按任务
+fingerDown = false
+longPressGrowJob.cancel()
+```
+
+三条路径彻底解耦：
+
+| 路径 | 行为 |
+|---|---|
+| 点击 | **零缩放**，只有平移 |
+| 长按 | 200ms 后放大（按下逻辑不变）|
+| 拖拽 | 移动即放大 + 松手缩回落位（不变）|
+
+#### ⚠️ 一个隐藏 bug（值得单独记）
+
+长按任务最初写 `if (phase == Phase.Pressed)`，但
+`animatePosTo()` 内部会把 `phase` 改成 `Settling`（因为位置正在动），
+导致这个条件**永远不成立** —— 长按放大完全失效，而且很难看出来
+（因为当时还没人验证过长按）。
+
+**教训：不要用「表达位置驱动状态」的 phase 去判断「手指是否还按着」，
+两者语义不同。** 改用独立 boolean `fingerDown`。
+
+#### 验证
+
+- 快速点击：录屏 118 帧逐帧检测指示器面积，范围 15117~16254
+  （7% 波动来自移动抗锯齿），**疑似放大帧 0 个**。
+- 长按 900ms：截图确认指示器明显放大、上下溢出底栏。
+- 拖拽：逻辑未改动。
+
+---
+
 ## 0.10 第六轮（2026-11-12 14:00–14:20）—— 底栏两个交互缺陷
 
 > 用户反馈：「点一下直接瞬移过去」+「刚切换界面的 0.5 秒左右无法点击或拖拽底栏」。
