@@ -2,7 +2,7 @@
 
 > 生成时间：2026-11-11 · 设备：Redmi K90 至尊版（M332BF / warsaw / HyperOS V816 / Android 16 / API 36）
 >
-> **最后更新：2026-11-12 12:55（第五轮：真机全链路验证 + 漏卡 P0 修复，详见 §0.9）**
+> **最后更新：2026-11-12 14:20（第六轮：底栏点击瞬移 + 0.5 秒点不动，详见 §0.10）**
 >
 > 分支：`fix/p0-punch-chain` · 基于 `91c07f3`
 >
@@ -144,6 +144,111 @@ showStatus(context, tone, title, subtitle, holdMs = 3000L)
 | 5 | `SettingsScreen` / `LaunchOverlay` 的裸 `tween()` | 未迁移 | 仍有多处 `tween(220)` / `tween(280)` 未走 `GlassMotion` |
 | 6 | 深色首页两个大卡片偏黑 | 用户说不急 | 第二轮遗留 |
 
+
+## 0.10 第六轮（2026-11-12 14:00–14:20）—— 底栏两个交互缺陷
+
+> 用户反馈：「点一下直接瞬移过去」+「刚切换界面的 0.5 秒左右无法点击或拖拽底栏」。
+> 两者都已复现、定位、修复，并用 60fps 录屏逐帧验证。
+
+### 0.10.1 【P0】点击后指示器瞬移（无过渡）
+
+**根因**（GlassTabBar.kt 手势松手处）：
+
+```kotlin
+pressX = centerXFor(target)   // 旧代码
+```
+
+`pressX` 是普通 `mutableFloatStateOf`，**同步写入当帧就渲染** ——
+指示器从当前位置直接跳到目标位置，中间没有一帧过渡。
+
+上一轮之所以这么写，是为了绕开「清空 pressX 后渲染回落到 liveOffset
+（还是旧值），指示器先跳回原页再跟着翻过去」的问题。
+但正确解法不是「瞬移到终点」，而是给一段真正的平移动画。
+
+**修法**：新增 `slideTo(target, pressStartX)`
+
+| 要点 | 说明 |
+|---|---|
+| 起点 | `pressStartX`，在 `awaitFirstDown` 之后**立刻捕获** |
+| 终点 | `centerXFor(target)` |
+| 时长曲线 | 420ms + `IosEaseOut`（= INDICATOR_MOVE_MS） |
+| 渲染优先级 | pressX(拖拽) > slideX(点击平移) > liveOffset > xAnim |
+
+**这里踩了两个坑，都值得记住：**
+
+1. **起点不能在 slideTo 里现读 `currentRenderX()`**
+   点击瞬间 `liveOffset` 已经开始向目标页滑动、`xAnim` 也被
+   `snapshotFlow { liveOffset }` 同步过去了，读出来 ≈ 终点。
+   于是 `abs(to - from) < 1f` 成立 → 直接 return → 动画根本不启动。
+   **必须在按下那一刻把位置存下来。**
+
+2. **不能用 `Animatable` 承载这个位置**
+   `Animatable.snapTo` 是**挂起函数**，写在 `scope.launch` 里要下一帧才生效，
+   而渲染端在同一帧读到的是 `NaN` —— 渲染分支一次都没进过
+   （加了 TabBarRender 日志验证：一条都没打印）。
+   改用普通 `mutableFloatStateOf` + `withFrameNanos` 手动驱动插值，
+   写入同步生效，本帧写本帧渲染。
+
+### 0.10.2 【P0】切换后 0.5 秒内点击/拖拽无效
+
+**根因链**：
+
+```
+MainActivity: tabIndex 只在 isScrollInProgress == false 时回写（620ms 动画结束）
+    ↓
+GlassTabBar: 用 currentSelected 判断「目标页是不是当前页」
+    ↓
+用户点 B（动画开始）→ 想立刻点回 A
+    → tabIndex 仍是 A → target(A) == currentSelected(A)
+    → 走 else 分支 → 什么都不做 → 点击被静默吞掉
+```
+
+**修法两处**：
+
+1. MainActivity：`tabIndex` 改为 `snapshotFlow { pagerState.currentPage }`，
+   意图确定即回写，不再等停稳。
+2. GlassTabBar：新增 `pendingTarget` 记录「已请求切到哪一页」，
+   落点判断用**请求值**而不是停稳值。
+
+```kotlin
+val effectiveCurrent =
+    if (pendingTarget != currentSelected) pendingTarget else currentSelected
+```
+
+### 0.10.3 真机验证
+
+| 场景 | 结果 |
+|---|---|
+| 点击后指示器连续平移（60fps 录屏逐帧） | ✅ 有连续位移（修复前 179 帧零位移） |
+| 设置页 → 300ms 内点回首页 | ✅ 点击生效，正确停回首页 |
+| 快速连点 4 次（首页↔设置） | ✅ 每次都响应 |
+| 从首页拖拽到设置 | ✅ 页面与指示器同时切换 |
+
+底栏真实尺寸（真机读数，别再猜）：
+
+```
+barW = 717px    tabW = 358.5px
+首页中心 x ≈ 460   设置中心 x ≈ 819   y ≈ 2598
+```
+
+### 0.10.4 顺带发现的真机坑
+
+36. **`am force-stop` 后重启 App 不会重新注册闹钟** ——
+    `alarm_scheduler.xml` 里的 `last_target_at` 会让 `scheduleNext`
+    认为该班次已处理，于是只注册 HEARTBEAT，三个打卡闹钟全部缺失。
+
+    ```
+    adb shell run-as <pkg> rm shared_prefs/alarm_scheduler.xml
+    adb shell am force-stop <pkg>
+    adb shell am start -n <pkg>/com.redmi.autoattend.MainActivity
+    ```
+
+37. **`adb shell input tap` 的坐标要按底栏真实边界算** ——
+    底栏只占屏宽 56%（717px）居中，左边界 ~281px。
+    点在胶囊外不会触发任何 tab 手势（也不报错，静默无效）。
+    用 `819, 2598`（设置中心）/ `460, 2598`（首页中心）实测可靠。
+
+---
 
 ## 0.9 第五轮（2026-11-12 12:20–13:00）—— 真机全链路验证
 
