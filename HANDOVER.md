@@ -395,6 +395,93 @@ LaunchedEffect(Unit) {          // 只启动一次
 
 ---
 
+### 0.11.9 性能优化（17:20–17:30）
+
+子 agent 反编译 + 字节码分析发现两个**比重绘贵 2~3 个数量级**的问题。
+
+#### 问题 A：指示器每帧触发整树重组 + 重新布局
+
+```kotlin
+val indPos = renderPos()      // 读 posAnim.value = 订阅
+val scale = scaleAnim.value   // 读 State = 订阅
+Modifier.offset { ... }       // layout 通道，每帧 measure+place
+```
+
+**在 Composable 函数体里读 State 就是订阅。** 于是指示器每动画一帧，
+整个 `GlassTabBar` 子树完整重组：重建 Modifier 链、重建 Canvas 的
+draw lambda、`tabs.forEachIndexed` 重建 2 个 Text、重新判定
+`LiquidGlassPanel` —— 连 AGSL 玻璃面板一起波及。
+
+修法：
+
+| 改动 | 从 | 到 |
+|---|---|---|
+| 位移 | `Modifier.offset{}`（layout 通道）| `graphicsLayer.translationX`（draw 通道）|
+| 缩放 | 单独 `graphicsLayer` | 合并进同一个 graphicsLayer |
+| 文字 | 内联在 GlassTabBar | 抽出 `TabLabels` 子组件 |
+
+文字必须留在 composition（`Text(color=)` 是组合期参数），
+但抽成子组件后重组范围只有那 2 个 Text。
+`positionProvider` 用 lambda 传，**不能传 Float** —— 传值的话调用方
+在 composition 里读 State 就订阅了，照样整树重组。
+
+#### 问题 B：每帧重建 native SkShader
+
+反编译确认：`Brush.verticalGradient` / `radialGradient` 每次调用都 new 对象，
+且 `ShaderBrush` 内部按 `createdSize` 缓存 native shader ——
+每帧新实例导致 `createdSize` 永远是 `Unspecified`，**缓存 100% 失效**。
+
+稳态每帧 2 个 native `LinearGradient`，交互态 3 个。
+
+修法：**把动态 alpha 从 color stops 挪到 `drawRoundRect(alpha=)` 参数**，
+Brush 就变成编译期常量：
+
+```kotlin
+// 顶层 val，只初始化一次
+private val BodyBrush = Brush.verticalGradient(
+    colors = listOf(Color.White, Color.White.copy(alpha = 0.62f)),  // 只表达比例
+)
+// 调用处
+drawRoundRect(brush = BodyBrush, alpha = baseAlpha, cornerRadius = corner)
+```
+
+依赖 size / density 的用 `drawWithCache`（只在 size/density 变化时重跑）：
+
+```kotlin
+Modifier.drawWithCache {
+    val glowBrush = Brush.radialGradient(..., center = Offset(size.width/2, size.height/2))
+    val edgeStroke = Stroke(width = 1.dp.toPx())
+    onDrawBehind { drawLiquidIndicator(..., glowBrush, edgeStroke) }
+}
+```
+
+#### 一条必须记住的诚实结论
+
+**「每帧 new 一堆 Brush 造成 GC 压力」在本项目不成立。**
+稳态约 11 个小对象/帧（60~120 KB/s），对 ART 是噪声级别。
+做这个优化不是因为 GC，而是 native shader 构造 + `Paint.setShader`
+管线重建比它贵一个数量级。以后排查卡顿**不要**从这里入手。
+
+#### 验证（真机 dumpsys gfxinfo，连续 12 次切换）
+
+```
+Total frames rendered: 2332
+Janky frames: 0 (0.00%)
+50th percentile:  9ms
+90th percentile: 15ms
+95th percentile: 17ms
+99th percentile: 22ms
+Number Slow UI thread: 0
+Number Slow issue draw commands: 0
+```
+
+#### 顺带修正的文档谎言
+
+`drawLiquidIndicator` 的注释一直写「五层结构」，**实际只有四层** ——
+流动高光带（shimmer）从未实现（用户要求去掉常驻流光）。已改为如实描述。
+
+---
+
 ## 0.10 第六轮（2026-11-12 14:00–14:20）—— 底栏两个交互缺陷
 
 > 用户反馈：「点一下直接瞬移过去」+「刚切换界面的 0.5 秒左右无法点击或拖拽底栏」。
