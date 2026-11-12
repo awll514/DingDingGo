@@ -177,6 +177,7 @@ private fun <T> glowFall(): androidx.compose.animation.core.FiniteAnimationSpec<
 
 
 
+
 /** 指示器驱动阶段 —— 唯一决定「谁在写 indicatorPos」的状态。 */
 private enum class Phase {
     /** 静止：位置由 pager 的 liveOffset 决定（用户左右滑页面时） */
@@ -277,6 +278,20 @@ fun GlassTabBar(
      * 用这个乐观值判断落点，交互永远即时。
      */
     var requestedIndex by remember { mutableIntStateOf(selectedIndex) }
+
+    /**
+     * 「这次 selectedIndex 变化是我们自己请求的」标记。
+     *
+     * ## 为什么需要一个显式标记
+     *
+     * 判断「要不要把 pager 进度灌进指示器位置」，必须区分两种来源：
+     *   · 用户直接在页面上左右滑 -> 指示器应当跟手（要灌）
+     *   · 我们点击/长按底栏触发切页 -> 指示器由状态机驱动（不要灌）
+     *
+     * 两者都会让 selectedIndex 变化、都会让 liveOffset 变化，
+     * 光看数值分不出来。所以由发起方主动打标记，动画结束后清除。
+     */
+    var selfDriven by remember { mutableStateOf(false) }
 
     // ==================== 视觉状态（与位置解耦） ====================
     val scaleAnim = remember { Animatable(1f) }
@@ -393,6 +408,9 @@ fun GlassTabBar(
      */
     LaunchedEffect(selectedIndex) {
         requestedIndex = selectedIndex
+        // pager 已经追到我们请求的页：这一次「自己发起的切页」结束了，
+        // 交还控制权 —— 之后用户再在页面上滑动，指示器应该跟手。
+        selfDriven = false
     }
 
     /** 底栏宽度首次就绪：把位置对齐到当前页，避免从 0 开始飘 */
@@ -412,17 +430,34 @@ fun GlassTabBar(
      * 只在 Idle 阶段同步：拖底栏或播放落位动画时，指示器由状态机驱动，
      * 此时 pager 的变化（我们主动请求的切页）不应该反过来覆盖位置。
      */
+    /**
+     * 【必须】把会变化的输入包成 State 再进闭包。
+     *
+     * ## 踩过的坑：闭包捕获旧值（导致「滑页面指示器不动」）
+     *
+     * 上一版直接写 LaunchedEffect(Unit) { snapshotFlow { liveOffset } ... }，
+     * 并在 collect 里读 liveOffset / selectedIndex。
+     *
+     * LaunchedEffect(Unit) 只启动一次，闭包捕获的是**首帧的值**，此后永不更新：
+     *   · liveOffset 首帧是 0.0 -> snapshotFlow 永远只发出 0.0，从不触发；
+     *   · selectedIndex 首帧是 0 -> 在设置页时条件永远不成立。
+     * 结果就是「在页面上左右滑动，指示器纹丝不动」。
+     *
+     * rememberUpdatedState 返回稳定的 State 容器，闭包读 .value 永远是**最新值**。
+     */
+    val latestLiveOffset by rememberUpdatedState(liveOffset)
+    val latestSelected by rememberUpdatedState(selectedIndex)
+
     LaunchedEffect(Unit) {
-        snapshotFlow { liveOffset }
+        snapshotFlow { latestLiveOffset }
             .collect { off ->
                 if (off == null) return@collect
                 // 只在「没有未完成的切页请求」时才同步 pager 进度。
                 //
                 // 长按把指示器滑到设置后，动画结束 phase 变 Idle，
                 // 但此刻 pager 的 liveOffset 仍是 0（页面刚开始切）。
-                // 无条件 snapTo 会让位置从 0.998 跳回 0.000 ——
-                // 真机日志抓到的就是这个跳变。
-                if (phase == Phase.Idle && requestedIndex == selectedIndex) {
+                // 无条件 snapTo 会让位置从 0.998 跳回 0.000。
+                if (phase == Phase.Idle && !selfDriven) {
                     posAnim.snapTo(off)
                 }
             }
@@ -525,6 +560,9 @@ fun GlassTabBar(
                         // 请求切页（页面与指示器同时开始、同时结束）
                         if (targetTab != requestedIndex) {
                             requestedIndex = targetTab
+                            // 标记：这次 pager 变化是我们发起的，
+                            // 注入逻辑不要覆盖指示器位置
+                            selfDriven = true
                             currentOnSelect(targetTab, dragged)
                         }
                     }

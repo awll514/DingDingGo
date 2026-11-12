@@ -659,9 +659,29 @@ private fun AppRoot() {
 
                     androidx.compose.foundation.pager.HorizontalPager(
                         state = pagerState,
-                        // 不预渲染相邻页：首帧少构建一整个页面，
-                        // 冷启动能快不少（设置页有一堆玻璃卡片，构建不便宜）。
-                        beyondViewportPageCount = 0,
+                        // ============ 预渲染相邻页（修「点击卡顿」的关键） ============
+                        //
+                        // 之前是 0，理由是「首帧少构建一整个页面，冷启动快」。
+                        // 用 atrace 实测后，这个权衡算错了方向：
+                        //
+                        //     冷进程首次 首页->设置 : measureAndLayout 147.4ms
+                        //     同进程第 2 次          : 4.5ms
+                        //     同进程第 3 次          : 1.7ms
+                        //     反向 设置->首页        : 16ms
+                        //
+                        // 147ms 里没有一行是玻璃渲染 —— 全是
+                        // Compose:recompose 39ms + applyChanges 33ms
+                        // + 74 个 Text 的测量 28ms。
+                        //
+                        // 更关键：这段组合跑在 AndroidOwner:onTouch 里，
+                        // 即输入事件分发路径上**同步执行**。
+                        // Choreographer 的下一帧回调排不进去 ——
+                        // 真机日志抓到动画前两帧间隔 154ms，指示器直接蹦到中途。
+                        //
+                        // 改成 1 后设置页在启动时就组合完毕，
+                        // 那 147ms 被 LaunchOverlay 遮住。
+                        // 代价：冷启动 +150ms、设置页节点树常驻（Java Heap 约 +2MB）。
+                        beyondViewportPageCount = 1,
                     ) { index ->
                         when (index) {
                             0 -> HomeScreen(
