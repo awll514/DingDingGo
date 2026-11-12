@@ -273,6 +273,28 @@ fun GlassTabBar(
      * 注意：它**只**用于手势落点判断与位移起始点，
      * 视觉高亮仍由 smoothWeight（位置插值）决定，因此不会出现两个高亮。
      */
+    /**
+     * 「我们已经主动把指示器放到了这个位置，但 pager 还没跟上」的锚点。
+     *
+     * ## 为什么必须有它（三个真机 bug 的共同根因）
+     *
+     * 按下跟手 / 点击 / 拖拽落位都会**主动移动**指示器，而 pager 的 liveOffset
+     * 此刻还停在旧页。之前 slideToX 一结束就把 slideX 清成 NaN，
+     * 渲染立刻回落到 liveOffset（旧页）——
+     *
+     *   · 「长按设置跟手，一松手就跳回首页复读」
+     *   · 「设置页长按首页不跟手，指示器又缩回设置」
+     *   · 「点击设置时先抖一下再滑过去」（松手时用了按下**之前**的位置）
+     *
+     * 全是同一件事：主动定位的结果没有被记住。
+     *
+     * ## 语义
+     *
+     *   settledX 非 NaN → 以它为准（我们已决定指示器在哪，等 pager 追上）
+     *   selectedIndex 追上 → 清空，无缝交还 liveOffset（此时两者数值相同）
+     */
+    var settledX by remember { mutableFloatStateOf(Float.NaN) }
+
     var pendingTarget by remember { mutableIntStateOf(selectedIndex) }
 
     // selectedIndex 一旦回写（动画停稳），把它对齐 —— 但只在没有更新请求时。
@@ -280,6 +302,23 @@ fun GlassTabBar(
     LaunchedEffect(selectedIndex) {
         if (pendingTarget != selectedIndex) {
             pendingTarget = selectedIndex
+        }
+        // 【注意】这里**不能**无条件清 settledX。
+        //
+        // 长按跟手时 pager 根本没动（不切页），selectedIndex 不变，
+        // 但 LaunchedEffect 仍会因重组而重启 —— 一清就把跟手位置抹掉，
+        // 渲染立刻回落到 liveOffset（旧页）→「长按不跟手」。
+        //
+        // 只有 pager 真的追到我们主动移去的那一页时才交还。
+        // 判断方式：settledX 对应的 tab 就是 selectedIndex 时，
+        // 说明 pager 已经到了，此时两者数值一致，清空无跳变。
+        if (!settledX.isNaN() && barWidthPx > 0 && tabs.isNotEmpty()) {
+            val tw = barWidthPx.toFloat() / tabs.size
+            val settledTab = ((settledX + indicatorWidthPx / 2f) / tw)
+                .toInt().coerceIn(0, tabs.lastIndex)
+            if (settledTab == selectedIndex) {
+                settledX = Float.NaN
+            }
         }
     }
 
@@ -382,6 +421,7 @@ fun GlassTabBar(
         return when {
             !pressX.isNaN() -> pressX
             !slideX.isNaN() -> slideX
+            !settledX.isNaN() -> settledX
             liveOffset != null -> offsetToX(liveOffset)
             else -> xAnim.value
         }
@@ -464,6 +504,9 @@ fun GlassTabBar(
                 }
                 // 落点对齐：让 xAnim 记录最终位置，供下一次 currentRenderX() 使用
                 xAnim.snapTo(to)
+                // 【关键】把结果记进 settledX 而不是丢弃 ——
+                // 否则渲染立刻回落到 liveOffset（旧页），指示器当场跳回去。
+                settledX = to
             } finally {
                 slideX = Float.NaN
                 slideJob = null
@@ -961,7 +1004,18 @@ fun GlassTabBar(
                                 //
                                 // 拖拽的起点 = 手指最后位置（pressX），
                                 // 点击的起点 = 按下那一刻的位置（pressStartX）。
-                                val fromX = if (dragged && !pressX.isNaN()) pressX else pressStartX
+                                // 【关键】起点必须是**此刻屏幕上真实显示的位置**。
+                                //
+                                // 「点击设置时指示器先抖一下」的根因就在这里：
+                                // 按下时已经启动了「滑到手指 tab」的运镜，
+                                // 松手瞬间指示器正在途中，而旧代码用 pressStartX
+                                // （按下**之前**的位置）当起点 → 先瞬移回起点再滑
+                                // → 视觉上抖一下。
+                                //
+                                // currentRenderX() 取的是实时值：
+                                // 拖拽中取 pressX，运镜中取 slideX，已落位取 settledX，
+                                // 全部与屏幕一致，起点永远不会跳。
+                                val fromX = currentRenderX()
                                 pressX = Float.NaN
                                 slideToX(centerXFor(target), fromX, RELEASE_MS)
                                 currentOnSelect(target, dragged)
@@ -1107,6 +1161,7 @@ fun GlassTabBar(
                     val cx = when {
                         !pressX.isNaN() -> pressX
                         !slideX.isNaN() -> slideX
+                        !settledX.isNaN() -> settledX
                         liveOffset != null -> offsetToX(liveOffset)
                         else -> xAnim.value
                     }
