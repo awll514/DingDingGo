@@ -103,7 +103,7 @@ AGP          9.3.1
 Kotlin       2.4.21（AGP 9 内置，不再单独应用 kotlin-android 插件）
 KSP          2.3.13（KSP2 独立版本线）
 Compose BOM  2026.06.01
-compileSdk   37        ← PrismalAGSL 1.0.7 硬性要求 minCompileSdk=37
+compileSdk   37        ← backdrop（Kyant0/AndroidLiquidGlass）要求 minCompileSdk=37
 minSdk       31
 targetSdk    37
 ```
@@ -149,15 +149,21 @@ sdk.dir=E:/dev/android-sdk
 gradlew.bat :app:testDebugUnitTest
 ```
 
-覆盖 **88 个用例**，包括：
+覆盖 **104 个用例**（10 个测试类），包括：
 - 排班计算（跨天、跨周、补执行窗口、单日覆盖、休息日强制）
 - 计时器精度（预热提前量 = 75 秒）
 - uiautomator XML 解析（坐标换算、零面积节点跳过、精确优先于包含）
 - 成功/失败信号判定（且保证两类信号不重叠）
-- 迟到/下班安全闸门（21 例，改常量必失败）
+- 迟到/下班安全闸门（改常量必失败）
 - 打卡结果判定（极速打卡、失败优先、状态翻转）
 - 已完成班次跳过（手动打卡后不重复触发）
 - **调度抗自激**（闹钟触发后重排不会排回同一班次）
+- **目标时段已打判定**（防止下班卡被误判成上班卡）
+- **打卡窗口边界**（提前量、迟到阈值）
+
+> ⚠️ 其中 12 个用例带 `@Ignore`：它们是红线的**期望语义**，断言已写好，
+> 等把相关函数从 `PunchEngine` 抽成独立入口后即可解挂。
+> `@Ignore` 是 skipped 而非 passed，不会造成"假绿"。
 
 > AGP 9.3.1 在 Windows 下 `testDebugUnitTest` 会报 ClassNotFoundException
 > （测试类其实编译成功了）。绕过方式见 HANDOVER §7。
@@ -230,13 +236,18 @@ adb pull /sdcard/ui.xml
 adb shell dumpsys gfxinfo com.redmi.autoattend framestats
 ```
 
-全 AGSL 玻璃面严格限制在 3 个：
-1. 首页倒计时大面板
-2. 首页今日打卡卡
-3. 底部 tab bar
+**玻璃面数量上限已解除** —— 用户明确要求"不用考虑性能消耗"，
+这台设备（Adreno 830）性能充足，视觉优先。
 
-其余（健康度卡、设置页所有分组、按钮、列表项）用轻量磨砂
-（`FrostedPanel`：一层渐变 + 一圈描边，无模糊无折射）。
+当前使用玻璃面板的位置：首页倒计时大面板、今日打卡卡、底部 tab bar、
+健康度卡、设置页分组等。
+
+> 但保留 `GlassPerfGuard` 作为**兜底**：设备过热/降频时自动退到磨砂，
+> 不会让界面卡死。这是保护，不是设计约束。
+
+> ⚠️ **已知限制**：`LiquidGlassPanel` 的 `blurRadius` 在本机**完全不生效**
+> （8/12/20/200dp 逐像素一致）。磨砂感实际由 `tintAlpha` 遮挡实现。
+> 详见 HANDOVER §0.1 的完整证据链，不要再尝试调大 blurRadius。
 
 **三层性能保护**（都在 `ui/glass/` 下）：
 

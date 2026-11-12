@@ -2,14 +2,9 @@
 
 > 生成时间：2026-11-11 · 设备：Redmi K90 至尊版（M332BF / warsaw / HyperOS V816 / Android 16 / API 36）
 >
-> **最后更新：2026-11-11 18:25（第三轮：换液态玻璃库 + 悬浮窗状态化，详见 §0）**
-
----
-
-## 0. 第三轮迭代（本轮）
-
-### 0.1 换掉整套液态玻璃实现 ⚠️ 有取舍
-
+> **最后更新：2026-11-12 09:40（第四轮：底栏手势彻底重构 + 打卡识别 P0 修复，详见 §0.8）**
+>
+> 分支：`fix/p0-punch-chain` · HEAD `91c07f3` · 已推送 origin
 **从 `PrismalAGSL`（50 星）换成 `Kyant0/AndroidLiquidGlass`（4600 星）**
 
 ```kotlin
@@ -138,12 +133,122 @@ showStatus(context, tone, title, subtitle, holdMs = 3000L)
 
 | # | 事项 | 状态 | 关键信息 |
 |---|------|------|---------|
-| 1 | 悬浮窗两个按钮点击是否真的生效 | ⚠️ **未验证** | 代码已改，但最后一次截图没拍到悬浮窗（点击坐标偏了），**需要在真机上点一次确认** |
+| 1 | 悬浮窗两个按钮点击是否真的生效 | ⚠️ **仍未验证** | 代码已改，但一直没拍到生效截图。**需要在打卡窗口期手动跑一次确认**（见 §4.2） |
 | 2 | 状态提示的实际视觉效果 | ⚠️ **未验证** | `showStatus` 已实现并接入，但没拍到生效截图 |
-| 3 | 底栏"真正的模糊" | ❌ **放弃** | 见下方说明 |
+| 3 | 底栏"真正的模糊" | ❌ **放弃**（第四轮已实测确认） | 见下方说明；第四轮又用 8/12/20/200dp 四档验证，逐像素一致 |
 | 4 | `LiquidGlassPanel` 的 `sampleOffsetX/Y` | 死参数 | 签名里保留但函数体从未使用，是旧 Prismal 遗留 |
 | 5 | `SettingsScreen` / `LaunchOverlay` 的裸 `tween()` | 未迁移 | 仍有多处 `tween(220)` / `tween(280)` 未走 `GlassMotion` |
 | 6 | 深色首页两个大卡片偏黑 | 用户说不急 | 第二轮遗留 |
+
+### 0.8 第四轮迭代（2026-11-12）—— 底栏手势彻底重构 + 打卡识别 P0
+
+> 本轮全部改动已推送：`fix/p0-punch-chain`，HEAD `91c07f3`。
+> 提交链 `d458686 → 91c07f3` 共 8 个提交。
+
+#### 0.8.1 【P0】下班卡被识别成上班卡（已修复，三轮根因叠加）
+
+三个独立缺陷叠加，缺一不可修：
+
+| # | 位置 | 问题 | 修法 |
+|---|------|------|------|
+| 1 | `MainViewModel.manualPunch()` | 传的 `targetAt = now`，而不是班次目标时刻 | 传真实目标时刻 |
+| 2 | `MainViewModel.inferManualKind()` | 无条件返回 `CLOCK_IN` | 按距上下班时刻最近推断 |
+| 3 | `PunchEngine.judgeResult()` | 拿到任意成功文案就判成功，不看类型 | 增加 `PunchKind` 校验（`successMatchesKind`） |
+
+新增单测：`TargetDoneTest`(14) / `PunchWindowTest`(10)。
+
+#### 0.8.2 底栏手势彻底重构（本轮最大工作量，5 次方案迭代）
+
+**用户反馈的 5 个症状，全部同一个根因：拖拽时 pager 没有同步跟手。**
+
+| 症状 | 说明 |
+|------|------|
+| 拖拽卡顿一下然后瞬移 | 帧间状态被合并/丢弃 |
+| 松手瞬移回原页再播一遍动画 | `liveOffset` 仍是旧值 |
+| 长按时指示器不跟手 | 没有逐帧驱动源 |
+| 点击要两次才生效 | 父级手势与子级 Clickable 各触发一次 |
+| 刚切换界面时点击没反应 | 按下时用 `pressTab != currentSelected` 判断，而它尚未回写 |
+
+**根因是结构性的，不是参数问题：**
+
+`awaitEachGesture` 跑在**受限协程作用域**里，任何挂起调用（`Animatable.animateTo`、
+`scrollToPage`）都必须经 `scope.launch` 逃逸，而 `launch` 是**异步调度**的 ——
+逐帧驱动必然掉帧。三种尝试全部失败：
+
+| 方案 | 失败原因 |
+|------|----------|
+| `scope.launch { scrollToPage() }` | 异步，帧间被合并 → 丢中间动画、卡顿后瞬移 |
+| `dispatchRawDelta(delta)` | 增量被 pager 的 snap 吸回最近的页 → 拖不过去 |
+| 绝对位置 `scrollToPage()` | 仍是 `launch` 异步 → 同样卡顿 |
+
+**最终方案：拖拽期间页面完全不动，只有指示器跟手；松手才切页。**
+
+```kotlin
+var pressX by remember { mutableFloatStateOf(Float.NaN) }   // 普通 state，同步
+
+按下 → scaleAnim.animateTo(dragScale)          // 放大
+拖拽 → pressX = xFor(fingerX)                  // 同步写，本帧即渲染，永不掉帧
+松手 → pressX = centerXFor(target)             // 先停到目标
+       currentOnSelect(target, dragged)        // 再请求切页
+       // pressX 的清空挪到 selectedIndex 更新后的 LaunchedEffect 里
+```
+
+**交接时机是关键**（这是最后一次修复）：
+
+```kotlin
+// 错：松手就清，但 pager 动画刚开始、selectedIndex 还没回写
+currentOnSelect(target); pressX = Float.NaN   // → 指示器跳回原页再翻过去
+
+// 对：等 selectedIndex 真的更新后，在 LaunchedEffect 里清
+pressX = centerXFor(target); currentOnSelect(target)
+// ...LaunchedEffect(selectedIndex) 末尾: pressX = Float.NaN
+```
+
+交接瞬间两边数值相同，无可见跳变。
+
+**其他配套修正：**
+
+- 移除子级 `Clickable`（父级手势已统一处理点按与拖拽，双触发是「要点两次」的直接原因）
+- 指示器位置只有一个来源，`isPressed` / `posJob` / `scaleJob` 等中间态全部删除
+- 文字颜色改为跟随实际位置插值（`livePos`），不再等 `selectedIndex` → 消除「变色慢一秒」
+- 三处动画时长统一为 **620ms**：`RELEASE_MS` / `TAB_RELEASE_MS` / `CLICK_PAGE_MS`，
+  保证指示器与页面同长同曲线、双向对称
+
+#### 0.8.3 真机验证结果（Redmi K90 至尊版实测）
+
+| 场景 | 结果 |
+|------|------|
+| 拖拽中途截图（手指在胶囊中段） | 指示器精确停在手指处、已放大、**页面未动** ✅ |
+| 拖拽 首页→设置 / 设置→首页 | 落点正确 ✅ |
+| 单击双向 | 各一次生效 ✅ |
+| 快速连点三次后立即点击 | 每次都响应 ✅ |
+| 在设置页长按设置（原地不动） | 不误切页 ✅ |
+
+> ⚠️ **测试坐标提醒**：底栏是宽度 0.56 屏宽的居中胶囊（1280 屏宽下约 x=300–1000）。
+> 用 `adb input` 测试时，坐标要落在胶囊内，两半中心约为 **x=475 / x=830**（y=2694）。
+> 曾经用 x=900 测出一堆假失败，实际是超出胶囊右缘导致 Row 内部坐标映射偏了。
+
+#### 0.8.4 其他修复
+
+- 设置页删除全部 4 个「测试」操作行
+- 倒计时数字上移淡出动画放慢：`DigitShiftMs 620` / `FadeIn 420` / `FadeOut 540`
+- 底栏玻璃采样源改为 `liquidBackdropContent`（含内容层），并确认 `directionalOptics = true`
+- 补交 `app/src/debug/AndroidManifest.xml`（`DebugPasswordSeedReceiver` 的配套清单，
+  只在 debug 构建合并，release 不含 —— 避免 exported receiver 成为改密码后门）
+- 修正 `verify-alarm.ps1` / `.sh` 三处必现误报（CRLF 导致 `$` 锚点失效、
+  `$pid` 撞 PowerShell 只读自动变量、logcat 漏抓 4 个关键 tag）
+
+#### 0.8.5 本轮**新增**的待办
+
+| # | 事项 | 状态 | 说明 |
+|---|------|------|------|
+| 1 | `TRIGGER_PUNCH` 广播链路 | ⚠️ 未修复 | 广播返回 `result=0` 但**没写 `punch_log` 行**，链路断在哪儿没查 |
+| 2 | `isTargetDone` 的 90 字符窗口启发式 | ⚠️ 待替换 | 应改为按 y 坐标配对行（`build/v2.xml` 里有真实节点坐标） |
+| 3 | `isOutdoor` 未下沉到 `judgeResult` | ⚠️ 待办 | 目前在外层判断，判定依据不够集中 |
+| 4 | 打卡时间未回显 | ⚠️ 待办 | `09:19` / `18:30` 应出现在日志与通知正文里 |
+| 5 | `MainViewModel.manualPunch()` 的 `delay(1_500)` | ⚠️ 待办 | `finally { _busy = false }` 仍绑固定延时，应改为真实完成信号 |
+
+---
 
 #### 关于「底栏真正的模糊」为什么放弃
 
@@ -164,13 +269,15 @@ tab bar；我们的底栏要跟随 pager 进度和拖拽动画，重构成本高
 
 ### 0.7 验收状态
 
-| 项 | 结果 |
-|---|---|
-| `assembleDebug` | ✅ BUILD SUCCESSFUL |
-| 单元测试（8 个类） | ✅ OK (88 tests) |
-| 安装运行 | ✅ 进程存活，无崩溃 |
-| 深浅双主题 | ✅ 都验证过截图 |
-| 调试探针残留 | ✅ 已清理干净 |
+| 项 | 结果 | 时间 |
+|---|---|---|
+| `assembleDebug` | ✅ BUILD SUCCESSFUL | 第四轮 |
+| 单元测试（10 个类 / 104 个） | ✅ 全部通过 | 第四轮 |
+| 安装运行 | ✅ 进程存活，无崩溃 | 第四轮 |
+| 底栏双向拖拽 / 双向点击 | ✅ 真机逐项验证（见 §0.8.3） | 第四轮 |
+| 拖拽中途跟手 | ✅ 截图确认指示器停在手指处、页面未动 | 第四轮 |
+| 深浅双主题 | ✅ 都验证过截图 | 第三轮 |
+| 调试探针残留 | ✅ 已清理干净 | 第三轮 |
 
 ---
 
@@ -277,44 +384,55 @@ AGSL 的 `blurRadius` 只能模糊**它采集的 GraphicsLayer**。
 
 ## 2. 本轮完成的内容
 
-### 2.1 底栏（GlassTabBar）—— 重写
+### 2.1 底栏（GlassTabBar）
 
-修掉三个真实 bug，并达到 iOS 26 视觉标准：
+> ⚠️ 本节在第四轮**全部重写**。旧版描述的「闭包捕获过期状态」「双边不对称」等
+> 问题已经随架构替换消失，不再适用。看这节就够了。
 
-**bug 1：拖拽只有指示器动、页面不切（第二次必现）**
+**尺寸（代码实测值，GlassTabBar.kt）：**
 
-根因是 **Kotlin 闭包捕获了过期状态**：
+| 参数 | 值 |
+|------|-----|
+| barWidthFraction | 0.56f（屏宽的 56%，居中悬浮胶囊） |
+| barHeight | 52.dp |
+| indicatorWidth / indicatorHeight | 78.dp / 40.dp |
+| dragScale | 1.55f（40 x 1.55 = 62dp > 52dp，真正溢出容器上下边界） |
+| INDICATOR_MOVE_MS | 420 |
+| PRESS_MS（放大） | 380 |
+| PRESS_SLIDE_MS | 520（预留，当前手势未使用） |
+| RELEASE_MS（落位） | **620** |
+| STRETCH_MS / SETTLE_MS | 260 / 460 |
+| GLOW_FADE_MS / COLOR_MS | 520 / 380 |
 
-```kotlin
-// 错误：pointerInput 的 key 不含 selectedIndex，手势块永不重建
-.pointerInput(barWidthPx, tabs.size) { ... selectedIndex ... }
+**手势模型（第四轮定稿）：**
+
+```
+按下 → 放大（380ms）
+拖拽 → 指示器同步跟手，页面完全不动
+松手 → 指示器落位到最近 tab + 页面切过去（620ms，同长同曲线）
 ```
 
-手势 lambda 一直拿着首次组合时的 `selectedIndex`，第二次拖拽时比较的是旧值，
-`nearest != selectedIndex` 恒为 false，`onSelect` 从不被调用。
+位置只有一个来源：拖拽时是 pressX（普通 mutableFloatStateOf，同步写入），
+其余时候是 liveOffset（pager 连续进度）。**不存在两套坐标对账**。
 
-修复：`val currentSelected by rememberUpdatedState(selectedIndex)`，手势里读最新值。
+详见 §0.8.2 —— 那里记录了 5 次失败方案与最终结论，改这个文件前务必先读。
 
-**bug 2：指示器卡在中间**
+**玻璃容器：**
 
-旧代码在 `onDragEnd` 里既 `settleTo()` 又 `onSelect()`，
-加上 `LaunchedEffect(selectedIndex)` 也 `settleTo()` —— 三个来源抢同一个 `Animatable`。
-现在统一：**只有 `onSelect` 触发状态变更，只有 `LaunchedEffect` 驱动动画**。
+LiquidGlassPanel（Kyant0/AndroidLiquidGlass）采样 liquidBackdropContent 层。关键参数：
 
-**bug 3：双边切换不对称**
+```kotlin
+tint = if (colors.isDark) Color(0xFF0E1B33) else Color(0xFFFAFAFA)
+tintAlpha = if (colors.isDark) 0.45f else 0.40f
+highlightAlpha = 0f                    // 关边缘高光，否则盖住贴边的「设置」文字
+dispersionOverride = if (isDark) 0.45f else 0.38f
+directionalOptics = true               // 必须 true，关掉会退化成平板色块
+blurRadius = if (colors.isDark) 8.dp else 16.dp   // 本机 blur 实际无效，见 §0.1
+```
 
-旧判定用 `round((dragX + iw/2) / tabWidth)`。tab 中心恰好落在 `k+0.5` 整数边界，
-`round` 向上取整 —— 从首页拖 0px 就判定为切到设置，反方向却要拖满一格。
-
-现在改为**比较到各 tab 中心的绝对距离**，实测双向均为 291px 触发。
-
-**视觉**：
-- 底栏宽度 0.56 屏宽居中（真正的悬浮胶囊，不是通栏条）
-- 高度 52dp，指示器 78×40dp
-- **用 `LiquidGlassPanel` 做容器**，采样 `LocalBackdropLayer` 的录制层，
-  得到真正的模糊 + 折射 + 色散。之前只是半透明白块，所以"不像玻璃"
-- 指示器拖拽时放大 **1.55×**（40 × 1.55 = 62dp > 52dp，真正溢出容器上下边界）
-- **移除了常驻流光**（用户要求），改为静止安静、仅交互动
+> ⚠️ **blurRadius 在本机是死参数**（8dp / 12dp / 20dp / 200dp 逐像素一致）。
+> 真正的「磨砂感」全靠 tintAlpha 遮挡。这是硬件/库的物理限制，不是配置问题，
+> 不要再尝试调大 blurRadius（§0.1 有完整证据）。
 
 ### 2.2 屏幕接管提示 → 系统悬浮窗
 
@@ -396,7 +514,11 @@ CLOCK_OUT_SAFETY_MARGIN_MS = 2_000L  // 下班卡最早触发点
 - **下班之前绝不打下班卡**（`clock_out` 目标时间 +2s 才允许）
 - **上班之后绝不打迟到卡**（进入上班时间后 55s 内是绿色窗口，满 60s 才算迟到）
 
-改动这些常量必须让 `SafetyGateTest`（21 个用例）失败。
+改动这些常量必须让 `SafetyGateTest` 的断言失败。
+
+> 该文件当前 6 个 `@Test`、4 个 `@Ignore`。`@Ignore` 里挂的正是这两条红线的
+> **期望语义**（断言已写好，等把函数抽成 `internal object SafetyGate` 后启用）。
+> 也就是说：**目前只有一半红线被自动化覆盖**，另一半靠代码 review 保证。
 
 ### 3.2 成功判定
 
@@ -405,18 +527,22 @@ CLOCK_OUT_SAFETY_MARGIN_MS = 2_000L  // 下班卡最早触发点
 
 `ALREADY_DONE ≠ SUCCESS`。
 
-> **更正（第三轮）**：此处曾写"全库只有一个 `success = true` 站点"，实测有 **3 处**。
-> 改判定逻辑时必须三处一起看：
+> **更正（第四轮）**：此处曾写"全库只有一个 `success = true` 站点"，实测有 **4 处**。
+> 改判定逻辑时必须四处一起看：
 >
-> | 位置 | 触发条件 | 说明 |
+> | 位置（当前行号） | 触发条件 | 说明 |
 > |------|---------|------|
-> | `PunchEngine.kt` L324 | `!clicked && alreadyDoneBefore` | 极速打卡：进页面时钉钉已自己打好 |
-> | `PunchEngine.kt` L349 | `verifyResult() != null` | 主路径，唯一"点了并验证成功"的站点 |
-> | `PunchEngine.kt` L961 | `targetAlreadyDone(blob, kind)` | 外勤闸门里的"目标时段已打卡 → 跳过" |
+> | `PunchEngine.kt` L667 | `alreadyDoneBefore` | 极速打卡：进页面时钉钉已自己打好 |
+> | `PunchEngine.kt` L687 | `readTargetDoneState(kind)` | **第四轮新增**：点击阶段发现目标已完成（极速打卡抢先） |
+> | `PunchEngine.kt` L710 | `verifyResult() != null` | 主路径，唯一"点了并验证成功"的站点 |
+> | `PunchEngine.kt` L1572 | `targetAlreadyDone(blob, kind)` | 外勤闸门里的"目标时段已打卡 → 跳过" |
 >
-> 第三处最需要警惕：它靠 `targetAlreadyDone()` 的**字符串邻近匹配**
+> L1572 最需要警惕：它靠 `targetAlreadyDone()` 的**字符串邻近匹配**
 > （"上班"/"下班" 关键词后 90 字符窗口内找"已打卡"）判定。
 > 钉钉改文案或改排布时这里会先失准。
+>
+> ⚠️ **行号会漂移**，查找时用 `Select-String -Pattern 'success = true'` 重新定位，
+> 别信文档里的绝对行号。
 
 ### 3.3 外勤规则
 
@@ -502,6 +628,32 @@ Activity 不可见后**不得有任何持续动画或 AGSL 计算**。
 去掉了压黑遮罩、加了入场动画（缩放 0.92→1.0 + 淡入 280ms），
 但**没有截图验证最终观感**。
 
+### 4.6 TRIGGER_PUNCH 广播链路断裂（第四轮发现，未修）
+
+`DebugPasswordSeedReceiver` 处理 `com.redmi.autoattend.debug.TRIGGER_PUNCH` 时，
+`am broadcast` 返回 `result=0`，但**数据库里没有新增 punch_log 行**。
+
+已确认：
+- receiver 确实被调用了（`result=0` 说明 onReceive 执行过并调用了 setResult）
+- 但打卡链路没有产出日志记录
+
+未确认：断在 `PunchEngine` 的哪个环节。要查的话先看 `PunchForegroundService`
+的前台服务启动是否被 HyperOS 拦掉（后台启动 FGS 限制）。
+
+**影响面**：仅影响 adb 联调便利性，不影响闹钟触发的正常打卡链路。
+
+### 4.7 文档与代码的历史偏差（已在本轮修正）
+
+第四轮之前，本文档有多处描述与代码不符，本轮已逐项校正：
+
+| 原文档说法 | 实际情况 |
+|---|---|
+| 测试 8 个类 / 88 个测试 | 10 个类 / 104 个测试 |
+| 底栏手势「闭包捕获过期状态」 | 架构已替换，该问题不存在了 |
+| 指示器 1.55x | 正确，未变 |
+| `RELEASE_MS` 340 | 已改为 620（三段动画统一） |
+| 只有 3 个测试类带 `@Ignore` | 实际 12 个 `@Ignore` 分布在 3 个类 |
+
 ---
 
 ## 5. 构建与调试
@@ -535,6 +687,21 @@ $base = "li.songe.gkd/com.google.android.accessibility.selecttospeak.SelectToSpe
 
 ### 5.4 验证闹钟已注册
 
+**推荐直接跑脚本**（一条命令查完 6 项）：
+
+```powershell
+.\verify-alarm.ps1          # Windows
+bash ./verify-alarm.sh      # Git Bash
+```
+
+脚本会依次检查：设备连接 → 进程存活 → 闹钟注册 → 保活服务 → 无障碍 → 最近日志。
+
+> 第四轮修了脚本的三处必现误报，注意两点：
+> - `adb devices` 的输出是 CRLF，`$` 锚点匹配不到行尾，必须用 `\s*$`
+> - 不要用 `$pid` 做变量名，那是 PowerShell 只读自动变量，赋值静默失败
+
+手动查：
+
 ```powershell
 & $adb shell "dumpsys alarm | Select-String autoattend"
 ```
@@ -554,37 +721,59 @@ app/src/main/java/com/redmi/autoattend/
 ├── MainActivity.kt                    入口；三层布局（背景/内容/底栏）
 ├── core/
 │   ├── AppConfig.kt                   SharedPreferences 封装；跳过日期、通知开关
-│   ├── PunchSchedule.kt               ★ 时间计算（纯函数，可测）；dayLabel/vacationLabel
-│   └── AlarmScheduler.kt              AlarmManager 精确闹钟
+│   ├── PunchSchedule.kt               ★ 时间计算（纯函数，可测）
+│   ├── AlarmScheduler.kt              ★ AlarmManager 精确闹钟；isSameSlot/handlesFor
+│   └── HealthCheck.kt                 保活健康度 8 项检查
+├── data/db/
+│   ├── AppDatabase.kt                 Room 数据库
+│   ├── PunchLogDao.kt                 日志查询
+│   └── PunchLogEntity.kt              日志实体
 ├── exec/
 │   ├── PunchEngine.kt                 ★ 打卡主流程；安全闸门；外勤轮询
 │   ├── PunchForegroundService.kt      前台服务；PAUSE/RESUME/CANCEL
+│   ├── PunchAlarmReceiver.kt          闹钟接收；重排下一班
 │   ├── PunchAccessibilityService.kt   无障碍通道
+│   ├── AccessibilityKeeper.kt         无障碍服务保活/重绑
 │   ├── RootShell.kt                   root 通道
-│   ├── ControlHudOverlay.kt           ★ 系统悬浮窗提示（本轮新增）
+│   ├── DingTalkUi.kt                  钉钉界面节点定位与文本判定
+│   ├── UiHierarchy.kt                 UI 树解析
+│   ├── GestureExecutor.kt             手势执行（无障碍/root 双路）
+│   ├── ControlHudOverlay.kt           ★ 系统悬浮窗提示
 │   ├── PunchNotifier.kt               通知 + 震动 + 音效
-│   └── KeepAliveService.kt            保活；常驻通知开关
+│   ├── KeepAliveService.kt            保活；常驻通知开关
+│   ├── ResurrectionService.kt         进程复活
+│   ├── BootReceiver.kt                开机重排闹钟
+│   └── DebugPasswordSeedReceiver.kt   ⚠️ 仅 debug 构建（见 app/src/debug/）
 ├── ui/
 │   ├── MainViewModel.kt               ★ 单一数据源；100ms tick
 │   ├── components/
-│   │   ├── GlassTabBar.kt             ★ 底栏（本轮重写）
+│   │   ├── GlassTabBar.kt             ★ 底栏（第四轮重构）
+│   │   ├── CountdownText.kt           ★ 倒计时数字滚动（上移淡出）
 │   │   ├── LiquidGlassButton.kt       液态玻璃按钮（四层按压反馈）
+│   │   ├── PressEffect.kt             通用按压反馈
 │   │   ├── ClickableNoRipple.kt       无涟漪点击
 │   │   ├── ConfirmDialog.kt           二次确认弹层
+│   │   ├── GlassWheelTimePicker.kt    玻璃风格时间滚轮
+│   │   ├── LaunchOverlay.kt           启动遮罩
+│   │   ├── HealthCard.kt              保活健康度卡片
+│   │   ├── StatusPill.kt              状态胶囊
+│   │   ├── PasswordInput.kt           密码输入
 │   │   └── SettingsComponents.kt      设置页组件
 │   ├── glass/
-│   │   ├── LiquidGlassPanel.kt        ★ AGSL 全管线玻璃面板
+│   │   ├── LiquidGlassPanel.kt        ★ 玻璃面板（Kyant0 backdrop）
 │   │   ├── FrostedPanel.kt            轻量磨砂（降级路径）
 │   │   ├── FlowingBackground.kt       ★ 流动光斑背景（20fps 节流）
-│   │   └── LocalBackdrop.kt           背景录制层（玻璃采样源）
+│   │   ├── LocalBackdrop.kt           内容层录制（玻璃采样源，★第四轮修正）
+│   │   ├── GlassPerfGuard.kt          降级守卫
+│   │   └── SystemBlur.kt              系统模糊（弹窗用，API 31+）
 │   ├── screens/
 │   │   ├── HomeScreen.kt              ★ 首页
 │   │   ├── SettingsScreen.kt          设置页
 │   │   └── TimeEditorSheet.kt         时间选择弹层
 │   └── theme/
 │       ├── GlassColors.kt             ★ 配色（深/浅两套）
+│       ├── GlassMotion.kt             ★ 动效常量（IosEaseOut / IosEaseInOut）
 │       └── GlassTheme.kt              圆角/间距尺度
-└── data/db/                           Room 日志库
 ```
 
 ### 关键文件说明
@@ -607,15 +796,27 @@ app/src/main/java/com/redmi/autoattend/
 
 | 测试类 | 数量 | 覆盖 |
 |--------|------|------|
-| `SafetyGateTest` | 21 | 迟到/下班安全闸门（红线） |
+| `TargetDoneTest` | 14 | **目标已打判定（第四轮新增，P0 下班卡误判回归）** |
 | `UiHierarchyTest` | 14 | 界面节点定位 |
+| `PunchResultJudgeTest` | 13 | 打卡结果判定（极速打卡、失败优先、最坏情况防护） |
 | `PunchScheduleTest` | 12 | 下一次打卡计算 |
-| **`PunchResultJudgeTest`** | **13** | **打卡结果判定（含极速打卡、失败优先、最坏情况防护）** |
-| **`CompletedSlotTest`** | **11** | **已完成班次跳过（手动打卡后不重复触发）** |
+| `CompletedSlotTest` | 11 | 已完成班次跳过（手动打卡后不重复触发） |
+| `SchedulerGuardTest` | 11 | 调度抗自激（含 4 个 `@Ignore`，见下方说明） |
+| `PunchWindowTest` | 10 | **打卡窗口边界（第四轮新增，含 2 个 `@Ignore`）** |
 | `DayLabelTest` | 8 | 今天/明天/周几/日期文案 |
+| `SafetyGateTest` | 6 | 迟到/下班安全闸门（含 4 个 `@Ignore`，见下方说明） |
 | `SkipDateTest` | 5 | 跳过某天后下次打卡顺延 |
-| **`SchedulerGuardTest`** | **4** | **调度抗自激（第三轮新增）** |
-| **合计** | **88** | |
+| **合计** | **104** | 全部通过（`@Ignore` 计为 skipped，不是 passed） |
+
+> **关于 `@Ignore`（12 个，总计）**：`SafetyGateTest` / `SchedulerGuardTest` /
+> `PunchWindowTest` 里各有一批红线的**期望语义**用 `@Ignore` 显式挂起。
+> 这些不是漏写，是刻意的：被测函数目前还在 `PunchEngine` 内部，
+> 需要先抽成 `internal object SafetyGate` / `AlarmScheduler.isSameSlot(a,b)` /
+> `handlesFor(slot)` 才能直接测。断言已经写好了，抽出来把 `@Ignore` 删掉即可，
+> **不需要重写用例**。
+>
+> 挂起而不是删除，是因为 `@Ignore` 是 skipped 而非 passed —— 不会「假绿」。
+
 
 > **SchedulerGuardTest 覆盖的回归点**：闹钟触发后会重排下一班，
 > 而 `nextSlot` 在补执行窗口内会返回**同一个班次** ——
@@ -668,9 +869,17 @@ app/src/main/java/com/redmi/autoattend/
 
 1. **验证暂停/恢复**（§4.2）—— 第三轮已修复其代码缺陷（见 §12），
    **但仍未真机验证**，需要在打卡窗口期手动跑一次
-2. **冷启动优化**（§4.1）—— 1936ms 仍偏慢
-3. 设置页剩余控件苹果化（§4.4）—— 分段控件、开关、周选择器
-4. 时间选择弹层视觉确认（§4.5）
+2. **查 `TRIGGER_PUNCH` 广播链路**（§4.6）—— 第四轮发现，`result=0` 但不写日志，
+   怀疑断在 `PunchForegroundService` 的后台启动限制上
+3. **替换 `isTargetDone` 的 90 字符窗口启发式**（§3.2）—— 改为按 y 坐标配对行，
+   `build/v2.xml` 里有真实节点坐标可参考；这是钉钉改版后最先失准的地方
+4. **把红线的期望语义解挂**（§7）—— 抽出 `internal object SafetyGate`、
+   `AlarmScheduler.isSameSlot(a,b)`、`handlesFor(slot)` 三个入口，
+   删掉 12 个 `@Ignore`，让 104 个测试全部生效
+5. 冷启动优化（§4.1）—— 1936ms 仍偏慢
+6. 设置页剩余控件苹果化（§4.4）—— 分段控件、开关、周选择器
+7. 打卡时间回显（§0.8.5 第 4 项）—— `09:19` / `18:30` 应进日志与通知正文
+8. 时间选择弹层视觉确认（§4.5）
 
 > ⛔ **已否决的方案**：本节过去建议"首帧先用 `FrostedPanel` 降级、稳定后退到 AGSL"。
 > **不要这么做** —— 踩坑 #9 已经论证过，用 `withFrameNanos` 做首帧降级会让
@@ -684,31 +893,33 @@ app/src/main/java/com/redmi/autoattend/
 | 项 | 值 |
 |----|-----|
 | 设备序列号 | `d65730c5` |
-| **adb（当前机器）** | `C:\AndroidTools\platform-tools\adb.exe` |
-| **JDK（当前机器）** | `C:\Program Files\Microsoft\jdk-17.0.21.21-hotspot` |
-| **SDK（当前机器）** | `C:\AndroidTools\sdk` |
+| **adb（当前机器）** | `E:\dev\android-sdk\platform-tools\adb.exe` |
+| **JDK（当前机器）** | `E:\dev\jdk21\jdk-21.0.2`（**JDK 21**，不是 17） |
+| **SDK（当前机器）** | `E:\dev\android-sdk` |
+| 项目路径 | `E:\dsh\dingding-go`（**纯英文，无中文**） |
 | 屏幕 | 1280×2772 @ density 520（≈3.25x） |
-| 截图缩放 | 预览 860×1860，换算系数 1.4884 |
+| 底栏可点区域 | y=2694；胶囊 x≈300–1000，两半中心 x≈475 / x≈830 |
 | 锁屏密码 | 已存于 EncryptedSharedPreferences，**源码中不得硬编码** |
+| PIN 验证入口 | `DebugPasswordSeedReceiver`（仅 debug 构建） |
 
 ### 当前机器的构建命令
 
 ```powershell
-$env:JAVA_HOME = 'C:\Program Files\Microsoft\jdk-17.0.21.21-hotspot'
-$env:ANDROID_HOME = 'C:\AndroidTools\sdk'
-$env:ANDROID_SDK_ROOT = 'C:\AndroidTools\sdk'
+$env:JAVA_HOME = 'E:\dev\jdk21\jdk-21.0.2'
+$env:ANDROID_HOME = 'E:\dev\android-sdk'
 $env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
-Set-Location 'F:\徐事\dsh\dingding-go'
-.\gradlew.bat assembleDebug --console=plain
+Set-Location 'E:\dsh\dingding-go'
+.\gradlew.bat :app:assembleDebug --console=plain
+.\gradlew.bat :app:testDebugUnitTest --console=plain
 ```
 
-**注意**：项目路径含中文（`F:\徐事\dsh\dingding-go`），
-`gradle.properties` 里已加 `android.overridePathCheck=true` 才能构建。
-
+> **注意**：旧文档写的是 `F:\徐事\dsh\dingding-go`（含中文）与 JDK 17，
+> 那是更早一台机器的环境。当前机器路径纯英文、JDK 21，
+> `gradle.properties` 里的 `android.overridePathCheck=true` 已经不需要，但保留无害。
 ### 装机后的固定流程（每次 install -r 之后必须做）
 
 ```powershell
-$adb = 'C:\AndroidTools\platform-tools\adb.exe'
+$adb = 'E:\dev\android-sdk\platform-tools\adb.exe'
 $pkg = 'com.redmi.autoattend.debug'
 
 # 1. 重绑无障碍（install -r 会解绑）
@@ -798,6 +1009,68 @@ $base = "li.songe.gkd/com.google.android.accessibility.selecttospeak.SelectToSpe
 22. **动效参数必须集中定义** —— 之前缓动曲线散在 6 个文件里，
     还有 2 处残留 `spring()`，导致同一个"按下回弹"在两个组件里观感不同。
     统一到 `ui/theme/GlassMotion.kt` 后改一处即全局生效。
+
+### 第四轮（底栏手势，GUI 交互）
+
+23. **受限协程作用域里无法逐帧驱动动画 —— 这是本轮最大的教训**
+
+    `awaitEachGesture { }` 的 lambda 跑在 `AwaitPointerEventScope` 里，
+    它继承了 `RestrictedSuspendable`。任何挂起调用（`Animatable.snapTo`、
+    `animateTo`、`pager.scrollToPage`）都**不能直接调**，
+    编译器会报 `Restricted suspending functions can invoke ...`。
+
+    唯一出路是 `scope.launch { }` 逃逸，但 `launch` 是**异步调度**的：
+    手指移动 60 帧就排 60 个协程，它们被合并、被丢弃、互相取消 ——
+    视觉结果就是「卡顿一下然后瞬移」。
+
+    **结论：手势循环里只能写普通 state（`mutableFloatStateOf`），
+    不能写 `Animatable`。** 普通 state 的写入是同步的，本帧写完下帧必渲染。
+
+24. **`Animatable` 是互斥的，多处并发写会互相打断**
+
+    同一帧里两个 `scope.launch` 都去 `animateTo` 同一个 `Animatable`，
+    后一个会**立刻取消**前一个。表现：放大动画播到一半被打断、
+    松手时位置动画和缩放动画互相取消导致闪烁。
+
+    真要多个动画并行，必须用**不同的 `Animatable`**（本轮拆成
+    `pressX` 与 `scaleAnim` 各管各的），或者放在同一个 `launch` 里用
+    `launch { }` 嵌套（子协程共享父作用域但互不取消）。
+
+25. **「交接」是这类 bug 的总根源 —— 能消除就别做交接**
+
+    本轮先后引入过 `pressX` / `isPressed` / `posJob` / `scaleJob` 等中间态，
+    每次都试图「按住期间自己管位置，松手再交还给 liveOffset」。
+    每一次都产生新的竞态：瞬移、回弹、复读、闪烁。
+
+    最后收敛到**单一数据源**才彻底干净。教训：
+    两个位置源之间的交接，无论怎么调整顺序都有窗口期；
+    正确做法是让其中一个彻底不参与位置计算。
+
+26. **`snapTo` 在 `isPressed = true` 之前调用会渲染一帧旧值**
+
+    即使顺序写对了，`snapTo` 是挂起函数，`isPressed = true` 会先触发重组，
+    这一帧读到的还是 `pressX` 的旧值（初始 `0f` = 首页位置）。
+    在设置页长按 → 指示器先闪到首页再滑回来，就是这个原因。
+
+    修法：用 `launch(start = CoroutineStart.UNDISPATCHED)`，
+    保证 `snapTo` 在本帧内同步完成，中间不插空帧。
+
+27. **父级 `pointerInput` 与子级 `Clickable` 会双触发**
+
+    底栏 Row 上挂了 `pointerInput`，每个 tab 子项又挂了 `ClickableNoRipple`，
+    一次点按会**同时**触发两者 → 第一次切过去、第二次切回来，
+    用户必须点两次才生效。
+
+    修法：统一由父级手势处理（根据 `touchSlop` 区分点按与拖拽），
+    子项不挂任何点击修饰符。
+
+28. **`adb input` 测试底栏坐标必须落在胶囊内**
+
+    底栏是 0.56 屏宽的居中胶囊。1280 屏宽下胶囊约 x=300–1000，
+    两半中心约 **x=475 / x=830**（y=2694）。
+    用 x=900 测试会得到一堆假失败 —— 那不是代码问题，是测试点超出了
+    Row 的局部坐标范围。**别拿错坐标当 bug 修**（本轮因此浪费了数轮）。
+
 ---
 
 ## 12. 第三轮：代码审计与修复（未跑真机）
