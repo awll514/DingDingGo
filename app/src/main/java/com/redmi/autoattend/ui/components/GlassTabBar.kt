@@ -194,6 +194,34 @@ fun GlassTabBar(
     /** 指示器位移时长：iOS 的 tab 切换约 350~450ms */
     val INDICATOR_MOVE_MS = 420
 
+
+
+    /**
+     * 指示器**平移**专用缓动。
+     *
+     * ## 为什么不能直接用 IosEaseOut
+     *
+     * 那条曲线（cubic-bezier(0.32, 0.72, 0, 1)）对**整体位移**来说太陡：
+     * 实测输出
+     *
+     *     t=0.083 → 已走 21.6%
+     *     t=0.200 → 已走 65.6%
+     *     t=0.300 → 已走 84.7%
+     *     t=0.500 → 已走 95.5%
+     *
+     * 也就是说位移的 2/3 在前 1/5 时间里就冲完了 ——
+     * 人眼感知成「啪一下弹过去，后面才慢慢蹭完」，即用户说的「抽搐」。
+     *
+     * 它适合 opacity / 缩放这类**局部变化**，不适合整段位移。
+     *
+     * ## 现在这条
+     *
+     * cubic-bezier(0.25, 0.10, 0.25, 1.00)（CSS ease 的近亲，更平缓）：
+     * 起步柔和、中段匀速、尾段收得干净，全程速度变化不突兀。
+     */
+    val IndicatorEase = androidx.compose.animation.core
+        .CubicBezierEasing(0.25f, 0.10f, 0.25f, 1.00f)
+
     /** 液滴拉伸（抻开）时长 */
     val STRETCH_MS = 260
 
@@ -329,7 +357,7 @@ fun GlassTabBar(
     val glowAnim = remember { Animatable(0f) }
 
     /**
-     * 点击切换时**指示器自己的平移动画**（覆盖 liveOffset 抢跑的问题）。
+     * 点击切换时**指示器自己的平移动画**（由 Compose 框架驱动，不丢帧）。
      *
      * ## 为什么必须有它
      *
@@ -359,6 +387,35 @@ fun GlassTabBar(
 
     /** 当前平移任务的句柄，重复点击时取消上一段 */
     var slideJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+
+    /**
+     * 当前平移任务的唯一令牌。
+     *
+     * 被顶替的旧协程在 finally 里必须**先比对令牌**再清理，
+     * 否则会把后一段动画刚写好的状态抹掉（渲染闪回旧位置一帧 = 抽搐）。
+     * 详见 slideToX 的注释。
+     */
+    var slideToken by remember { mutableStateOf<Any?>(null) }
+
+    /**
+     * 指示器平移的真值来源（由 Compose 动画时钟驱动）。
+     *
+     * 用 Animatable 而不是「普通 float state + withFrameNanos 手工插值」，
+     * 因为后者在主线程繁忙时会丢帧，而插值按真实时间算 →
+     * 一掉帧就出现「卡一下然后暴冲一大段」，即用户说的抽搐。
+     *
+     * Animatable 由框架补偿，视觉上始终连续。
+     */
+    val slideAnim = remember { Animatable(0f) }
+
+    /**
+     * 是否有正在进行的平移动画。
+     *
+     * 之前是「slideX 是否 NaN」，现在改用动画是否在跑来判断。
+     * 用 Animatable 的 isRunning 比维护一个 NaN 哨兵更可靠 ——
+     * 哨兵的清理时机在协程 finally 里，容易和其它逻辑抢。
+     */
+    fun isSliding(): Boolean = slideAnim.isRunning
 
     // ==================== 拖拽跟手位置（同步 state）====================
     //
@@ -485,31 +542,117 @@ fun GlassTabBar(
         val to = toX
         if (abs(to - from) < 1f) return
         if (barWidthPx == 0) return
+        // ============ 任务令牌：解决"抽搐"的真凶 ============
+        //
+        // ## 抽搐是怎么来的
+        //
+        // 旧写法：先 cancel() 上一段，再同步写 slideX = from，然后 launch 新的。
+        // 看起来没问题，实际有 1 帧的空窗：
+        //
+        //   cancel() 不是立即生效 —— 旧协程要在下一个挂起点
+        //   （withFrameNanos）抛 CancellationException 才进 finally。
+        //   而那一刻**新任务已经把 slideX 写成 from 了**，
+        //   旧任务的 finally 却无条件执行 slideX = Float.NaN，
+        //   把新的起点抹掉 → 渲染回落到 liveOffset（还是旧页）→
+        //   指示器闪回旧位置一帧 → 视觉上就是「抽搐一下」。
+        //
+        // 点击和长按松手都会连续调用两次 slideToX（按下一次、松手一次），
+        // 所以两个场景都抽搐。
+        //
+        // ## 修法
+        //
+        // 每次调用生成唯一 token。协程的 finally 只有在
+        // 「自己仍是当前任务」时才允许清理状态，
+        // 被顶替的旧任务直接静默退出。
+        val myToken = Any()
+        slideToken = myToken
         if (slideJob != null && slideJob!!.isActive) slideJob?.cancel()
-        // 【关键】同步写入，本帧立刻可见。绝不放进 launch 里 await。
-        // 同步写入起点：本帧就生效，不会出现"上一段动画的残留位置闪一下"
+        // 同步写入起点，本帧立刻可见
         slideX = from
+        scope.launch { slideAnim.snapTo(from) }
+        // ============ 用 Animatable 承载位置，不是手写 withFrameNanos 循环 ============
+        //
+        // ## 手写循环的真实毛病：丢帧导致起步暴冲
+        //
+        // 实测日志（dur=620ms）：
+        //
+        //     t=0.027  el=16ms   ease=0.014
+        //     t=0.255  el=158ms  ease=0.420   ← 两帧之间隔了 141ms！
+        //
+        // 第一帧到第二帧有 141ms 空档（正常 16ms），这段时间 t 从 0.027
+        // 冲到 0.255，位移一次走掉 40%。用户看到的就是
+        // 「先抽搐一下，剩下的慢慢滑」。
+        //
+        // 根因：withFrameNanos 跑在普通协程里，帧回调会被主线程其它工作推迟，
+        // 而 t 按真实经过时间算 —— 一推迟，下次回调就把积压时间一次性折算成位移。
+        //
+        // ## Animatable 为什么没有这个问题
+        //
+        // 它由 Compose 动画时钟驱动，与合成器同频；即使偶发掉帧，
+        // 框架按目标值插值补偿，不会「卡一帧然后暴冲」。
         slideJob = scope.launch {
             try {
-                withFrameNanos { }
-                val start = withFrameNanos { it }
-                var done = false
-                while (!done) {
-                    withFrameNanos { now ->
-                        val elapsed = (now - start) / 1_000_000f
-                        val t = (elapsed / durationMs.toFloat()).coerceIn(0f, 1f)
-                        slideX = from + (to - from) * IosEaseOut.transform(t)
-                        if (t >= 1f) done = true
+                // ============ 等主线程喘息，再启动动画 ============
+                //
+                // ## 抽搐的真正根因（实测数据）
+                //
+                // 采样 slideAnim.value（dur=620ms）：
+                //
+                //     seq = 53, 53, 182, 203, 213, ...
+                //
+                // 第 1 帧到第 2 帧之间隔了 **136ms**（正常 16ms），
+                // 相当于主线程被占用 8 帧。这期间动画按真实时间推进，
+                // 下一帧一次性补上 → 从 53 直接蹦到 182（跳 129px）。
+                //
+                // ## 谁阻塞了主线程
+                //
+                // 不是动画本身。点击切页时，**目标页要首次合成** ——
+                // 设置页有多个液态玻璃面板（AGSL 着色器），
+                // 首帧渲染开销就是 100ms 量级。
+                // 指示器动画和它抢同一帧，必然被拖累。
+                //
+                // ## 所以正确做法不是调曲线，是**等它忙完再动**
+                //
+                // 轮询帧间隔，连续两帧都在 20ms 内（说明主线程已恢复），
+                // 才开始平移。等待期间指示器稳定停在 from，不会跳。
+                //
+                // 视觉上是「点一下，指示器稍顿一下，然后从容滑过去」——
+                // 这正是 iOS 的手感：先确认收到，再开始运动。
+                // 比「先抽搐再滑」好得多。
+                slideAnim.snapTo(from)
+                var prevFrame = withFrameNanos { it }
+                var stableWait = 0f
+                while (stableWait < 20_000_000f) {
+                    val nf = withFrameNanos { it }
+                    val gapMs = (nf - prevFrame) / 1_000_000f
+                    prevFrame = nf
+                    // 连续两帧间隔 < 24ms 视为主线程已恢复
+                    if (gapMs < 24f) {
+                        val nf2 = withFrameNanos { it }
+                        val gap2 = (nf2 - prevFrame) / 1_000_000f
+                        prevFrame = nf2
+                        if (gap2 < 24f) break
                     }
+                    stableWait += 16f
                 }
+                slideAnim.animateTo(
+                    to,
+                    animationSpec = tween(
+                        durationMillis = durationMs,
+                        easing = IndicatorEase,
+                    ),
+                )
+
                 // 落点对齐：让 xAnim 记录最终位置，供下一次 currentRenderX() 使用
                 xAnim.snapTo(to)
-                // 【关键】把结果记进 settledX 而不是丢弃 ——
-                // 否则渲染立刻回落到 liveOffset（旧页），指示器当场跳回去。
+                // 把结果记进 settledX，否则渲染回落到 liveOffset（旧页）会当场跳回去
                 settledX = to
             } finally {
-                slideX = Float.NaN
-                slideJob = null
+                // 【只在仍是当前任务时清理】否则会抹掉后一段动画的状态
+                if (slideToken === myToken) {
+                    slideX = Float.NaN
+                    slideJob = null
+                }
             }
         }
     }
@@ -660,25 +803,24 @@ fun GlassTabBar(
         val byDrag = pendingSwipeSettle
         pendingSwipeSettle = false
 
-        // ============ 点击切换的收尾 ============
+        // ============ 收尾 ============
         //
-        // 平移动画**不在这里**启动 —— 这个 LaunchedEffect 要等
-        // selectedIndex 回写（620ms 翻页动画结束）才跑，
-        // 那时指示器已经被 liveOffset 带到位了，再动画等于原地重播（无可见位移）。
-        // 真正的启动点在手势松手处（见 pointerInput 里 slideTo()）。
+        // 【不要再 snapTo xAnim】这里曾经有一段
         //
-        // 这里只做一件事：把内部记录位置对齐到最终值，供下一次计算使用。
-        if (!byDrag) {
-            scope.launch { xAnim.snapTo(centerXFor(selectedIndex)) }
-        }
-
-        settleTo(
-            index = selectedIndex,
-            fromX = xAnim.value,
-            // 一律不拉伸：拖拽已有跟手位置，点击有专属平移动画，
-            // 再叠液滴拉伸会变成"移动 + 拉伸"两段动作。
-            stretch = false,
-        )
+        //     if (!byDrag) scope.launch { xAnim.snapTo(centerXFor(selectedIndex)) }
+        //
+        // 意图是「把内部记录位置对齐到最终值」，但它会**打断正在播放的
+        // 平移动画**：点击的 slideToX 是 420ms，而 selectedIndex 在
+        // pager 翻页（620ms）结束时才回写 —— 两个时间点不重合，
+        // 有时动画还没播完 xAnim 就被瞬移到终点，
+        // 下一帧 slideToX 的落点又写回来 → 视觉上抽搐一下。
+        //
+        // 现在落位完全由 slideToX 负责（它结束时会 xAnim.snapTo(to)），
+        // 这里不再插手位置，只处理缩放/发光等**视觉状态**的收敛。
+        scope.launch { scaleAnim.snapTo(1f) }
+        scope.launch { glowAnim.snapTo(0f) }
+        scope.launch { wAnim.snapTo(indicatorWidthPx) }
+        scope.launch { hAnim.snapTo(indicatorHeightPx) }
 
         // ============ 交接：pressX → liveOffset ============
         //
@@ -1160,7 +1302,7 @@ fun GlassTabBar(
                     // 若让 liveOffset 抢跑，指示器就没有可感知的过渡。
                     val cx = when {
                         !pressX.isNaN() -> pressX
-                        !slideX.isNaN() -> slideX
+                        isSliding() -> slideAnim.value
                         !settledX.isNaN() -> settledX
                         liveOffset != null -> offsetToX(liveOffset)
                         else -> xAnim.value
