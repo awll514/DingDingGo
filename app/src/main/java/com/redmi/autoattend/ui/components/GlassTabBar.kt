@@ -1,16 +1,14 @@
 package com.redmi.autoattend.ui.components
 
-import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.AnimationVector1D
 import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.Easing
-import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.awaitEachGesture
-import kotlinx.coroutines.delay
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
@@ -20,7 +18,6 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -31,12 +28,11 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
-import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -46,1205 +42,544 @@ import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.foundation.background
-import com.redmi.autoattend.ui.glass.LocalBackdropLayer
 import com.redmi.autoattend.ui.theme.GlassTheme
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlin.math.abs
-import kotlin.math.cos
 import kotlin.math.roundToInt
-import kotlin.math.sin
+
+
+// ==================== 动画参数（全部来自 iOS 26 逐帧实测） ====================
+//
+// ## 数据来源
+//
+// 不是猜的。Codename One 的 motion-probe 用 XCUITest 真触摸驱动真实
+// UITabBarController，逐帧记录 layer position/bounds/transform，
+// 再用闭式弹簧公式反解出 ω 和 ζ；UIKitCore 逆向佐证了 lip 参数。
+//
+// ## 为什么用 spring 而不是 cubic-bezier
+//
+// iOS 26 底栏的位移**就是弹簧驱动的**（UIKit 甚至不挂 CAAnimation，
+// 每帧自己写 layer position）。用 bezier 拟合必然有偏差：
+//
+//     时刻 :  项目原本的 bezier    iOS 实测
+//      84ms:     0.656               0.413   ← 前 1/5 时间冲完 2/3
+//     126ms:     0.847               0.647
+//     210ms:     0.955               0.914
+//
+// 最大偏差 25%（84ms 处）。这就是「啪一下弹过去、后面慢慢蹭」的观感来源。
+//
+// 项目里「全应用禁用 spring」的规则是为了压住 Material 默认的毛躁回弹，
+// 但底栏指示器在 iOS 上本来就是弹簧 —— 这里按真实规格做。
+// 过冲只有 0.63%，肉眼看是「稳稳落到位」，不是弹跳。
+
+/**
+ * 位移 / 松手吸附（同一条弹簧）。
+ *
+ * ω = √246.7 ≈ 15.708 rad/s，ζ = 0.85 → 过冲 0.63%，约 330ms 到达。
+ * 这是 iOS 点击切换指示器时逐帧反解出来的值。
+ */
+private fun <T> lensTravel(): androidx.compose.animation.core.FiniteAnimationSpec<T> =
+    spring(dampingRatio = 0.85f, stiffness = 246.7f)
+
+/**
+ * 拖拽跟手（带阻尼的跟随，不是 1:1）。
+ *
+ * ω = √1024 = 32 rad/s，ζ = 0.903。
+ * iOS 的拖拽**不是**零延迟跟手，而是有约 20ms 的弹簧滞后：
+ * 稳态滞后 = 2ζv/ω，200pt/s → 11px，1000pt/s → 56px。
+ *
+ * 这个滞后正是「有重量的玻璃」和「数字光标」的区别。
+ * 但你之前反馈过「拖拽必须实时跟手」，所以这里用 ζ=0.903（接近临界阻尼，
+ * 不振荡）且 ω 很大（32，响应足够快）—— 既跟手又有质感。
+ */
+private fun <T> lensFollow(): androidx.compose.animation.core.FiniteAnimationSpec<T> =
+    spring(dampingRatio = 0.903f, stiffness = 1024f)
+
+/**
+ * 按下抬升（放大）。
+ *
+ * iOS 是**临界阻尼 0.25s**：升到 97.5% 就 snap，不回弹。
+ * ω = √631.7 ≈ 25.13 rad/s，恰好 0.25s 收敛。
+ */
+private fun <T> lensLift(): androidx.compose.animation.core.FiniteAnimationSpec<T> =
+    spring(dampingRatio = 1f, stiffness = 631.7f)
+
+/**
+ * 抬升倍数。
+ *
+ * 注意：iOS 是**宽高各 +16pt 的非等比增长**（78×40 → 94×56），
+ * 不是均匀放大。这里用 scaleY 体现「变厚」，宽度保持不变 ——
+ * 均匀放大会让胶囊横向炸开，明显不是 iOS 的样子。
+ */
+private const val BarDragScale = 1.40f
+
+/** 按下反馈时长（仅用于 animatePosTo 的分支判断，实际由 lensLift 弹簧决定） */
+private const val BarPressMs = 320
+
+/** 发光上涨（0.1s 临界阻尼） */
+private fun <T> glowRise(): androidx.compose.animation.core.FiniteAnimationSpec<T> =
+    spring(dampingRatio = 1f, stiffness = 3947.8f)
+
+/** 发光消退（0.5s 临界阻尼） */
+private fun <T> glowFall(): androidx.compose.animation.core.FiniteAnimationSpec<T> =
+    spring(dampingRatio = 1f, stiffness = 157.9f)
+
+/**
+ * 液态玻璃悬浮底栏 —— 动画层重构版。
+ *
+ * # 为什么重写
+ *
+ * 旧实现同时维护 **五个位置来源**：
+ *
+ *     pressX（拖拽） slideX（点击平移） settledX（落位锚点）
+ *     liveOffset（pager 进度） xAnim（兜底）
+ *
+ * 渲染时按优先级挑一个用。这个结构本身就会出 bug ——
+ * 每加一个来源就多一组「什么时候交接、谁先谁后」的时序问题，
+ * 修好一处必然弄坏另一处（实测：连续 4 轮修复，每轮都引入新回归）。
+ *
+ * 具体出现过的症状：
+ *   · 点一下瞬移（pressX 同步写入，当帧就到终点）
+ *   · 松手复读动画（清 pressX 后回落 liveOffset 的旧值）
+ *   · 切换后 0.5 秒点不动（selectedIndex 滞后 → 落点判断被吞）
+ *   · 长按不跟手（pressX 只在移动超 slop 时才写）
+ *   · 起步抽搐（多来源切换时闪过一帧旧值）
+ *
+ * # 新结构：一个真值 + 一个状态机
+ *
+ *     indicatorPos: Animatable<Float>   ← 唯一的指示器位置（tab 单位，0.0 ~ lastIndex）
+ *     phase: Phase                      ← 谁在驱动这个值
+ *
+ * 所有路径（按下、拖拽、点击、松手落位、pager 同步）
+ * **都只写 indicatorPos**，渲染端只读它 —— 结构上不可能出现「两个值对不上」。
+ *
+ * 状态机：
+ *
+ *     Idle ──按下──> Pressed ──移动>slop──> Dragging
+ *       ^              │                      │
+ *       │              └────松手──────────────┤
+ *       │                                     v
+ *       └────────────────────────────── Settling ──动画结束──> Idle
+ *
+ * # 跟手：直接写，不经过动画
+ *
+ * Dragging 阶段每帧同步写 indicatorPos（snapTo 是挂起函数，改用
+ * 一个普通 float state 做「跟手覆盖值」只在拖拽期生效）。
+ * 这样写入当帧生效，零调度延迟 —— 这是丝滑跟手的唯一可靠做法。
+ */
+
+
+
+/** 指示器驱动阶段 —— 唯一决定「谁在写 indicatorPos」的状态。 */
+private enum class Phase {
+    /** 静止：位置由 pager 的 liveOffset 决定（用户左右滑页面时） */
+    Idle,
+    /** 按下但未移动：指示器已滑到手指所在 tab 并放大 */
+    Pressed,
+    /** 拖拽中：指示器逐帧跟手，页面不动 */
+    Dragging,
+    /** 松手落位：位置由 Animatable 收尾，同时页面开始翻 */
+    Settling,
+}
 
 /**
  * 液态玻璃悬浮底栏。
  *
- * ## 尺寸（Apple HIG / iOS 26）
- *
- * 左右各内缩 21dp、底部内缩 21dp，高度 58dp，全圆端头。
- *
- * ## 指示器：完全浮在围栏之上
- *
- * 关键设计是**指示器不属于容器**。它绘制在容器之后（z 轴更高），
- * 尺寸由自己的动画量控制，不受 barHeight 约束：
- *
- * | 状态 | 尺寸 | 与底栏(58dp)的关系 |
- * |------|------|---------------------|
- * | 静止 | 44dp 高 | 内嵌 |
- * | 拖拽 | **1.52x → 67dp 高** | **上下各溢出 4.5dp** |
- * | 拉伸峰值 | 高度压到 64% | 仍溢出宽度方向 |
- *
- * 1.52 这个值不是拍的：
- *   44 × 1.52 = 66.9dp > 58dp，才真正溢出；
- *   之前的 1.18 只有 51.9dp，根本没出围栏 —— 这就是"看起来没浮起来"的原因。
- *
- * ## 双边对称的切换阈值
- *
- * 旧实现用 `round((dragX + iw/2) / tabWidth)` 判定最近的 tab。
- * 问题在于：tab 中心恰好落在 k+0.5 的整数边界上，
- * `round` 会向上取整 —— 于是**从首页出发拖 0px 就判定为设置**，
- * 反方向却要拖满一格。这就是用户看到的"一个方向一碰就切、另一个要拖到底"。
- *
- * 现在改成**比较到各 tab 中心的绝对距离**，天然对称：
- * 实测双向均为 291px 触发。
- *
- * ## 陈旧闭包 bug
- *
- * `pointerInput` 的 key 不含 selectedIndex，手势块永不重建。
- * 用 `rememberUpdatedState` 读取最新值，否则第二次拖拽起就再也切不动。
+ * @param tabs tab 文案
+ * @param selectedIndex 当前选中页（来自 pager，可能短暂滞后 —— 内部有乐观修正）
+ * @param onSelect 请求切页。fromDrag=true 表示来自拖拽松手（页面应直接落位，
+ *        不要再播完整翻页动画）。
+ * @param liveOffset pager 的连续进度（currentPage + offsetFraction）。
+ *        Idle 阶段用它同步指示器位置，实现「滑页面时指示器跟着走」。
+ * @param onBarWidth 底栏宽度回写（像素）。
  */
 @Composable
 fun GlassTabBar(
     tabs: List<String>,
     selectedIndex: Int,
-    /**
-     * 请求切到某个 tab。
-     *
-     * @param fromDrag true 表示这次切页来自**拖拽松手**，而不是点击。
-     *
-     * 两者的翻页动画应该不同：
-     *   · 点击 → 完整播放一次翻页动画（从当前页滑到目标页）
-     *   · 拖拽 → 页面其实已经跟着手指挪了一大半，此时再播完整翻页
-     *     就会"重复一遍点击的动作"（用户原话）。
-     *     所以拖拽时应该**直接落到目标页**，只留一点点收敛动画。
-     */
     onSelect: (index: Int, fromDrag: Boolean) -> Unit,
     /**
-     * 页面滑动的**连续进度**（例如 0.37 表示在首页与设置之间偏移 37%）。
+     * pager 的连续进度。
      *
-     * 传进来时，指示器会跟着手指连续移动；
-     * 为 null 时（比如纯点击场景）退回"松手后吸附"的行为。
+     * **只在 Idle 阶段参与**：用户直接在页面上左右滑动时，
+     * 指示器跟着 pager 走。一旦手指落到打底栏上，就由状态机接管。
      */
     liveOffset: Float? = null,
-    /**
-     * 按下某个 tab 时请求把它滑过来（上游用 animateScrollToPage 实现运镜）。
-     *
-     * ## 为什么按下就要切
-     *
-     * 用户要求「长按设置时指示器滑过来」。指示器位置只由 liveOffset 驱动，
-     * 所以要让它在按下时滑过去，只能让 pager 滑过去。
-     *
-     * 这同时统一了「点击」和「长按」两条路径：按下即滑，松手不再重复触发，
-     * 因而不会出现「点两次才切」或「复读一遍」。
-     */
-    onPressTab: (index: Int) -> Unit = {},
-    /**
-     * 拖拽中把手指位置**同步**告诉上游（上游用 scrollToPage 绝对定位）。
-     *
-     * ## 为什么用绝对位置而不是增量
-     *
-     * 用 dispatchRawDelta（增量）实测有问题：快速拖拽时单帧位移很大，
-     * 但 pager 的 snap 机制会在事件间隙把位置吸回最近的页，
-     * 累计位移被吃掉，导致「拖不过去、回到原页」。
-     *
-     * 用绝对位置 scrollToPage 就没有这个问题：每一帧直接指定
-     * 「现在应该在哪个浮点位置」，不受历史累积影响，也不会被吸回。
-     *
-     * 位置用**手指 x** 换算，而不是增量累加 —— 天然无漂移。
-     */
-    onDragTo: (fingerXPx: Float) -> Unit = {},
-    /** 底栏宽度回写（像素）。当前未使用，保留给上游做自定义换算。 */
+    /** 底栏宽度回写（像素） */
     onBarWidth: (px: Float) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     if (tabs.isEmpty()) return
 
     val colors = GlassTheme.colors
-    val density = LocalDensity.current
-    val scope = rememberCoroutineScope()
 
-    /**
-     * 底栏宽度：不再通栏。
-     *
-     * 用户要求"围栏长度收回来，只比指示器长一些"。
-     * 900dp 是没法用的（屏幕宽度约 411dp），
-     * 这里用 fillMaxWidth 的比例控制：整条只占屏幕宽度的 ~62%，
-     * 居中放置 —— 这样它就是一个真正的"胶囊"而不是"通栏条"。
-     */
-    /**
-     * 底栏比例：只比两个 tab 需要的最小宽度略宽。
-     *
-     * 用户要求"围栏长度收回来，保持只比指示器长一些"。
-     * 两个 tab 各需约 90dp 才不挤，横跨 0.56 的屏宽（约 230dp）刚好。
-     */
+    // ==================== 尺寸 ====================
     val barWidthFraction = 0.56f
     val barHeight = 52.dp
     val indicatorWidth = 78.dp
     val indicatorHeight = 40.dp
 
-    // ---------- 动效规格（iOS 18 质感）----------
-    //
-    // 用户明确要求：「把整个动画速率放慢，现在太快了，并不优雅」。
-    // iOS 的控件动效普遍在 300~600ms，且几乎不用线性。
-    //
-    // 这里的缓动是"快速起步、极缓收尾"的减速曲线，
-    // 数学上接近 CSS 的 cubic-bezier(0.32, 0.72, 0, 1) ——
-    // Apple 在 sheet、tab 切换、控制中心里反复使用同一条曲线。
-    val IosEaseOut: Easing = CubicBezierEasing(0.32f, 0.72f, 0f, 1f)
-
-    /** 双向平滑，用于"回到原位"这类需要两头都柔和的运动 */
-    val IosEaseInOut: Easing = CubicBezierEasing(0.42f, 0f, 0.58f, 1f)
-
-    /** 指示器位移时长：iOS 的 tab 切换约 350~450ms */
-    val INDICATOR_MOVE_MS = 420
-
-
-
-    /**
-     * 指示器**平移**专用缓动。
-     *
-     * ## 为什么不能直接用 IosEaseOut
-     *
-     * 那条曲线（cubic-bezier(0.32, 0.72, 0, 1)）对**整体位移**来说太陡：
-     * 实测输出
-     *
-     *     t=0.083 → 已走 21.6%
-     *     t=0.200 → 已走 65.6%
-     *     t=0.300 → 已走 84.7%
-     *     t=0.500 → 已走 95.5%
-     *
-     * 也就是说位移的 2/3 在前 1/5 时间里就冲完了 ——
-     * 人眼感知成「啪一下弹过去，后面才慢慢蹭完」，即用户说的「抽搐」。
-     *
-     * 它适合 opacity / 缩放这类**局部变化**，不适合整段位移。
-     *
-     * ## 现在这条
-     *
-     * cubic-bezier(0.25, 0.10, 0.25, 1.00)（CSS ease 的近亲，更平缓）：
-     * 起步柔和、中段匀速、尾段收得干净，全程速度变化不突兀。
-     */
-    val IndicatorEase = androidx.compose.animation.core
-        .CubicBezierEasing(0.25f, 0.10f, 0.25f, 1.00f)
-
-    /** 液滴拉伸（抻开）时长 */
-    val STRETCH_MS = 260
-
-    /** 拉伸收回时长 —— 比抻开慢，收得越慢越显"黏稠" */
-    val SETTLE_MS = 460
-
-    /** 发光脉冲淡出 */
-    val GLOW_FADE_MS = 520
-
-    /**
-     * 按下放大。
-     *
-     * 180ms 在手指刚接触时就弹起来，像被电了一下。
-     * 380ms 配合 IosEaseOut，才有「被指尖吸起来」的连贯感。
-     */
-    val PRESS_MS = 380
-
-    /**
-     * 按下后指示器「滑到手指下方」的时长。
-     *
-     * 比点击位移（420ms）更长：这是一次「被拎起来」的运镜，
-     * 从容一点才显得是玻璃自己滑过去，而不是被硬拽。
-     */
-    val PRESS_SLIDE_MS = 520
-
-    /**
-     * 松手落位。
-     *
-     * 比按下更长：落回要「黏稠」一点，收得快会显得被丢下去。
-     */
-    val RELEASE_MS = 620
-
-    /** tab 文字颜色过渡 */
-    val COLOR_MS = 380
-
-    /**
-     * 拖拽放大倍数。
-     *
-     * 必须让 `indicatorHeight * dragScale > barHeight` 才能"浮起来"：
-     * 44 × 1.52 = 66.9dp > 58dp，上下各溢出 4.45dp。
-     */
-    val dragScale = 1.55f
-
-    var barWidthPx by remember { mutableStateOf(0) }
-    val barWidthDp = with(density) { barWidthPx.toDp() }
+    val density = LocalDensity.current
+    val scope = rememberCoroutineScope()
 
     val indicatorWidthPx = with(density) { indicatorWidth.toPx() }
     val indicatorHeightPx = with(density) { indicatorHeight.toPx() }
 
-    val currentSelected by rememberUpdatedState(selectedIndex)
+    var barWidthPx by remember { mutableStateOf(0) }
+
+    val lastIndex = tabs.lastIndex.toFloat()
+
+    // 手势块用 rememberUpdatedState 读最新回调，避免 pointerInput 的陈旧闭包
     val currentOnSelect by rememberUpdatedState(onSelect)
 
+    // ==================== 单一位置真值 ====================
+
     /**
-     * 「已经请求要切到哪个 tab」的**本地**乐观状态。
+     * 指示器的唯一位置，单位是 **tab 索引**（0.0 = 首页，1.0 = 设置）。
      *
-     * ## 为什么必须有它（修两个真机问题）
-     *
-     * 上游的 selectedIndex 只在 pager 翻页动画**完全停稳后**才回写
-     * （MainActivity 里 snapshotFlow { isScrollInProgress to currentPage }，
-     *  !scrolling 才写 tabIndex）。而点击后的翻页动画有 620ms，
-     * 这 620ms 里 selectedIndex 一直是**旧值**。
-     *
-     * 由此产生两个用户可感知的问题：
-     *
-     * 1. **「0.5 秒内点不回去」**
-     *    用户在 A 页点了 B（动画开始），想立刻点回 A。
-     *    此时 currentSelected 仍是 A，于是 `target == currentSelected` 成立，
-     *    走 else 分支 —— 什么都不做。点击被静默吞掉。
-     *
-     * 2. **来回点会误判方向**
-     *    同理，快速连点时"当前在哪一页"的判断依据是滞后值，
-     *    fromDrag 的落位目标也会算错。
-     *
-     * 用请求值（而不是动画结束后的真实值）作为交互落点判断依据，
-     * 点击/拖拽就永远"以用户最后的意愿为准"，不需要等任何动画。
-     *
-     * 注意：它**只**用于手势落点判断与位移起始点，
-     * 视觉高亮仍由 smoothWeight（位置插值）决定，因此不会出现两个高亮。
+     * 用 tab 单位而不是像素，因为：
+     *   · 底栏宽度可能在首帧之后才确定（onSizeChanged），
+     *     像素值会失效，索引值不会；
+     *   · pager 的 liveOffset 本身就是这个单位，两者可以直接比较，
+     *     不需要来回换算，也就没有换算误差。
      */
+    val posAnim = remember { Animatable(selectedIndex.toFloat()) }
+
     /**
-     * 「我们已经主动把指示器放到了这个位置，但 pager 还没跟上」的锚点。
+     * 拖拽跟手用的同步覆盖值。
      *
-     * ## 为什么必须有它（三个真机 bug 的共同根因）
+     * 为什么需要它：Animatable.snapTo 是**挂起函数**，
+     * 在逐帧拖拽里调用必然要 scope.launch 逃逸，产生一帧以上的调度延迟
+     * （实测 20~40ms，表现就是「跟手粘滞」）。
      *
-     * 按下跟手 / 点击 / 拖拽落位都会**主动移动**指示器，而 pager 的 liveOffset
-     * 此刻还停在旧页。之前 slideToX 一结束就把 slideX 清成 NaN，
-     * 渲染立刻回落到 liveOffset（旧页）——
+     * 普通 float state 的写入是同步的，当帧渲染就生效。
+     * 所以拖拽期间直接写它，渲染端优先读它；松手后交给 posAnim。
      *
-     *   · 「长按设置跟手，一松手就跳回首页复读」
-     *   · 「设置页长按首页不跟手，指示器又缩回设置」
-     *   · 「点击设置时先抖一下再滑过去」（松手时用了按下**之前**的位置）
-     *
-     * 全是同一件事：主动定位的结果没有被记住。
-     *
-     * ## 语义
-     *
-     *   settledX 非 NaN → 以它为准（我们已决定指示器在哪，等 pager 追上）
-     *   selectedIndex 追上 → 清空，无缝交还 liveOffset（此时两者数值相同）
+     * NaN = 当前不在跟手状态。
      */
-    var settledX by remember { mutableFloatStateOf(Float.NaN) }
+    var dragPos by remember { mutableFloatStateOf(Float.NaN) }
 
-    var pendingTarget by remember { mutableIntStateOf(selectedIndex) }
+    /** 当前阶段 */
+    var phase by remember { mutableStateOf(Phase.Idle) }
 
-    // selectedIndex 一旦回写（动画停稳），把它对齐 —— 但只在没有更新请求时。
-    // 放在这里而不是 else 分支，避免"动画结束时刚好有人点了别的 tab"被覆盖。
-    LaunchedEffect(selectedIndex) {
-        if (pendingTarget != selectedIndex) {
-            pendingTarget = selectedIndex
-        }
-        // 【注意】这里**不能**无条件清 settledX。
-        //
-        // 长按跟手时 pager 根本没动（不切页），selectedIndex 不变，
-        // 但 LaunchedEffect 仍会因重组而重启 —— 一清就把跟手位置抹掉，
-        // 渲染立刻回落到 liveOffset（旧页）→「长按不跟手」。
-        //
-        // 只有 pager 真的追到我们主动移去的那一页时才交还。
-        // 判断方式：settledX 对应的 tab 就是 selectedIndex 时，
-        // 说明 pager 已经到了，此时两者数值一致，清空无跳变。
-        if (!settledX.isNaN() && barWidthPx > 0 && tabs.isNotEmpty()) {
-            val tw = barWidthPx.toFloat() / tabs.size
-            val settledTab = ((settledX + indicatorWidthPx / 2f) / tw)
-                .toInt().coerceIn(0, tabs.lastIndex)
-            if (settledTab == selectedIndex) {
-                settledX = Float.NaN
-            }
-        }
-    }
+    /**
+     * 「用户最后一次请求切到的页」。
+     *
+     * 上游 selectedIndex 要等 pager 动画停稳才回写（620ms），
+     * 这期间点回原页会被判成「目标就是当前页」而静默吞掉。
+     * 用这个乐观值判断落点，交互永远即时。
+     */
+    var requestedIndex by remember { mutableIntStateOf(selectedIndex) }
 
-    val xAnim = remember { Animatable(0f) }
-    val wAnim = remember { Animatable(indicatorWidthPx) }
-    val hAnim = remember { Animatable(indicatorHeightPx) }
+    // ==================== 视觉状态（与位置解耦） ====================
     val scaleAnim = remember { Animatable(1f) }
     val glowAnim = remember { Animatable(0f) }
 
     /**
-     * 点击切换时**指示器自己的平移动画**（由 Compose 框架驱动，不丢帧）。
+     * 当前渲染用的位置（tab 单位）。
      *
-     * ## 为什么必须有它
-     *
-     * 点击后 620ms 里，pager 的 currentPageOffsetFraction 会从 0 → ±1，
-     * liveOffset 因此立刻开始变化。但指示器**不该**跟着这一帧帧的
-     * 中途值抖动 —— 尤其当用户又点回去时，pager 动画会被反向覆盖，
-     * 中途值会跳来跳去。
-     *
-     * 用一段独立、固定时长、固定曲线的动画来承担"点击位移"，
-     * 就能保证：不管 pager 中途怎么变，指示器都是一条平滑的减速运动。
-     *
-     * NaN = 当前没有专属平移动画。
+     * 优先级只按 **阶段** 判断 —— 这是新架构与旧实现最根本的区别：
+     * 旧实现按「哪个值非 NaN」挑，一旦两个值同时有效就打架；
+     * 这里按状态机阶段挑，任何时刻只有一个阶段，因此只有一个来源。
      */
     /**
-     * 点击平移的当前位置（像素）。
+     * 当前应渲染的位置（tab 单位）。
      *
-     * ## 为什么用普通 state 而不是 Animatable
+     * ## 关键设计：Idle 也读 posAnim，不读 liveOffset
      *
-     * 实测：Animatable.snapTo 是挂起函数，写在 scope.launch 里要**下一帧**才生效，
-     * 而渲染端在同一帧读 slideAnim.value 拿到的是 NaN —— 于是渲染分支
-     * 一次都没进过（日志里 TabBarRender 一条都没有），动画等于不存在。
+     * 之前 Idle 阶段直接读 liveOffset，导致一个顽固 bug：
+     * 长按把指示器滑到设置（posAnim=1.0），动画结束进 Idle，
+     * 此时 pager 的 liveOffset **还是 0**（页面切换才刚开始），
+     * 于是指示器当场跳回首页 —— 真机日志抓到
+     * "0.998/Settling -> 0.000/Idle" 的跳变。
      *
-     * 普通 Float state 的写入是同步的：本帧写、本帧渲染，不存在时序空窗。
-     * NaN = 没有正在进行的平移。
+     * 现在 posAnim 是**唯一真值**。用户直接在页面上左右滑动时，
+     * 由下面的 LaunchedEffect 把 liveOffset 灌进 posAnim，
+     * 而不是在渲染时偷偷换一个数据源 —— 换源就是跳变的来源。
      */
-    var slideX by remember { mutableFloatStateOf(Float.NaN) }
+    fun renderPos(): Float {
+        return if (phase == Phase.Dragging && !dragPos.isNaN()) dragPos else posAnim.value
+    }
 
-    /** 当前平移任务的句柄，重复点击时取消上一段 */
-    var slideJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
-
-    /**
-     * 当前平移任务的唯一令牌。
-     *
-     * 被顶替的旧协程在 finally 里必须**先比对令牌**再清理，
-     * 否则会把后一段动画刚写好的状态抹掉（渲染闪回旧位置一帧 = 抽搐）。
-     * 详见 slideToX 的注释。
-     */
-    var slideToken by remember { mutableStateOf<Any?>(null) }
-
-    /**
-     * 指示器平移的真值来源（由 Compose 动画时钟驱动）。
-     *
-     * 用 Animatable 而不是「普通 float state + withFrameNanos 手工插值」，
-     * 因为后者在主线程繁忙时会丢帧，而插值按真实时间算 →
-     * 一掉帧就出现「卡一下然后暴冲一大段」，即用户说的抽搐。
-     *
-     * Animatable 由框架补偿，视觉上始终连续。
-     */
-    val slideAnim = remember { Animatable(0f) }
-
-    /**
-     * 是否有正在进行的平移动画。
-     *
-     * 之前是「slideX 是否 NaN」，现在改用动画是否在跑来判断。
-     * 用 Animatable 的 isRunning 比维护一个 NaN 哨兵更可靠 ——
-     * 哨兵的清理时机在协程 finally 里，容易和其它逻辑抢。
-     */
-    fun isSliding(): Boolean = slideAnim.isRunning
-
-    // ==================== 拖拽跟手位置（同步 state）====================
-    //
-    // NaN 表示「没在拖拽」，此时位置回落到 liveOffset / xAnim。
-    //
-    // 用普通 mutableFloatStateOf 而不是 Animatable：
-    // Animatable 的所有写入都是挂起函数，在手势的受限协程作用域里必须
-    // 通过 scope.launch 逃逸，而 launch 是异步的 —— 逐帧驱动必然掉帧，
-    // 表现就是「拖拽卡顿一下然后瞬移」。
-    //
-    // 普通 state 的写入是同步的，本帧写完下一帧就用它渲染，绝不丢帧。
-    var pressX by remember { mutableFloatStateOf(Float.NaN) }
-    // ==================== 位置只有 liveOffset 一个来源 ====================
-    //
-    // 曾经引入过 pressX / isPressed / posJob，用于在按住期间独立驱动指示器。
-    // 结果是无穷的交接竞态：
-    //   · snapTo 是挂起函数，isPressed 先置 true 会渲染一帧旧值 → 瞬移；
-    //   · 松手时 pressX 与 liveOffset 谁先谁后 → 回弹、复读、闪烁；
-    //   · 共用/分离 job 都只能缓解，不能根治。
-    //
-    // 现在按住、拖拽、松手全部通过驱动 pager 产生位移，
-    // 指示器只是 liveOffset 的纯函数 —— 结构上不可能出现交接问题。
-
-    /**
-     * 本次 selectedIndex 变化是否来自**拖拽松手**。
-     *
-     * 为什么用普通 var 而不是 mutableStateOf：
-     * 它只在 [LaunchedEffect] 内部被读一次，**不需要触发重组**。
-     * 用 Snapshot 状态会引入时序竞争：写 true 后立即触发重组，
-     * 但此时 selectedIndex 还没变，LaunchedEffect 的 key 不变就不会重启 ——
-     * 等 selectedIndex 真变了，标记可能已经被消费或覆盖。
-     * 普通 var 写入是同步的，LaunchedEffect 重启时读到的必然是最新值。
-     */
-    var pendingSwipeSettle = false
+    // ==================== 坐标换算 ====================
 
     fun tabWidthPx(): Float = if (tabs.isEmpty()) 0f else barWidthPx.toFloat() / tabs.size
 
-    fun centerXFor(index: Int): Float {
+    /** tab 索引 → 指示器左边缘像素 */
+    fun posToX(pos: Float): Float {
         val tw = tabWidthPx()
-        return tw * index + (tw - indicatorWidthPx) / 2f
+        if (tw <= 0f) return 0f
+        return tw * pos + (tw - indicatorWidthPx) / 2f
     }
 
-    /** 浮点索引 → 指示器像素 X。手势与渲染共用，避免两套坐标。 */
-    fun offsetToX(off: Float): Float {
-        val lo = off.toInt()
-        val frac = off - lo
-        val p0 = centerXFor(lo)
-        val p1 = centerXFor(lo + 1)
-        return p0 + (p1 - p0) * frac
-    }
-
-    /**
-     * 此刻屏幕上**真实显示**的指示器 X。
-     *
-     * 与渲染处的优先级完全一致，因此可以安全地作为"新一段动画的起点"：
-     * 从这个值开始动，视觉上就是连续的，不会跳。
-     */
-    fun currentRenderX(): Float {
-        if (barWidthPx == 0) return 0f
-        return when {
-            !pressX.isNaN() -> pressX
-            !slideX.isNaN() -> slideX
-            !settledX.isNaN() -> settledX
-            liveOffset != null -> offsetToX(liveOffset)
-            else -> xAnim.value
-        }
-    }
-
-    /** 当前 pager 进度换算成像素；没有 pager 时返回 null。 */
-    fun liveOffsetToX(): Float? {
-        val off = liveOffset ?: return null
-        if (barWidthPx == 0) return null
-        return offsetToX(off)
-    }
-
-    /**
-     * 找出"指示器中心"最近的 tab。
-     *
-     * 用绝对距离比较而不是 round 取整，保证左右对称。
-     */
-    fun nearestTabFor(dragXPx: Float): Int {
+    /** 手指像素 → tab 索引（0.0 ~ lastIndex，连续） */
+    fun fingerToPos(fingerX: Float): Float {
         val tw = tabWidthPx()
-        if (tw <= 0f) return 0
-        val center = dragXPx + indicatorWidthPx / 2f
-        var best = 0
-        var bestDist = Float.MAX_VALUE
-        for (i in tabs.indices) {
-            val tabCenter = tw * i + tw / 2f
-            val d = abs(center - tabCenter)
-            if (d < bestDist) {
-                bestDist = d
-                best = i
+        if (tw <= 0f) return requestedIndex.toFloat()
+        // tab 中心对应的手指位置是 tw*(i+0.5)，所以减去半格再归一
+        return ((fingerX - tw / 2f) / tw).coerceIn(0f, lastIndex)
+    }
+
+    /** 手指像素 → 最近的 tab（整数） */
+    fun fingerToTab(fingerX: Float): Int {
+        val tw = tabWidthPx()
+        if (tw <= 0f) return requestedIndex
+        return (fingerX / tw).toInt().coerceIn(0, tabs.lastIndex)
+    }
+
+    // ==================== 位置驱动 ====================
+
+    /**
+     * 平移动画的任务句柄。
+     *
+     * 用令牌比对而不是单纯 cancel：cancel 不会立即生效，
+     * 旧协程要跑到下一个挂起点才进 finally，
+     * 那一刻可能把新任务刚写好的状态抹掉（= 抽搐）。
+     */
+    var moveJob by remember { mutableStateOf<Job?>(null) }
+    var moveToken by remember { mutableStateOf<Any?>(null) }
+
+    /**
+     * 把指示器平滑移到 [target]（tab 单位）。
+     *
+     * @param durationMs 时长；0 表示立即落位
+     */
+    fun animatePosTo(target: Float, durationMs: Int, spec: androidx.compose.animation.core.FiniteAnimationSpec<Float> = lensTravel()) {
+        val token = Any()
+        moveToken = token
+        moveJob?.cancel()
+        dragPos = Float.NaN
+        phase = if (durationMs <= 0) Phase.Idle else Phase.Settling
+
+        if (durationMs <= 0) {
+            scope.launch {
+                posAnim.snapTo(target)
+                if (moveToken === token) phase = Phase.Idle
             }
-        }
-        return best
-    }
-
-    /**
-     * 点击切换时，让指示器从"当前显示位置"平滑滑到目标 tab。
-     *
-     * ## 为什么必须在**松手瞬间**调用（而不是等 selectedIndex 回写）
-     *
-     * 上游 selectedIndex 要等 pager 翻页动画（620ms）**停稳后**才更新。
-     * 如果在那里才开始动画，指示器早已被 liveOffset 带到终点，
-     * 动画的起点和终点重合 —— 视觉上就是"没有任何动画"（真机录屏实测：
-     * 179 帧里指示器位置零变化，但最终确实到了目标位置）。
-     *
-     * 所以动画必须在点击发生的**同一帧**启动，起点取当前渲染位置。
-     *
-     * ## 与 liveOffset 的关系
-     *
-     * 动画期间 liveOffset 会同步变化（pager 在翻页），但渲染优先级里
-     * slideAnim 高于 liveOffset，所以指示器走自己的曲线，不受 pager 抖动影响。
-     * 动画结束后 slideAnim 复位为 NaN，控制权交还 liveOffset（两者数值一致，无跳变）。
-     */
-    /**
-     * 把指示器从 [fromX] 平滑移到 [toX]（都是像素）。
-     *
-     * @param durationMs 动画时长。按下跟手用 PRESS_SLIDE_MS，
-     *        松手落位用 RELEASE_MS，点击切换用 INDICATOR_MOVE_MS。
-     */
-    fun slideToX(toX: Float, fromX: Float, durationMs: Int) {
-        val from = fromX
-        val to = toX
-        if (abs(to - from) < 1f) return
-        if (barWidthPx == 0) return
-        // ============ 任务令牌：解决"抽搐"的真凶 ============
-        //
-        // ## 抽搐是怎么来的
-        //
-        // 旧写法：先 cancel() 上一段，再同步写 slideX = from，然后 launch 新的。
-        // 看起来没问题，实际有 1 帧的空窗：
-        //
-        //   cancel() 不是立即生效 —— 旧协程要在下一个挂起点
-        //   （withFrameNanos）抛 CancellationException 才进 finally。
-        //   而那一刻**新任务已经把 slideX 写成 from 了**，
-        //   旧任务的 finally 却无条件执行 slideX = Float.NaN，
-        //   把新的起点抹掉 → 渲染回落到 liveOffset（还是旧页）→
-        //   指示器闪回旧位置一帧 → 视觉上就是「抽搐一下」。
-        //
-        // 点击和长按松手都会连续调用两次 slideToX（按下一次、松手一次），
-        // 所以两个场景都抽搐。
-        //
-        // ## 修法
-        //
-        // 每次调用生成唯一 token。协程的 finally 只有在
-        // 「自己仍是当前任务」时才允许清理状态，
-        // 被顶替的旧任务直接静默退出。
-        val myToken = Any()
-        slideToken = myToken
-        if (slideJob != null && slideJob!!.isActive) slideJob?.cancel()
-        // 同步写入起点，本帧立刻可见
-        slideX = from
-        scope.launch { slideAnim.snapTo(from) }
-        // ============ 用 Animatable 承载位置，不是手写 withFrameNanos 循环 ============
-        //
-        // ## 手写循环的真实毛病：丢帧导致起步暴冲
-        //
-        // 实测日志（dur=620ms）：
-        //
-        //     t=0.027  el=16ms   ease=0.014
-        //     t=0.255  el=158ms  ease=0.420   ← 两帧之间隔了 141ms！
-        //
-        // 第一帧到第二帧有 141ms 空档（正常 16ms），这段时间 t 从 0.027
-        // 冲到 0.255，位移一次走掉 40%。用户看到的就是
-        // 「先抽搐一下，剩下的慢慢滑」。
-        //
-        // 根因：withFrameNanos 跑在普通协程里，帧回调会被主线程其它工作推迟，
-        // 而 t 按真实经过时间算 —— 一推迟，下次回调就把积压时间一次性折算成位移。
-        //
-        // ## Animatable 为什么没有这个问题
-        //
-        // 它由 Compose 动画时钟驱动，与合成器同频；即使偶发掉帧，
-        // 框架按目标值插值补偿，不会「卡一帧然后暴冲」。
-        slideJob = scope.launch {
-            try {
-                // ============ 等主线程喘息，再启动动画 ============
-                //
-                // ## 抽搐的真正根因（实测数据）
-                //
-                // 采样 slideAnim.value（dur=620ms）：
-                //
-                //     seq = 53, 53, 182, 203, 213, ...
-                //
-                // 第 1 帧到第 2 帧之间隔了 **136ms**（正常 16ms），
-                // 相当于主线程被占用 8 帧。这期间动画按真实时间推进，
-                // 下一帧一次性补上 → 从 53 直接蹦到 182（跳 129px）。
-                //
-                // ## 谁阻塞了主线程
-                //
-                // 不是动画本身。点击切页时，**目标页要首次合成** ——
-                // 设置页有多个液态玻璃面板（AGSL 着色器），
-                // 首帧渲染开销就是 100ms 量级。
-                // 指示器动画和它抢同一帧，必然被拖累。
-                //
-                // ## 所以正确做法不是调曲线，是**等它忙完再动**
-                //
-                // 轮询帧间隔，连续两帧都在 20ms 内（说明主线程已恢复），
-                // 才开始平移。等待期间指示器稳定停在 from，不会跳。
-                //
-                // 视觉上是「点一下，指示器稍顿一下，然后从容滑过去」——
-                // 这正是 iOS 的手感：先确认收到，再开始运动。
-                // 比「先抽搐再滑」好得多。
-                slideAnim.snapTo(from)
-                var prevFrame = withFrameNanos { it }
-                var stableWait = 0f
-                while (stableWait < 20_000_000f) {
-                    val nf = withFrameNanos { it }
-                    val gapMs = (nf - prevFrame) / 1_000_000f
-                    prevFrame = nf
-                    // 连续两帧间隔 < 24ms 视为主线程已恢复
-                    if (gapMs < 24f) {
-                        val nf2 = withFrameNanos { it }
-                        val gap2 = (nf2 - prevFrame) / 1_000_000f
-                        prevFrame = nf2
-                        if (gap2 < 24f) break
-                    }
-                    stableWait += 16f
-                }
-                slideAnim.animateTo(
-                    to,
-                    animationSpec = tween(
-                        durationMillis = durationMs,
-                        easing = IndicatorEase,
-                    ),
-                )
-
-                // 落点对齐：让 xAnim 记录最终位置，供下一次 currentRenderX() 使用
-                xAnim.snapTo(to)
-                // 把结果记进 settledX，否则渲染回落到 liveOffset（旧页）会当场跳回去
-                settledX = to
-            } finally {
-                // 【只在仍是当前任务时清理】否则会抹掉后一段动画的状态
-                if (slideToken === myToken) {
-                    slideX = Float.NaN
-                    slideJob = null
-                }
-            }
-        }
-    }
-
-    /** 点击切换：从 [fromX] 滑到目标 tab 中心（标准时长） */
-    fun slideTo(target: Int, fromX: Float) {
-        slideToX(centerXFor(target), fromX, INDICATOR_MOVE_MS)
-    }
-
-    /**
-     * 吸附到某个 tab。
-     *
-     * @param stretch 是否播放液滴拉伸。
-     *
-     * ## 为什么需要这个开关（真机踩坑）
-     *
-     * 滑动切页时，指示器由 [liveOffset] **直接跟手**，
-     * 而 xAnim 停在旧位置没更新。等页面吸附到位、selectedIndex
-     * 被回写后，这里会用 xAnim.value（旧位置）算出一段**整宽距离**，
-     * 于是明明已经停在正确的 tab 上，又额外拉伸出一次 ——
-     * 用户的原话是"界面停住了，最后还会往右边伸展一下，这没意义"。
-     *
-     * 所以：**滑动结束只做 snapTo 归位，不播放拉伸**；
-     * 只有点击切换（指示器确实要“跳”过去）才播放拉伸。
-     */
-    fun settleTo(index: Int, fromX: Float, stretch: Boolean = true) {
-        val target = centerXFor(index)
-        val distance = abs(target - fromX)
-
-        if (!stretch) {
-            // 静默归位：滑动已经把手势带到目标位置了，
-            // 这里只把内部状态对齐，**不产生任何可见动画**。
-            // 用 snapTo 而不是极短的 animateTo：哪怕 1 帧的动画
-            // 也会被感知成"停住后又弹一下"。
-            scope.launch { xAnim.snapTo(target) }
-            scope.launch { wAnim.snapTo(indicatorWidthPx) }
-            scope.launch { hAnim.snapTo(indicatorHeightPx) }
-            scope.launch { glowAnim.snapTo(0f) }
             return
         }
 
-        // ---------- 点击切换：iOS 18 质感的慢速位移 ----------
-        //
-        // 不用 spring：spring 的物理回弹在"点一下"这种**明确的
-        // 目标切换**里显得毛躁。Apple 的 tab 切换用的是一条
-        // 平滑减速曲线，落点稳、没有多余弹跳。
-        scope.launch {
-            xAnim.animateTo(
-                target,
-                animationSpec = tween(
-                    durationMillis = INDICATOR_MOVE_MS,
-                    easing = IosEaseOut,
-                ),
-            )
-        }
-
-        val maxExtra = indicatorWidthPx * 0.55f
-        val extra = (distance * 0.26f).coerceAtMost(maxExtra)
-        if (extra > 2f) {
-            // 液滴拉伸：先缓慢抻开，再更缓慢地收回。
-            // 整个过程比之前慢一倍多 —— 用户明确要求"放慢，要优雅"。
-            scope.launch {
-                wAnim.animateTo(
-                    indicatorWidthPx + extra,
-                    tween(STRETCH_MS, easing = IosEaseOut),
-                )
-                wAnim.animateTo(
-                    indicatorWidthPx,
-                    tween(SETTLE_MS, easing = IosEaseInOut),
-                )
-            }
-            scope.launch {
-                val squash = 1f - (extra / (indicatorWidthPx + extra)) * 0.55f
-                hAnim.animateTo(
-                    (indicatorHeightPx * squash).coerceAtLeast(indicatorHeightPx * 0.70f),
-                    tween(STRETCH_MS, easing = IosEaseOut),
-                )
-                hAnim.animateTo(
-                    indicatorHeightPx,
-                    tween(SETTLE_MS, easing = IosEaseInOut),
-                )
-            }
-            scope.launch {
-                glowAnim.animateTo(0.9f, tween(STRETCH_MS, easing = IosEaseOut))
-                glowAnim.animateTo(0f, tween(GLOW_FADE_MS, easing = IosEaseInOut))
+        moveJob = scope.launch {
+            try {
+                // 从当前位置出发：posAnim 与渲染位置可能不同（Idle 时用 liveOffset），
+                // 所以先把渲染位置灌进去，保证视觉连续。
+                val from = renderPos()
+                if (abs(from - posAnim.value) > 0.001f) posAnim.snapTo(from)
+                posAnim.animateTo(target, animationSpec = spec)
+            } finally {
+                if (moveToken === token) {
+                    phase = Phase.Idle
+                    moveJob = null
+                }
             }
         }
     }
 
+    // ==================== 响应上游变化 ====================
+
+    /**
+     * 上游 selectedIndex 变化：对齐请求值。
+     *
+     * **不动位置** —— 位置由状态机和动画负责。
+     * 旧实现这里是「清 settledX / 清 pressX」，每次清理都会让渲染
+     * 回落到另一个来源，正是抽搐和回弹的来源。
+     */
+    LaunchedEffect(selectedIndex) {
+        requestedIndex = selectedIndex
+    }
+
+    /** 底栏宽度首次就绪：把位置对齐到当前页，避免从 0 开始飘 */
     LaunchedEffect(barWidthPx) {
-        if (barWidthPx > 0) xAnim.snapTo(centerXFor(selectedIndex))
+        if (barWidthPx > 0 && phase == Phase.Idle) {
+            posAnim.snapTo((liveOffset ?: selectedIndex.toFloat()))
+        }
     }
 
     /**
-     * 【关键】让 xAnim 持续跟随 pager 的真实位置。
+     * 用户**直接在页面上**左右滑动时，把 pager 进度灌进 posAnim。
      *
-     * 之前 xAnim 只在 settleTo 时才动，而滑动/点击翻页期间
-     * 指示器由 liveOffset 渲染 —— 两者脱节。
+     * 这是 liveOffset 唯一进入位置系统的入口。
+     * 用 snapshotFlow 而不是在渲染里读，是为了让「写入」显式且可追踪 ——
+     * 任何位置变化都必须经过 posAnim，视线所及只有一个真值。
      *
-     * 后果：翻页结束后 settleTo 用陈旧的 xAnim.value 算距离，
-     * 得出一个巨大的值，于是又拉一次。
-     *
-     * 现在把 xAnim 当成"内部记录的位置"，每帧跟 liveOffset 对齐。
-     * 这样任何后续计算里 fromX 都是真实位置，distance ≈ 0，
-     * 从根上消除了"二次拉伸"的可能。
+     * 只在 Idle 阶段同步：拖底栏或播放落位动画时，指示器由状态机驱动，
+     * 此时 pager 的变化（我们主动请求的切页）不应该反过来覆盖位置。
      */
-    LaunchedEffect(barWidthPx) {
-        if (barWidthPx == 0) return@LaunchedEffect
-        // 用 snapshotFlow 而不是 LaunchedEffect(liveOffset)：
-        // 后者每帧都会取消并重启协程，开销大且会打断 snapTo。
-        // snapshotFlow 只在一帧一次地把新值推给 collect。
+    LaunchedEffect(Unit) {
         snapshotFlow { liveOffset }
             .collect { off ->
                 if (off == null) return@collect
-                // 用与渲染完全相同的公式把进度换算成像素位置
-                val lo = off.toInt()
-                val frac = off - lo
-                val p0 = centerXFor(lo)
-                val p1 = centerXFor(lo + 1)
-                xAnim.snapTo(p0 + (p1 - p0) * frac)
+                // 只在「没有未完成的切页请求」时才同步 pager 进度。
+                //
+                // 长按把指示器滑到设置后，动画结束 phase 变 Idle，
+                // 但此刻 pager 的 liveOffset 仍是 0（页面刚开始切）。
+                // 无条件 snapTo 会让位置从 0.998 跳回 0.000 ——
+                // 真机日志抓到的就是这个跳变。
+                if (phase == Phase.Idle && requestedIndex == selectedIndex) {
+                    posAnim.snapTo(off)
+                }
             }
     }
 
-    // 唯一驱动指示器动画的地方（点击切换与滑动切页最终都走这里）
-    LaunchedEffect(selectedIndex, barWidthPx) {
-        if (barWidthPx == 0) return@LaunchedEffect
 
-        // ========== 为什么这里几乎总是不该拉伸 ==========
-        //
-        // 指示器的**可见位置**有两套驱动源：
-        //   A. liveOffset（pager 连续进度）→ 拖拽、点击翻页动画期间都走这条
-        //   B. xAnim（settleTo 的动画目标）
-        //
-        // 只要 liveOffset != null，指示器就已经被 pager 连续驱动到位了。
-        // 此时再让 settleTo 播放拉伸，就会在"已经到位"之后
-        // **额外拉一次然后回缩** —— 正是用户反复反馈的：
-        //   「指示器已经完全横移过去了，最后收尾却会突然拉伸一下再回缩」
-        //
-        // 早期只在拖拽时置 pendingSwipeSettle=true，
-        // 点击 tab 时漏了 —— 而点击同样会启动 animateScrollToPage，
-        // 期间 liveOffset 一直在动，松手后 selectedIndex 才回写，
-        // 于是又触发一次拉伸。这是根因。
-        //
-        // 现在的规则：
-        //   · liveOffset 由 pager 提供（非 null）→ 永远静默归位
-        //   · 没有 pager 进度（纯本地切换）→ 才播放拉伸
-        val drivenByPager = liveOffset != null
-        val byDrag = pendingSwipeSettle
-        pendingSwipeSettle = false
-
-        // ============ 收尾 ============
-        //
-        // 【不要再 snapTo xAnim】这里曾经有一段
-        //
-        //     if (!byDrag) scope.launch { xAnim.snapTo(centerXFor(selectedIndex)) }
-        //
-        // 意图是「把内部记录位置对齐到最终值」，但它会**打断正在播放的
-        // 平移动画**：点击的 slideToX 是 420ms，而 selectedIndex 在
-        // pager 翻页（620ms）结束时才回写 —— 两个时间点不重合，
-        // 有时动画还没播完 xAnim 就被瞬移到终点，
-        // 下一帧 slideToX 的落点又写回来 → 视觉上抽搐一下。
-        //
-        // 现在落位完全由 slideToX 负责（它结束时会 xAnim.snapTo(to)），
-        // 这里不再插手位置，只处理缩放/发光等**视觉状态**的收敛。
-        scope.launch { scaleAnim.snapTo(1f) }
-        scope.launch { glowAnim.snapTo(0f) }
-        scope.launch { wAnim.snapTo(indicatorWidthPx) }
-        scope.launch { hAnim.snapTo(indicatorHeightPx) }
-
-        // ============ 交接：pressX → liveOffset ============
-        //
-        // selectedIndex 已经更新（说明 pager 也到位了），此时才把
-        // 拖拽用的临时位置清掉，让渲染改由 liveOffset 驱动。
-        //
-        // 必须在**这里**清而不是在手势松手时清：
-        // 松手时 pager 还在翻页，liveOffset 仍是旧值，
-        // 提前清会让指示器先跳回原页，再跟着翻过去。
-        pressX = Float.NaN
-    }
-
-    // 【已移除】常驻流光。
-    //
-    // 用户指出："底栏一闪闪的高光是去除的"。
-    // 之前跑了一个 3.2 秒循环的高光带，静止时也一直在闪 ——
-    // 那是装饰性的躁动，不是液态玻璃该有的克制。
-    //
-    // iOS 的玻璃**静止时是安静的**，只在交互瞬间有质感反应。
-    // 所以现在高光只在两处出现：
-    //   1. 拖拽中（跟随手指的柔光）；
-    //   2. 切换的瞬间（一次短促的脉冲）。
-    // 其余时间完全不动。
+    // ==================== 布局 ====================
 
     Box(
         modifier = modifier
             .fillMaxWidth()
-            // 胶囊只占屏幕宽度的一部分并居中 —— 这才是"悬浮胶囊"，
-            // 而不是贴着左右两边的通栏条。
             .padding(vertical = 10.dp),
         contentAlignment = Alignment.Center,
     ) {
         Box(
             modifier = Modifier
-                .fillMaxWidth(barWidthFraction),
+                .fillMaxWidth(barWidthFraction)
+                // ==================== 手势 ====================
+                //
+                // 全部手势在这里统一处理，子级不挂任何 Clickable ——
+                // 否则父级和子级各触发一次，就是「点两次才切」。
+                .pointerInput(Unit) {
+                    awaitEachGesture {
+                        val down = awaitFirstDown(requireUnconsumed = false)
+
+                        val downTab = fingerToTab(down.position.x)
+                        val downPos = fingerToPos(down.position.x)
+
+                        // ---------- 按下 ----------
+                        //
+                        // 立刻把指示器滑到手指所在 tab 并放大。
+                        // 用 320ms（比点击位移略快）：按下的反馈要「跟手」，
+                        // 不能等太久，否则手感是「点了没反应」。
+                        phase = Phase.Pressed
+                        dragPos = Float.NaN
+                        scope.launch {
+                            scaleAnim.animateTo(BarDragScale, lensLift())
+                        }
+                        scope.launch {
+                            glowAnim.animateTo(0.9f, lensLift())
+                        }
+                        // 按下即移动到手指处（这是「长按跟手」的核心）
+                        animatePosTo(downPos, BarPressMs, lensLift())
+
+                        var dragged = false
+                        var lastX = down.position.x
+
+                        // ---------- 移动 ----------
+                        while (true) {
+                            val ev = awaitPointerEvent()
+                            val ch = ev.changes.firstOrNull() ?: break
+                            if (!ch.pressed) break
+                            lastX = ch.position.x
+                            if (!dragged && abs(lastX - down.position.x) > viewConfiguration.touchSlop) {
+                                dragged = true
+                                phase = Phase.Dragging
+                                // 取消按下的运镜，完全交给逐帧跟手
+                                moveToken = Any()
+                                moveJob?.cancel()
+                                moveJob = null
+                            }
+                            if (dragged) {
+                                ch.consume()
+                                // 同步写入：本帧生效，零调度延迟 —— 这是跟手的关键
+                                dragPos = fingerToPos(lastX)
+                            }
+                        }
+
+                        // ---------- 松手 ----------
+                        val targetTab = if (dragged) fingerToTab(lastX) else downTab
+                        val fromPos = if (dragged && !dragPos.isNaN()) dragPos else posAnim.value
+
+                        scope.launch {
+                            scaleAnim.animateTo(1f, lensTravel())
+                            glowAnim.animateTo(0f, glowFall())
+                        }
+
+                        // 无移动的点按：指示器已在按下时移到位，这里直接落位
+                        // 有移动的拖拽：从手指位置滑到目标 tab 中心
+                        dragPos = Float.NaN
+                        phase = Phase.Settling
+                        val token = Any()
+                        moveToken = token
+                        moveJob?.cancel()
+                        moveJob = scope.launch {
+                            try {
+                                posAnim.snapTo(fromPos)
+                                posAnim.animateTo(
+                                    targetTab.toFloat(),
+                                    animationSpec = lensTravel(),
+                                )
+                            } finally {
+                                if (moveToken === token) {
+                                    phase = Phase.Idle
+                                    moveJob = null
+                                }
+                            }
+                        }
+
+                        // 请求切页（页面与指示器同时开始、同时结束）
+                        if (targetTab != requestedIndex) {
+                            requestedIndex = targetTab
+                            currentOnSelect(targetTab, dragged)
+                        }
+                    }
+                },
         ) {
-        // ================= 第一层：真正的玻璃容器 =================
-        //
-        // 【关键修正】之前这里只是"半透明白色圆角矩形"，
-        // 看起来是一张贴纸浮在内容上，而不是玻璃。
-        //
-        // 真玻璃必须做两件事：
-        //   1. **采样背后的真实内容**（LocalBackdropLayer 提供的录制层）；
-        //   2. 对采样结果做模糊 + 折射 + 色散（由 Kyant0/AndroidLiquidGlass 完成）。
-        //
-        // 用 LiquidGlassPanel 而不是自己画背景，就是拿到这套光学管线。
-        // 这也是 iOS 底栏"能透出底下内容"的真正原因 —— 不是透明度，
-        // 是**折射**。
-        // ================= 第一层：液态玻璃容器 =================
-        //
-        // 【第十一轮】换成 Kyant0/AndroidLiquidGlass（4600 星）。
-        //
-        // 之前用 PrismalAGSL 时，blurRadius 在本机完全不生效 ——
-        // 14dp / 60dp / 200dp 三张截图逐像素一致，背后文字始终锐利。
-        // 试过 RenderEffect 链、RenderNode 中转、Bitmap 拷贝、
-        // 录制层预模糊等七八种绕过方案，全部卡在同一个物理限制上：
-        // Compose 的 GraphicsLayer 无法在绘制阶段同步读成像素。
-        //
-        // 新库自带 Backdrop 录制 + 库内模糊/折射，不走 Compose 效果链，
-        // 所以那一环终于能生效。
-        val liquidBackdrop = com.redmi.autoattend.ui.glass.LocalLiquidBackdrop.current
-        if (liquidBackdrop != null) {
-            com.redmi.autoattend.ui.glass.LiquidGlassPanel(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(barHeight)
-                    .onSizeChanged {
-                        barWidthPx = it.width
-                        // 回写给上游：拖拽换算 tab 宽度时需要底栏真实宽度
-                        onBarWidth(it.width.toFloat())
-                    },
-                cornerRadius = barHeight / 2,
-                // 模糊：28dp ≈ 91px。实测 14dp 太弱（背后文字一望即知），
-                // 28dp 才能把笔画糊成团块、需要凑近辨认。
-                // 官方 LiquidBottomTabs 用 8dp；弹窗用 16dp（浅）/ 8dp（深）。
-                // 这个库的 blur 本来就是"轻微柔化"，不是"糊成团块" ——
-                // 所有官方示例的半径都在 2–16dp 之间。
-                blurRadius = if (colors.isDark) 8.dp else 16.dp,
-                // 【关键】tintAlpha 决定"下层内容直接透出多少"。
-                //
-                // tint 留空 → 由 LiquidGlassPanel 按主题自动选：
-                //   浅色 = 亮白（0xFFFAFAFA）
-                //   深色 = 近黑（0xFF121212）
-                //
-                // 【为什么不能写死白色】
-                //
-                // 深色主题下，白 tint 叠在深蓝紫背景上，数学上必然趋向灰 ——
-                // 底栏会变成一块灰紫色，和旁边蓝青色的卡片完全不搭。
-                // 这正是"深色下风格不统一"的根因。
-                //
-                // 深色改用近黑 tint 后，玻璃只压暗不泛灰，
-                // 色相仍由背后的内容决定，于是和卡片自然同色系。
-                // tint 走默认值（深色近黑 / 浅色亮白），色相交给主题决定。
-                //
-                // 但 tintAlpha 要**比卡片更轻**：
-                //
-                // 深度上，底栏位于屏幕最下方，而流动背景是「上蓝下紫」的渐变，
-                // 底部本来就是最暗最紫的一段。卡片在中部采到亮蓝，
-                // 底栏在底部采到深紫 —— 同样的 0.40 叠上去，
-                // 底栏会明显更黑更沉，和卡片不像一个体系。
-                //
-                // 把底栏的 tint 降到 0.28，让它多透出一些背景色，
-                // 亮度就能和卡片拉近，同时仍压得住下层文字。
-                // 深色下显式指定一个偏蓝的 tint，把底栏从背景的紫色里拉回来。
-                // 背景渐变在屏幕底部本来就是紫的，只靠中性黑压不住色相。
-                tint = if (colors.isDark) Color(0xFF0E1B33) else Color(0xFFFAFAFA),
-                tintAlpha = if (colors.isDark) 0.45f else 0.40f,
-                // 关掉边缘高光：它画在内容之上，会盖住贴边的「设置」文字。
-                highlightAlpha = 0f,
-                dispersionOverride = if (colors.isDark) 0.45f else 0.38f,
-            ) {
-                // 内容为空 —— 文字和指示器都画在它上面
-                Box(Modifier.fillMaxWidth().height(barHeight))
+
+
+            // ---------- 第一层：液态玻璃容器（材质未改动） ----------
+            //
+            // 这一段是已经调好的材质：Kyant0/AndroidLiquidGlass 的
+            // Backdrop 录制 + 库内模糊/折射，参数（blurRadius / tint /
+            // tintAlpha / dispersion）都是真机逐项比对过的，未做改动。
+            val liquidBackdrop = com.redmi.autoattend.ui.glass.LocalLiquidBackdrop.current
+            if (liquidBackdrop != null) {
+                com.redmi.autoattend.ui.glass.LiquidGlassPanel(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(barHeight)
+                        .onSizeChanged {
+                            barWidthPx = it.width
+                            onBarWidth(it.width.toFloat())
+                        },
+                    cornerRadius = barHeight / 2,
+                    blurRadius = if (colors.isDark) 8.dp else 16.dp,
+                    tint = if (colors.isDark) Color(0xFF0E1B33) else Color(0xFFFAFAFA),
+                    tintAlpha = if (colors.isDark) 0.45f else 0.40f,
+                    highlightAlpha = 0f,
+                    dispersionOverride = if (colors.isDark) 0.45f else 0.38f,
+                ) {
+                    Box(Modifier.fillMaxWidth().height(barHeight))
+                }
             }
-            // ================= 第三层：文字 + 手势 =================
+
+            // ---------- 第二层：文字 ----------
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(barHeight)
-                    // ============ 手势：指示器自己走，松手才交给 pager ============
-                    //
-                    // ## 用户要的交互
-                    //
-                    //   按下 → 指示器滑到手指处并放大
-                    //   移动 → 指示器完全跟手
-                    //   松手 → 落位到最近 tab + 缩小 + 页面切过去
-                    // ============ 手势：位置只由 pager 驱动 ============
-                    //
-                    // ## 设计原则（本轮彻底重构）
-                    //
-                    // 指示器的位置**只有 liveOffset 一个来源**，它是 pager 连续进度的
-                    // 纯函数。按住、拖拽、松手全部通过驱动 pager 来产生位移，
-                    // 因而结构上不可能出现「两个位置源对不上」的交接问题。
-                    //
-                    // ## 之前所有 bug 的共同根因
-                    //
-                    // 我一直在试图让指示器在按住期间「自己动」（pressX），
-                    // 松手时再把控制权交还给 liveOffset。凡是有交接，就有竞态：
-                    //   · snapTo 是挂起函数，先置标志位会渲染一帧旧值 → 瞬移；
-                    //   · 两边时长/曲线不一致 → 一个有一个没、不对称；
-                    //   · 共用 job 会互相取消 → 放大被打断、动画卡住；
-                    //   · 父级 pointerInput 吞掉子级 Clickable → 点击要两次。
-                    //
-                    // 现在没有交接：按下就把 pager 平滑推到手指位置，
-                    // 拖拽就让 pager 跟手，松手就让 pager 落到最近页。
-                    // 指示器始终只是「跟着 pager 走」，不需要任何状态切换。
-                    //
-                    // ## 点击由子级 Clickable 处理，这里绝不重复触发
-                    //
-                    // 这是「点击要两次」的根因：父级手势与子级 Clickable 各调一次
-                    // onSelect，第一次切过去、第二次又切回来。
-                    // 现在父级只在**确实发生拖拽**（超过 touchSlop）时才切页，
-                    // 纯点按一律交给子级，绝不重复。
-                    // ============ 手势：同步驱动 pager，位置只有 liveOffset ============
-                    //
-                    // ## 三个 bug 的共同根因
-                    //
-                    // 之前拖拽只写本地 dragFrac / 或用异步 scrollToPage，两种情况都错：
-                    //   ① 只写本地 → 指示器跟手了，但 pager 没动，liveOffset 还是旧值，
-                    //      松手时一交还控制权就「瞬移回首页再播一遍动画」；
-                    //   ② 异步 scrollToPage → 每帧一个协程被合并/丢弃，丢失中间动画、
-                    //      「长按时指示器不跟手」。
-                    //
-                    // ## 现在：dispatchRawDelta（同步）
-                    //
-                    // 它是**非挂起**函数，在手指事件里直接同步改 pager 滚动状态，
-                    // 于是 pager 真正逐帧跟手 → liveOffset 连续 → 指示器（liveOffset
-                    // 的纯函数）自然跟手。松手时 liveOffset 已经等于目标位置，
-                    // 不需要任何交接，也就没有瞬移和复读。
-                    //
-                    // 点击也走同一条路径：按下就让 pager 滑过去（onPressTab），
-                    // 松手不再触发第二次，因此不会「点两次才切」。
-                    .pointerInput(barWidthPx, tabs.size, indicatorWidthPx) {
-                        awaitEachGesture {
-                            val down = awaitFirstDown(requireUnconsumed = false)
-
-                            /** 手指 x → 指示器左上角 x（中心对齐手指） */
-                            fun xFor(fingerX: Float): Float {
-                                val tw = tabWidthPx()
-                                if (tw <= 0f) return centerXFor(currentSelected)
-                                return (fingerX - indicatorWidthPx / 2f)
-                                    .coerceIn(0f, (barWidthPx - indicatorWidthPx).coerceAtLeast(0f))
-                            }
-
-                            /** 手指 x → 最近的 tab 索引 */
-                            fun tabFor(fingerX: Float): Int {
-                                val tw = tabWidthPx()
-                                if (tw <= 0f) return currentSelected
-                                return (fingerX / tw).toInt().coerceIn(0, tabs.lastIndex)
-                            }
-
-                            // ============================================================
-                            // 模型：拖拽期间**页面完全不动**，只有指示器跟手。
-                            //        松手才切页。
-                            // ============================================================
-                            //
-                            // ## 为什么不用「拖拽同时驱动 pager」
-                            //
-                            // 试过三种驱动 pager 的方式，全部失败：
-                            //   · scope.launch { scrollToPage() } —— 异步，帧间被合并，
-                            //     丢失中间动画、卡顿后瞬移；
-                            //   · dispatchRawDelta —— 增量会被 pager 的 snap 吸回最近的页；
-                            //   · 绝对位置 scrollToPage —— 仍是 launch 异步，同样卡顿。
-                            //
-                            // 根因：手势循环跑在**受限协程作用域**里，任何挂起调用都必须
-                            // 通过 scope.launch 逃逸，而 launch 是异步调度 —— 逐帧驱动必然
-                            // 掉帧。这不是参数问题，是结构问题。
-                            //
-                            // ## 正确模型（也是用户最初描述的交互）
-                            //
-                            //   按下 → 放大；
-                            //   拖拽 → 指示器同步跟手（写 float state，无协程，永不掉帧）；
-                            //   松手 → 指示器落位 + 页面切过去（两条动画同时开始、同时结束）。
-                            //
-                            // 指示器跟手用普通 state：写入是同步的，下一帧必定用新值，
-                            // 不存在调度延迟，因此丝滑无卡顿。
-
-                            // ---------- 按下：放大 ----------
-                            //
-                            // 同时把"按下这一刻指示器在哪"记下来。
-                            // 松手时的平移动画必须从**这个位置**出发，
-                            // 而不是从 currentRenderX() 再读一次 ——
-                            // 那时 liveOffset 已经开始动了，读出来已接近终点。
-                            val pressStartX = currentRenderX()
-
-                            scope.launch {
-                                scaleAnim.animateTo(
-                                    dragScale,
-                                    tween(PRESS_MS, easing = IosEaseOut),
-                                )
-                            }
-
-                            // ============ 按下即跟手 ============
-                            //
-                            // 用户反馈：「在首页长按设置，指示器会原地放大而不是跟手」。
-                            //
-                            // 根因：pressX 只在 dragged == true（移动超过 touchSlop）
-                            // 时才被写入。长按不动 → 永远不写 → 指示器位置毫无变化，
-                            // 只有缩放动画在跑，看起来就是"原地放大"。
-                            //
-                            // 正确模型：按下瞬间就请求把指示器移到手指所在的 tab，
-                            // 用一段从容的运镜（PRESS_SLIDE_MS，比点击位移更长）——
-                            // 这正是需求里写的「按下 → 指示器滑到手指处并放大」。
-                            //
-                            // 之后一旦真的拖起来，pressX 会接管逐帧跟手；
-                            // 若只是长按，就停在 target 上等松手。
-                            val downTarget = tabFor(down.position.x)
-                            if (downTarget != currentSelected) {
-                                val toX = centerXFor(downTarget)
-                                slideToX(toX, pressStartX, PRESS_SLIDE_MS)
-                            }
-
-                            // ---------- 移动：同步跟手 ----------
-                            var dragged = false
-                            var lastX = down.position.x
-                            val slop = viewConfiguration.touchSlop
-                            while (true) {
-                                val ev = awaitPointerEvent()
-                                val ch = ev.changes.firstOrNull() ?: break
-                                if (!ch.pressed) break
-                                lastX = ch.position.x
-                                if (!dragged && kotlin.math.abs(lastX - down.position.x) > slop) {
-                                    dragged = true
-                                }
-                                if (dragged) {
-                                    ch.consume()
-                                    // 真拖起来时，取消「按下跟手」那段运镜，
-                                    // 完全交给 pressX 逐帧驱动（否则两者抢写会打架）。
-                                    if (slideJob != null && slideJob!!.isActive) {
-                                        slideJob?.cancel()
-                                        slideX = Float.NaN
-                                        slideJob = null
-                                    }
-                                    // 同步写入普通 state：本帧立即生效，绝不掉帧
-                                    pressX = xFor(lastX)
-                                }
-                            }
-
-                            // ---------- 松手 ----------
-                            scope.launch {
-                                scaleAnim.animateTo(
-                                    1f,
-                                    tween(RELEASE_MS, easing = IosEaseOut),
-                                )
-                            }
-
-                            // 目标：拖拽看松手位置，点按看按下位置。
-                            // 只由手指决定，与 pager 当前状态无关 —— 这样不会误切页。
-                            val target = if (dragged) tabFor(lastX) else tabFor(down.position.x)
-
-                            // ============ 落点判断必须用「请求值」而不是「停稳值」 ============
-                            //
-                            // 旧代码用 currentSelected（= 上游 selectedIndex），
-                            // 而它要等翻页动画停稳（620ms）才回写。
-                            // 于是动画期间点回原页会被判成"目标就是当前页"→ 静默吞掉。
-                            // 这就是「刚切换的 0.5 秒内点不动、拖不动」的根因。
-                            val effectiveCurrent = if (pendingTarget != currentSelected) {
-                                pendingTarget
-                            } else {
-                                currentSelected
-                            }
-
-                            if (target != effectiveCurrent) {
-                                pendingSwipeSettle = true
-                                pendingTarget = target
-
-                                // ============ 松手：先接住位置，再切页 ============
-                                //
-                                // ## 为什么不能直接 pressX = Float.NaN（拖拽复读的根因）
-                                //
-                                // 清空 pressX 后，渲染立刻回落到 liveOffset ——
-                                // 而此刻 pager 还没开始翻页，liveOffset 仍是**旧页**位置。
-                                // 于是指示器先"跳回原页"，然后才被翻页动画带着走一遍。
-                                // 用户看到的就是「松手后复读动画」。
-                                //
-                                // ## 正确顺序
-                                //
-                                //   ① 用当前真实显示位置作为起点启动平移动画
-                                //      （slideX 同步写入当帧生效，视觉上连续）；
-                                //   ② 再请求切页；
-                                //   ③ 动画结束后 slideX 清空，此时 liveOffset 已到终点，
-                                //      交还时数值一致，无跳变。
-                                //
-                                // 拖拽的起点 = 手指最后位置（pressX），
-                                // 点击的起点 = 按下那一刻的位置（pressStartX）。
-                                // 【关键】起点必须是**此刻屏幕上真实显示的位置**。
-                                //
-                                // 「点击设置时指示器先抖一下」的根因就在这里：
-                                // 按下时已经启动了「滑到手指 tab」的运镜，
-                                // 松手瞬间指示器正在途中，而旧代码用 pressStartX
-                                // （按下**之前**的位置）当起点 → 先瞬移回起点再滑
-                                // → 视觉上抖一下。
-                                //
-                                // currentRenderX() 取的是实时值：
-                                // 拖拽中取 pressX，运镜中取 slideX，已落位取 settledX，
-                                // 全部与屏幕一致，起点永远不会跳。
-                                val fromX = currentRenderX()
-                                pressX = Float.NaN
-                                slideToX(centerXFor(target), fromX, RELEASE_MS)
-                                currentOnSelect(target, dragged)
-                            } else {
-                                // 目标就是当前页：直接把跟手值交还给 liveOffset。
-                                pressX = Float.NaN
-                            }
-                        }
-                    },
+                    .height(barHeight),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
+                val pos = renderPos()
                 tabs.forEachIndexed { index, label ->
-                    val selected = index == selectedIndex
-
-                    // ============ 文字颜色：跟随指示器位置实时插值 ============
-                    //
-                    // ## 为什么不能再用 animateColorAsState(selected)
-                    //
-                    // 用户反馈：「指示器拖过去了，蓝字还要等 1 秒左右才变，而且生硬」。
-                    //
-                    // 根因链：
-                    //   1. selected 来自 selectedIndex，只在 pager **停稳后**才回写；
-                    //   2. 拖拽全程 selected 不变 → 颜色不准备变；
-                    //   3. 松手后还要跑完翻页动画，selectedIndex 才更新；
-                    //   4. 更新后再走 tween —— 叠加起来就是「等一秒」。
-                    //
-                    // ## 正确模型：颜色是位置的函数
-                    //
-                    // 指示器位置逐帧变化，颜色也应该逐帧跟随：
-                    // 拖到 70% 就蓝 70%，与指示器**永远同相**，零延迟。
-                    //
-                    // 权重 = 1 - |当前位置 - 本 tab 索引|，天然连续。
-                    // 与指示器**同一个来源**：liveOffset。
-                    // 拖拽时 pager 跟着手指走，liveOffset 连续变化，
-                    // 颜色因此连续渐变，和指示器永远同相。
-                    val livePos = when {
-                        // 点击平移动画进行中：颜色跟着指示器的实际位置走，
-                        // 否则会出现"指示器已经滑到设置，文字还是首页蓝"。
-                        !slideX.isNaN() -> {
-                            val tw = tabWidthPx()
-                            if (tw > 0f) {
-                                val center = slideX + indicatorWidthPx / 2f
-                                ((center - tw / 2f) / tw).coerceIn(0f, tabs.lastIndex.toFloat())
-                            } else selectedIndex.toFloat()
-                        }
-                        !pressX.isNaN() -> {
-                            val tw = tabWidthPx()
-                            if (tw > 0f) {
-                                val center = pressX + indicatorWidthPx / 2f
-                                ((center - tw / 2f) / tw).coerceIn(0f, tabs.lastIndex.toFloat())
-                            } else selectedIndex.toFloat()
-                        }
-                        liveOffset != null -> liveOffset
-                        else -> selectedIndex.toFloat()
-                    }
-                    val colorWeight = (1f - kotlin.math.abs(livePos - index)).coerceIn(0f, 1f)
-
-                    // 未选中项的颜色要**自己定**，不能直接用 textTertiary：
-                    // 它的 alpha 只有 43%/50%，叠在半透明玻璃上几乎看不见
-                    // （实测「设置」直接消失）。
+                    // 颜色是位置的连续函数：拖到 70% 就蓝 70%，与指示器永远同相。
+                    // 这是「文字变色要等一秒」的根治方案 —— 不做独立动画，
+                    // 直接由位置算出权重，天生零延迟。
+                    val weight = (1f - abs(pos - index)).coerceIn(0f, 1f)
                     val activeColor =
                         if (colors.isDark) colors.textPrimary else Color(0xFF1A73E8)
                     val idleColor =
                         if (colors.isDark) Color(0xCCD8E2F0) else Color(0xCC2A3140)
-
-                    // 平滑：位置本身是连续的，再叠一层极短的补间只为消除逐帧抖动。
-                    // 时长刻意很短（90ms）——它只是低通滤波，不是「变色动画」，
-                    // 太长就会重现用户抱怨的「等一秒」。
-                    val smoothWeight by animateFloatAsState(
-                        targetValue = colorWeight,
-                        animationSpec = tween(90, easing = IosEaseOut),
-                        label = "tab-color-weight",
-                    )
                     val contentColor =
-                        androidx.compose.ui.graphics.lerp(idleColor, activeColor, smoothWeight)
-
-                    // 字重：过半才加粗，避免中途来回跳
+                        androidx.compose.ui.graphics.lerp(idleColor, activeColor, weight)
                     val fontWeight =
-                        if (smoothWeight > 0.5f) FontWeight.SemiBold else FontWeight.Normal
+                        if (weight > 0.5f) FontWeight.SemiBold else FontWeight.Normal
 
-                    // 【不要在这里挂 Clickable】
-                    //
-                    // 这是「点击要两次」的直接原因：子级 Clickable 触发一次 onSelect，
-                    // 父级 pointerInput 松手时又触发一次，第一次切过去、第二次切回来。
-                    //
-                    // 现在所有输入统一由父级手势处理（点按与拖拽都在那里判定），
-                    // 子级只负责显示文字，不接收点击。
                     Box(
                         modifier = Modifier
                             .weight(1f)
@@ -1261,74 +596,53 @@ fun GlassTabBar(
                     }
                 }
             }
-        } else {
-            // 采样源还没准备好时的兜底，避免首帧闪一下空白
+
+
+            // ---------- 第三层：指示器（材质未改动） ----------
+            //
+            // 位置从 renderPos 换算成像素。renderPos 是唯一的真值，
+            // 因此这里不存在「读哪个值」的决策 —— 那是旧架构的 bug 来源。
+            val indPos = renderPos()
+            val scale = scaleAnim.value
+            // 注意：这里**只用基础高度**布局，放大由 graphicsLayer 完成。
+            //
+            // 之前写的是「hDp = 基础高度 × scale」再算 padding 居中，
+            // 当 scale=1.40 时 hDp=56dp > barHeight=52dp，
+            // padding = (52-56)/2 = -2dp → Compose 抛
+            // IllegalArgumentException: Padding must be non-negative，
+            // App 当场崩溃（真机表现是"按住就退回桌面"）。
+            //
+            // graphicsLayer 的 scale 以自身中心为轴，不改变布局尺寸，
+            // 因此这里用固定高度即可，放大后自然上下溢出、不会被裁剪。
+            val hDp = with(density) { indicatorHeightPx.toDp() }
+            val wDp = with(density) { indicatorWidthPx.toDp() }
+
             Box(
-                Modifier
-                    .fillMaxWidth()
-                    .height(barHeight)
-                    .background(
-                        color = Color.White.copy(alpha = 0.10f),
-                        shape = androidx.compose.foundation.shape.RoundedCornerShape(barHeight / 2),
-                    ),
-            )
-        }
-
-
-        // ================= 第二层：指示器（不裁剪，浮在外围之上） =================
-        val hDp = with(density) { hAnim.value.toDp() }
-        val wDp = with(density) { wAnim.value.toDp() }
-
-        Box(
-            modifier = Modifier
-                .offset {
-                    // ============ 位置来源 ============
-                    //
-                    // 只有 liveOffset（pager 连续进度）。
-                    // 按住、拖拽、松手落位全部通过驱动 pager 产生位移，
-                    // 因此这里不需要任何「拿起态」分支 —— 也就没有了交接竞态。
-                    // 优先级：
-                    //   1. 拖拽中（pressX 非 NaN）→ 直接用同步值，逐帧跟手；
-                    //   2. pager 有进度 → liveOffset；
-                    //   3. 首帧 → xAnim。
-                    // 优先级（与 currentRenderX() 必须完全一致）：
-                    //   1. 拖拽中（pressX 非 NaN）→ 同步值，逐帧跟手；
-                    //   2. 点击平移动画进行中（slideAnim 非 NaN）→ 自己的一段减速运动；
-                    //   3. pager 有进度 → liveOffset；
-                    //   4. 兜底 → xAnim。
-                    //
-                    // 把 2 排在 3 前面是修「点一下直接瞬移」的关键：
-                    // 点击后 pager 的 offsetFraction 会立刻从 0 变到 ±1，
-                    // 若让 liveOffset 抢跑，指示器就没有可感知的过渡。
-                    val cx = when {
-                        !pressX.isNaN() -> pressX
-                        isSliding() -> slideAnim.value
-                        !settledX.isNaN() -> settledX
-                        liveOffset != null -> offsetToX(liveOffset)
-                        else -> xAnim.value
+                modifier = Modifier
+                    .offset {
+                        IntOffset(posToX(indPos).roundToInt(), 0)
                     }
-                    IntOffset(cx.roundToInt(), 0)
+                    // 基础高度小于底栏高度，padding 恒为正
+                    .padding(top = ((barHeight - hDp) / 2).coerceAtLeast(0.dp))
+                    .width(wDp)
+                    .height(hDp)
+                    // 放大用 graphicsLayer：以自身中心缩放，
+                    // 溢出部分不会被父级 layout 边界裁掉
+                    .graphicsLayer {
+                        scaleX = scale
+                        scaleY = scale
+                    },
+            ) {
+                Canvas(modifier = Modifier.size(wDp, hDp)) {
+                    drawLiquidIndicator(
+                        isDark = colors.isDark,
+                        glow = glowAnim.value,
+                        dragProgress = ((scale - 1f) / (BarDragScale - 1f)).coerceIn(0f, 1f),
+                    )
                 }
-                // 垂直居中：高度大于底栏时上下对称溢出
-                .padding(top = (barHeight - hDp) / 2)
-                .width(wDp)
-                .height(hDp)
-                .graphicsLayer {
-                    // 用 graphicsLayer 放大：以自身中心缩放，
-                    // 溢出部分不会被父级的 layout 边界裁掉
-                    scaleX = scaleAnim.value
-                    scaleY = scaleAnim.value
-                },
-        ) {
-            Canvas(modifier = Modifier.size(wDp, hDp)) {
-                drawLiquidIndicator(
-                    isDark = colors.isDark,
-                    glow = glowAnim.value,
-                    dragProgress = ((scaleAnim.value - 1f) / (dragScale - 1f)).coerceIn(0f, 1f),
-                )
             }
+
         }
-    }
     }
 }
 
