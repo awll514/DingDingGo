@@ -40,6 +40,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
@@ -597,51 +598,44 @@ fun GlassTabBar(
             }
 
             // ---------- 第二层：文字 ----------
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(barHeight),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                val pos = renderPos()
-                tabs.forEachIndexed { index, label ->
-                    // 颜色是位置的连续函数：拖到 70% 就蓝 70%，与指示器永远同相。
-                    // 这是「文字变色要等一秒」的根治方案 —— 不做独立动画，
-                    // 直接由位置算出权重，天生零延迟。
-                    val weight = (1f - abs(pos - index)).coerceIn(0f, 1f)
-                    val activeColor =
-                        if (colors.isDark) colors.textPrimary else Color(0xFF1A73E8)
-                    val idleColor =
-                        if (colors.isDark) Color(0xCCD8E2F0) else Color(0xCC2A3140)
-                    val contentColor =
-                        androidx.compose.ui.graphics.lerp(idleColor, activeColor, weight)
-                    val fontWeight =
-                        if (weight > 0.5f) FontWeight.SemiBold else FontWeight.Normal
-
-                    Box(
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(barHeight),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Text(
-                            text = label,
-                            color = contentColor,
-                            fontSize = 13.sp,
-                            fontWeight = fontWeight,
-                            letterSpacing = 0.3.sp,
-                        )
-                    }
-                }
-            }
+            //
+            // 抽成独立 Composable 是为了**限制重组范围**。
+            //
+            // 文字颜色由位置连续算出（拖到 70% 就蓝 70%，与指示器永远同相，
+            // 零延迟 —— 这是「变色要等一秒」的根治方案）。
+            // 但 Text(color=) 是组合期参数，必须在 composition 里读 posAnim。
+            //
+            // 如果直接内联在这里，重组会波及整个 GlassTabBar —— 包括
+            // LiquidGlassPanel（AGSL 玻璃，重组的代价远高于几个 Text）。
+            // 抽出去之后，每帧重组的只有 TabLabels 内部这 2 个 Text。
+            TabLabels(
+                tabs = tabs,
+                positionProvider = { renderPos() },
+                isDark = colors.isDark,
+                primaryColor = colors.textPrimary,
+                barHeight = barHeight,
+            )
 
 
             // ---------- 第三层：指示器（材质未改动） ----------
             //
             // 位置从 renderPos 换算成像素。renderPos 是唯一的真值，
             // 因此这里不存在「读哪个值」的决策 —— 那是旧架构的 bug 来源。
-            val indPos = renderPos()
-            val scale = scaleAnim.value
+            // 注意：这里**故意不在 composition 阶段读位置和缩放**。
+            //
+            // ## 为什么
+            //
+            // renderPos() 内部读 posAnim.value / dragPos，scaleAnim.value 也是 State。
+            // 在 Composable 函数体里读 = **订阅**，于是指示器每动画一帧，
+            // 整个 GlassTabBar 子树就完整重组一次：重建 Modifier 链、
+            // 重建 Canvas 的 draw lambda、tabs.forEachIndexed 重建 2 个 Text，
+            // 还要重新判定 LiquidGlassPanel —— 连 AGSL 玻璃面板一起波及。
+            //
+            // 这个开销比绘制本身高 2~3 个数量级。
+            //
+            // 改成在 graphicsLayer / drawWithCache 的 lambda 里读：
+            // 那些 lambda 属于 **draw 阶段**，读 State 只触发 invalidateDraw，
+            // 不重组、不重新布局。
             // 注意：这里**只用基础高度**布局，放大由 graphicsLayer 完成。
             //
             // 之前写的是「hDp = 基础高度 × scale」再算 padding 居中，
@@ -657,76 +651,187 @@ fun GlassTabBar(
 
             Box(
                 modifier = Modifier
-                    .offset {
-                        IntOffset(posToX(indPos).roundToInt(), 0)
-                    }
-                    // 基础高度小于底栏高度，padding 恒为正
+                    // 基础高度小于底栏高度，padding 恒为正（这三个是静态布局，不进动画）
                     .padding(top = ((barHeight - hDp) / 2).coerceAtLeast(0.dp))
                     .width(wDp)
                     .height(hDp)
-                    // 放大用 graphicsLayer：以自身中心缩放，
-                    // 溢出部分不会被父级 layout 边界裁掉
+                    // 位移与缩放都放进 graphicsLayer —— 属于 draw 阶段，
+                    // 只触发 invalidateDraw，不重新 measure/place。
+                    //
+                    // 之前用 Modifier.offset{} 每帧都会重新布局整个指示器，
+                    // 而它是页面上唯一跟着动画走的元素 —— 等于每帧一次全局 layout。
                     .graphicsLayer {
-                        scaleX = scale
-                        scaleY = scale
+                        translationX = posToX(renderPos())
+                        scaleX = scaleAnim.value
+                        scaleY = scaleAnim.value
                     },
             ) {
-                Canvas(modifier = Modifier.size(wDp, hDp)) {
-                    drawLiquidIndicator(
-                        isDark = colors.isDark,
-                        glow = glowAnim.value,
-                        dragProgress = ((scale - 1f) / (BarDragScale - 1f)).coerceIn(0f, 1f),
-                    )
-                }
+                // drawWithCache 的 lambda 只在 **size / density / layoutDirection**
+                // 变化时重跑，动画帧之间完全不执行 ——
+                // 依赖尺寸的 glowBrush 和依赖 density 的 Stroke 因此只创建一次。
+                //
+                // onDrawBehind 里的读值属于 draw 阶段，不触发重组。
+                Box(
+                    modifier = Modifier
+                        .size(wDp, hDp)
+                        .drawWithCache {
+                            val glowBrush = Brush.radialGradient(
+                                colors = listOf(GlowColor, GlowColor.copy(alpha = 0f)),
+                                center = Offset(size.width / 2f, size.height / 2f),
+                                radius = size.maxDimension * 0.85f,
+                            )
+                            val edgeStroke = Stroke(width = 1.dp.toPx())
+                            onDrawBehind {
+                                val sc = scaleAnim.value
+                                drawLiquidIndicator(
+                                    isDark = colors.isDark,
+                                    glow = glowAnim.value,
+                                    dragProgress = ((sc - 1f) / (BarDragScale - 1f))
+                                        .coerceIn(0f, 1f),
+                                    glowBrush = glowBrush,
+                                    edgeStroke = edgeStroke,
+                                )
+                            }
+                        },
+                )
             }
 
         }
     }
 }
 
+
+/**
+ * 底栏文字。
+ *
+ * 单独抽成 Composable，是为了把「每帧因位置变化而重组」的范围
+ * 限制在这两个 Text 内部，不让它波及 AGSL 玻璃面板。
+ *
+ * @param positionProvider 用 lambda 而不是直接传 Float ——
+ *        传 Float 的话调用方在 composition 里读 State 就订阅了，照样整树重组。
+ */
+@Composable
+private fun TabLabels(
+    tabs: List<String>,
+    positionProvider: () -> Float,
+    isDark: Boolean,
+    primaryColor: Color,
+    barHeight: androidx.compose.ui.unit.Dp,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(barHeight),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        val pos = positionProvider()
+        tabs.forEachIndexed { index, label ->
+            // 颜色是位置的连续函数：拖到 70% 就蓝 70%，与指示器永远同相。
+            val weight = (1f - abs(pos - index)).coerceIn(0f, 1f)
+            val activeColor = if (isDark) primaryColor else Color(0xFF1A73E8)
+            val idleColor = if (isDark) Color(0xCCD8E2F0) else Color(0xCC2A3140)
+            val contentColor =
+                androidx.compose.ui.graphics.lerp(idleColor, activeColor, weight)
+            val fontWeight =
+                if (weight > 0.5f) FontWeight.SemiBold else FontWeight.Normal
+
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .height(barHeight),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = label,
+                    color = contentColor,
+                    fontSize = 13.sp,
+                    fontWeight = fontWeight,
+                    letterSpacing = 0.3.sp,
+                )
+            }
+        }
+    }
+}
+// ==================== 静态绘制资源（零每帧分配） ====================
+//
+// 这些 Brush 的**颜色与结构完全固定**，只有整体 alpha 在变。
+// 把动态 alpha 从 color stops 里挪到 drawRoundRect(alpha=) 参数，
+// Brush 就变成编译期常量，可以提到函数外。
+//
+// ## 为什么这很重要
+//
+// 反编译确认：Brush.verticalGradient / radialGradient 每次调用都 new 一个
+// LinearGradient / RadialGradient 对象。而且 ShaderBrush 内部按 createdSize
+// 缓存 native shader —— 每帧新实例导致 createdSize 永远是 Unspecified，
+// 缓存 100% 失效 → 每帧必然重建 native SkShader + Paint.setShader。
+//
+// Java 小对象本身不是问题（11 个/帧对 ART 是噪声），
+// 但 native shader 构造 + 渲染管线 paint state 重建比它贵一个数量级。
+
+private val GlowColor = Color(0xFF7CC4FF)
+
+/** 边缘描边（深色）：两条 stop 的 alpha 比是 0.22 : 0.04，不是固定倍数，必须各自保留 */
+private val EdgeBrushDark = Brush.verticalGradient(
+    colors = listOf(Color.White.copy(alpha = 0.22f), Color.White.copy(alpha = 0.04f)),
+)
+
+/** 边缘描边（浅色）：0.70 : 0.10 */
+private val EdgeBrushLight = Brush.verticalGradient(
+    colors = listOf(Color.White.copy(alpha = 0.70f), Color.White.copy(alpha = 0.10f)),
+)
+
+/**
+ * 主体渐变。
+ *
+ * 只表达**相对比例**（上亮下暗 1 : 0.62），绝对透明度由 drawRoundRect 的
+ * alpha 参数给 —— 这样同一个 Brush 能服务任意 intensity。
+ */
+private val BodyBrush = Brush.verticalGradient(
+    colors = listOf(Color.White, Color.White.copy(alpha = 0.62f)),
+)
+
 /**
  * 绘制液态玻璃指示器。
  *
- * 五层结构（从底到顶）：
- * 1. **外发光**：拖拽/切换时的柔光，让它看起来"发亮地浮着"；
- * 2. **投影**：向下偏移的暗影，制造脱离底栏的悬浮感；
- * 3. **主体**：竖向渐变 + 轻微径向高光，玻璃的厚度感；
- * 4. **流动高光带**：随 shimmer 扫过的亮带，液体表面反光；
- * 5. **边缘描边**：上亮下暗的 1px 线，玻璃的锐利边缘。
+ * ## 参数说明
  *
- * 用 Canvas 而不是叠 Box，因为要高光的角度与位置可控。
+ * @param glowBrush 外发光用的径向渐变。依赖 size，由调用方 drawWithCache 缓存。
+ * @param edgeStroke 1dp 描边。依赖 density，由调用方缓存。
+ *
+ * ## 五层结构（从底到顶）
+ * 1. 外发光 —— 拖拽/切换时的柔光
+ * 2. 投影 —— 向下偏移的暗影，制造悬浮感
+ * 3. 主体 —— 竖向渐变，玻璃的厚度感
+ * 4. 边缘描边 —— 上亮下暗的 1px 线
+ *
+ * （第 4 层「流动高光带」当前未实现 —— 用户要求去掉常驻流光，
+ *   只在交互瞬间有质感反应，所以这一层是刻意省略的。）
  */
 private fun DrawScope.drawLiquidIndicator(
     isDark: Boolean,
     glow: Float,
     dragProgress: Float,
+    glowBrush: Brush,
+    edgeStroke: Stroke,
 ) {
     val w = size.width
     val h = size.height
-    val radius = h / 2f
-    val corner = CornerRadius(radius, radius)
+    val corner = CornerRadius(h / 2f, h / 2f)
 
-    // 交互强度：只有拖拽或切换脉冲时才 > 0
     val intensity = maxOf(glow, dragProgress).coerceIn(0f, 1f)
 
-    // ---- 外发光：只在交互时出现 ----
+    // ① 外发光：只在交互时出现。alpha 走参数，Brush 复用。
     if (intensity > 0.02f) {
         drawRoundRect(
-            brush = Brush.radialGradient(
-                colors = listOf(
-                    Color(0xFF7CC4FF).copy(alpha = 0.26f * intensity),
-                    Color(0xFF7CC4FF).copy(alpha = 0f),
-                ),
-                center = Offset(w / 2f, h / 2f),
-                radius = w.coerceAtLeast(h) * 0.85f,
-            ),
+            brush = glowBrush,
+            alpha = 0.26f * intensity,
             topLeft = Offset(-h * 0.35f, -h * 0.35f),
             size = Size(w + h * 0.7f, h + h * 0.7f),
             cornerRadius = CornerRadius((h + h * 0.7f) / 2f),
         )
     }
 
-    // ---- 投影：拖拽时加深，强化"脱离底栏浮起来" ----
+    // ② 投影：拖拽时加深，强化「脱离底栏浮起来」
     val shadowAlpha = (if (isDark) 0.16f else 0.10f) * (0.7f + intensity * 0.9f)
     drawRoundRect(
         color = Color.Black.copy(alpha = shadowAlpha),
@@ -735,30 +840,19 @@ private fun DrawScope.drawLiquidIndicator(
         cornerRadius = corner,
     )
 
-    // ---- 主体：静止时非常克制 ----
-    //
-    // iOS 的选中指示器只是"比背景亮一点的一层"：
-    // 静止 alpha 0.10（深）/ 0.30（浅），动起来才涨到 0.20 / 0.44。
+    // ③ 主体：静态 Brush + 动态 alpha
+    //    静止 alpha 0.10（深）/ 0.30（浅），动起来涨到 0.20 / 0.44
     val baseAlpha = if (isDark) 0.10f + intensity * 0.10f else 0.30f + intensity * 0.14f
     drawRoundRect(
-        brush = Brush.verticalGradient(
-            colors = listOf(
-                Color.White.copy(alpha = baseAlpha),
-                Color.White.copy(alpha = baseAlpha * 0.62f),
-            ),
-        ),
+        brush = BodyBrush,
+        alpha = baseAlpha,
         cornerRadius = corner,
     )
 
-    // ---- 边缘描边：静态就有的那一圈细线，是"玻璃边缘"的底线 ----
+    // ④ 边缘描边：静态 Brush + 静态 Stroke
     drawRoundRect(
-        brush = Brush.verticalGradient(
-            colors = listOf(
-                Color.White.copy(alpha = if (isDark) 0.22f else 0.70f),
-                Color.White.copy(alpha = if (isDark) 0.04f else 0.10f),
-            ),
-        ),
+        brush = if (isDark) EdgeBrushDark else EdgeBrushLight,
         cornerRadius = corner,
-        style = Stroke(width = 1.dp.toPx()),
+        style = edgeStroke,
     )
 }
