@@ -724,9 +724,15 @@ private fun BtStatusCard(
                 Text(
                     text = bt.missingPermission
                         ?: if (bt.deviceName.isNotBlank()) {
-                            "已学习「" + bt.deviceName + "」"
+                            buildString {
+                                append("已学习「").append(bt.deviceName).append("」")
+                                if (bt.deviceMac.isNotBlank()) {
+                                    append(" · MAC ").append(bt.deviceMac)
+                                }
+                                append(" · 特征 UUID 0xFE3C")
+                            }
                         } else {
-                            "按钉钉考勤机广播特征匹配（未指定具体设备）"
+                            "按钉钉考勤机广播特征匹配（Service UUID 0xFE3C）"
                         },
                     color = if (bt.missingPermission != null) colors.error else colors.textTertiary,
                     fontSize = 11.5.sp,

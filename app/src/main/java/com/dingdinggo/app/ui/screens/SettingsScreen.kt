@@ -831,9 +831,21 @@ private fun BtSettingsGroup(
             title = "检测到公司考勤机时自动打卡",
             subtitle = when {
                 !bt.enabled -> "关闭时只按设定时间自动打卡"
-                bt.present -> "当前在考勤机范围内"
-                bt.deviceName.isNotBlank() -> "已学习「" + bt.deviceName + "」，当前不在范围内"
-                else -> "已开启，但还没学习考勤机（将按钉钉考勤机特征匹配）"
+                bt.present -> buildString {
+                    append("当前在考勤机范围内（UUID 0xFE3C")
+                    if (bt.deviceMac.isNotBlank()) {
+                        append(" · ").append(bt.deviceMac)
+                    }
+                    append("）")
+                }
+                bt.deviceName.isNotBlank() -> buildString {
+                    append("已学习「").append(bt.deviceName).append("」")
+                    if (bt.deviceMac.isNotBlank()) {
+                        append("（").append(bt.deviceMac).append("）")
+                    }
+                    append("，当前不在范围内")
+                }
+                else -> "已开启，未绑定单台设备（按广播特征 UUID 0xFE3C 匹配）"
             },
             trailing = {
                 GlassSwitch(
@@ -888,9 +900,9 @@ private fun BtSettingsGroup(
                     is LearnState.Running -> "正在扫描附近设备…（最多 12 秒）"
                     is LearnState.Done -> s.message
                     LearnState.Idle -> if (bt.deviceName.isNotBlank()) {
-                        bt.deviceMac + " · 点一下可重新学习"
+                        "名称：${bt.deviceName} · MAC：${bt.deviceMac} · 特征：UUID 0xFE3C（点此重新学习）"
                     } else {
-                        "走到考勤机旁点一下，可锁定你这台机器，避免同楼其他考勤机误触发"
+                        "走到考勤机旁点一下，可记录该机器的 MAC 与名称特征，辅助区分同楼 0xFE3C 设备"
                     }
                 },
                 value = if (bt.deviceName.isNotBlank() && learnState is LearnState.Idle) {
@@ -911,7 +923,7 @@ private fun BtSettingsGroup(
                 SettingsDivider()
                 SettingsRow(
                     title = "忘记这台考勤机",
-                    subtitle = "清除后会退回按设备特征匹配",
+                    subtitle = "清除已保存的 MAC 与名称，退回按通用特征（UUID 0xFE3C）匹配",
                     danger = true,
                     onClick = {
                         learnState = LearnState.Idle

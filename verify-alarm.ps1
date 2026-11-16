@@ -141,5 +141,5 @@ Write-Host "══════════════════════�
 Write-Host " 提示："
 Write-Host "  • 如果第 1 项为空，先手动打开一次 App"
 Write-Host "  • 重启手机后再跑一遍本脚本，是验证自启动的唯一可靠方法"
-Write-Host "  • 完整验证清单见 README.md 第四节"
+Write-Host "  • 完整验证清单见 README.md 第五节"
 Write-Host "════════════════════════════════════════════" -ForegroundColor Cyan
