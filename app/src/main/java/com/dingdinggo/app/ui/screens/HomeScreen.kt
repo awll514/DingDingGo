@@ -1,0 +1,757 @@
+package com.dingdinggo.app.ui.screens
+
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.getValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.dingdinggo.app.core.HealthCheck
+import com.dingdinggo.app.core.PunchSchedule
+import com.dingdinggo.app.data.db.PunchKind
+import com.dingdinggo.app.ui.HomeStatus
+import com.dingdinggo.app.ui.HomeUiState
+import com.dingdinggo.app.ui.components.CountdownPanelContent
+import com.dingdinggo.app.ui.components.ConfirmDialog
+import com.dingdinggo.app.ui.components.GlassTextButton
+import com.dingdinggo.app.ui.components.LiquidGlassButton
+import com.dingdinggo.app.ui.components.HealthCard
+import com.dingdinggo.app.ui.components.PixelDingMascotPortal
+import com.dingdinggo.app.ui.components.PixelStarAccent
+import com.dingdinggo.app.ui.components.PunchStatusRow
+import com.dingdinggo.app.ui.components.badgeColor
+import com.dingdinggo.app.ui.components.resolveDingMascotMood
+import com.dingdinggo.app.ui.components.StatusPill
+import com.dingdinggo.app.ui.components.ClickableNoRipple
+import com.dingdinggo.app.ui.glass.FrostedPanel
+import com.dingdinggo.app.ui.glass.LiquidGlassPanel
+import com.dingdinggo.app.ui.theme.GlassDimens
+import com.dingdinggo.app.ui.theme.GlassMotion
+import com.dingdinggo.app.ui.theme.GlassTheme
+
+/**
+ * 首页。
+ */
+@Composable
+fun HomeScreen(
+    state: HomeUiState,
+    busy: Boolean,
+    onManualPunch: () -> Unit,
+    onFixHealth: (HealthCheck.Item) -> Unit,
+    onSkipToday: (Boolean) -> Unit,
+    onRequestBtPermission: () -> Unit = {},
+    backgroundPaused: Boolean = false,
+    modifier: Modifier = Modifier,
+) {
+    val colors = GlassTheme.colors
+    val mascotMood = resolveDingMascotMood(state = state, busy = busy)
+
+    // 两个不可逆操作都需要二次确认
+    var showPunchConfirm by remember { mutableStateOf(false) }
+    var showSkipConfirm by remember { mutableStateOf(false) }
+    var showMascotQuip by remember { mutableStateOf(false) }
+
+
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = GlassDimens.pagePadding),
+    ) {
+        Spacer(Modifier.height(20.dp))
+
+        // ---------- 顶部标题栏 ----------
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                PixelDingMascotPortal(
+                    size = 52.dp,
+                    cornerRadius = 16.dp,
+                    mood = mascotMood,
+                    backgroundPaused = backgroundPaused,
+                    onClick = { showMascotQuip = !showMascotQuip },
+                )
+                Column {
+                    // Apple Large Title：34pt Regular（Bold 才是强调），
+                    // 字距收紧 -0.5，视觉上更"整"。
+                    Text(
+                        text = "钉钉GO",
+                        color = colors.textPrimary,
+                        fontSize = 30.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        letterSpacing = (-0.8).sp,
+                    )
+                    Spacer(Modifier.height(2.dp))
+                    // Apple 的副标题：15pt secondary
+                    Text(
+                        text = if (state.enabled) "定时任务运行中" else "定时任务已暂停",
+                        color = if (state.enabled) colors.textTertiary else colors.warning,
+                        fontSize = 13.sp,
+                        letterSpacing = (-0.1).sp,
+                    )
+                }
+            }
+            StatusPillFor(state = state, busy = busy)
+        }
+
+        AnimatedVisibility(
+            visible = showMascotQuip,
+            enter = fadeIn(tween(180)) + expandVertically(tween(220)),
+            exit = fadeOut(tween(150)) + shrinkVertically(tween(180)),
+        ) {
+            FrostedPanel(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 10.dp),
+                cornerRadius = 16.dp,
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    PixelStarAccent(color = mascotMood.badgeColor(), size = 12.dp)
+                    Text(
+                        text = "钉钉娘：${mascotMood.quip}",
+                        color = colors.textSecondary,
+                        fontSize = 12.sp,
+                    )
+                }
+            }
+        }
+
+        Spacer(Modifier.height(18.dp))
+
+        // ---------- 倒计时大玻璃面板 ----------
+        LiquidGlassPanel(
+            modifier = Modifier.fillMaxWidth(),
+            cornerRadius = GlassDimens.radiusLarge,
+            blurRadius = 28.dp,
+            lensHeight = 12.dp,
+            lensAmount = 16.dp,
+        ) {
+            Column {
+                CountdownPanelContent(
+                    kindLabel = kindLabelOf(state),
+                    countdown = state.countdownText,
+                    targetTimeLabel = targetLabelOf(state),
+                    hintLabel = hintOf(state),
+                    active = state.enabled,
+                    progress = slotProgressOf(state),
+                )
+
+                val failed = state.status as? HomeStatus.Failed
+                if (failed != null) {
+                    val bannerShape = RoundedCornerShape(16.dp)
+                    val bannerBg = colors.error.copy(alpha = if (colors.isDark) 0.12f else 0.06f)
+                    val bannerBorder = colors.error.copy(alpha = if (colors.isDark) 0.22f else 0.14f)
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = 16.dp, end = 16.dp, bottom = 16.dp)
+                            .clip(bannerShape)
+                            .background(bannerBg)
+                            .border(0.75.dp, bannerBorder, bannerShape)
+                            .padding(horizontal = 14.dp, vertical = 11.dp),
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(7.dp),
+                                modifier = Modifier.weight(1f),
+                            ) {
+                                Box(
+                                    Modifier
+                                        .size(6.dp)
+                                        .clip(CircleShape)
+                                        .background(colors.error),
+                                )
+                                Text(
+                                    text = "最近失败 · ${failed.stage}",
+                                    color = colors.error,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    letterSpacing = 0.1.sp,
+                                )
+                            }
+                            if (!busy) {
+                                Spacer(Modifier.width(8.dp))
+                                GlassTextButton(
+                                    text = "重试",
+                                    onClick = { showPunchConfirm = true },
+                                    tintColor = colors.error,
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            text = PunchSchedule.normalizeDurationDisplay(
+                                failed.message.ifBlank { "执行未通过界面成功校验" },
+                            ),
+                            color = colors.textSecondary,
+                            fontSize = 11.5.sp,
+                            lineHeight = 16.sp,
+                            letterSpacing = (-0.2).sp,
+                        )
+                    }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(GlassDimens.cardGap))
+
+        // ---------- 今日打卡玻璃卡 ----------
+        LiquidGlassPanel(
+            modifier = Modifier.fillMaxWidth(),
+            cornerRadius = GlassDimens.radiusMedium,
+            blurRadius = 26.dp,
+            lensHeight = 10.dp,
+            lensAmount = 12.dp,
+        ) {
+            Column(Modifier.padding(GlassDimens.cardPadding)) {
+                // 卡片标题行 + 完成度
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text(
+                        text = "今日打卡",
+                        color = colors.textPrimary,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        text = completionLabel(state),
+                        color = if (isAllDone(state)) colors.success else colors.textTertiary,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium,
+                    )
+                }
+
+                Spacer(Modifier.height(14.dp))
+
+                PunchStatusRow(
+                    label = "上班",
+                    doneTime = state.todayClockIn?.displayTimeText(),
+                    done = state.todayClockIn != null,
+                )
+
+                Spacer(Modifier.height(14.dp))
+
+                // 进度条：显示今天完成的阶段
+                TodayProgress(
+                    clockInDone = state.todayClockIn != null,
+                    clockOutDone = state.todayClockOut != null,
+                )
+
+                Spacer(Modifier.height(14.dp))
+
+                PunchStatusRow(
+                    label = "下班",
+                    doneTime = state.todayClockOut?.displayTimeText(),
+                    done = state.todayClockOut != null,
+                    onColor = colors.accent,
+                )
+            }
+        }
+
+        Spacer(Modifier.height(GlassDimens.cardGap))
+
+        // ---------- 手动打卡兜底 ----------
+        // 顺序调整：手动打卡放在健康度之前。
+        // 理由：健康度是"诊断信息"，日常用户不需要天天看；
+        // 手动打卡是"操作入口"，应该更靠上更容易够到。
+        ManualPunchButton(
+            busy = busy,
+            enabled = !busy,
+            onClick = { showPunchConfirm = true },
+        )
+
+        // ---------- 蓝牙在场状态 ----------
+        //
+        // 只在功能开启时才显示。关着的时候这块完全不渲染 ——
+        // 既符合"后台零消耗"的精神（不显示就没有任何开销），
+        // 也避免让不用这个功能的人看到无意义的卡片。
+        if (state.bt.enabled) {
+            Spacer(Modifier.height(GlassDimens.cardGap))
+            BtStatusCard(
+                bt = state.bt,
+                onRequestPermission = onRequestBtPermission,
+            )
+        }
+
+        Spacer(Modifier.height(GlassDimens.cardGap))
+
+        // ---------- 保活健康度 ----------
+        HealthCard(report = state.health, onFix = onFixHealth)
+
+        Spacer(Modifier.height(18.dp))
+
+        // ---------- 跳过 / 恢复（低权重文本按钮）----------
+        //
+        // 刻意做成"纯文字 + 无背景"，而不是和「立即手动打卡」同级的玻璃按钮：
+        //
+        // 1. 它是低频操作，不该抢主操作的视觉权重；
+        // 2. 真机踩过坑 —— 系统权限弹窗消失的瞬间，
+        //    原本落在弹窗上的点击会穿透到下面的按钮，
+        //    结果"点允许通知"变成了"跳过今天"。
+        //    把它做得更小、更靠下，能显著降低这类误触。
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .ClickableNoRipple(
+                    onClick = { showSkipConfirm = true },
+                )
+                .padding(vertical = 8.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                text = if (state.skipToday) {
+                    "取消跳过" + state.skippedDayLabel
+                } else {
+                    "跳过" + state.nextDayLabel + "的自动打卡"
+                },
+                color = if (state.skipToday) colors.success else colors.textTertiary,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
+                letterSpacing = 0.3.sp,
+            )
+        }
+
+        Spacer(Modifier.height(6.dp))
+
+        Text(
+            text = "手动打卡会立即执行一次完整流程，适合配置后自测。",
+            color = colors.textTertiary,
+            fontSize = 10.sp,
+            lineHeight = 14.sp,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.fillMaxWidth(),
+        )
+
+        // ============ 列表末尾占位：必须让内容滚到**底栏下面** ============
+        //
+        // 【第七轮 · 找到"底栏不透"的真正原因】
+        //
+        // 之前一直以为是玻璃参数（tint / 模糊 / 折射）没调好，
+        // 连续改了七八轮都没效果。做了受控实验才看清：
+        //
+        //   把 tintAlpha 设为 0，底栏仍是 RGB(221,226,233) —— 一个均匀的亮块。
+        //   而它背后的内容区是 RGB(190,210,246)。
+        //
+        // 说明玻璃**确实在采样**，只是它采样的那块区域**本来就没有内容**。
+        //
+        // 根因就是这里的 Spacer：74dp 把最后一行字顶到了底栏上沿之上，
+        // 于是底栏正下方永远是一片空的背景渐变。
+        // 玻璃再透，透的也只是背景 —— 当然看起来像一块纯色板。
+        //
+        // iOS 的悬浮底栏之所以"透"，是因为列表会**从它下面滑过去**，
+        // 滚动时能看见卡片边缘在玻璃里变形。
+        //
+        // 所以这里要给的不是"刚好够露出最后一行"的高度，
+        // 而是**整个底栏高度 + 额外余量**，保证滚到底时内容仍然延伸到玻璃下方：
+        //   底栏 52dp + 上下 padding 20dp + 手势条区域 20dp ≈ 92dp
+        // 取 120dp，多留 28dp：滚到最底时，最后一行字仍有一部分位于玻璃之下。
+        Spacer(Modifier.height(GlassDimens.bottomBarReserved))
+    }
+
+    // ---------- 二次确认 ----------
+    if (showPunchConfirm) {
+        ConfirmDialog(
+            title = "立即执行一次打卡？",
+            message = "会现在打开钉钉并真实点击打卡按钮，可能产生一条考勤记录。" +
+                "如果不是上下班时间，钉钉可能拒绝或记为异常。",
+            confirmText = "立即打卡",
+            onConfirm = {
+                showPunchConfirm = false
+                onManualPunch()
+            },
+            onDismiss = { showPunchConfirm = false },
+        )
+    }
+
+    if (showSkipConfirm) {
+        val skipping = !state.skipToday
+        val dayWord = state.nextDayLabel
+        ConfirmDialog(
+            title = if (skipping) "跳过" + dayWord + "的所有自动打卡？" else "恢复" + dayWord + "的自动打卡？",
+            message = if (skipping) {
+                dayWord + "不会再自动打上班卡和下班卡，之后自动恢复。" +
+                    "如果这天已经打过，已产生的记录不受影响。"
+            } else {
+                dayWord + "剩余的打卡会重新按计划自动执行。已经错过的时间点不会补打。"
+            },
+            confirmText = if (skipping) "跳过" + dayWord else "恢复打卡",
+            danger = skipping,
+            onConfirm = {
+                showSkipConfirm = false
+                onSkipToday(skipping)
+            },
+            onDismiss = { showSkipConfirm = false },
+        )
+    }
+}
+
+/** 今日完成度文案 */
+private fun completionLabel(state: HomeUiState): String {
+    val a = state.todayClockIn != null
+    val b = state.todayClockOut != null
+    return when {
+        a && b -> "已全部完成"
+        a -> "已完成 1 / 2"
+        b -> "已完成 1 / 2"
+        else -> "待开始"
+    }
+}
+
+private fun isAllDone(state: HomeUiState): Boolean =
+    state.todayClockIn != null && state.todayClockOut != null
+
+/**
+ * 今日进度条：两段式，第一段代表上班，第二段代表下班。
+ * 这是把"两个独立状态"在视觉上连成一条时间线，比两行文字更容易一眼看完。
+ */
+@Composable
+private fun TodayProgress(clockInDone: Boolean, clockOutDone: Boolean) {
+    val colors = GlassTheme.colors
+
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Segment(filled = clockInDone, color = colors.success, modifier = Modifier.weight(1f))
+        Spacer(Modifier.width(6.dp))
+        Segment(filled = clockOutDone, color = colors.accent, modifier = Modifier.weight(1f))
+    }
+}
+
+@Composable
+private fun Segment(
+    filled: Boolean,
+    color: Color,
+    modifier: Modifier = Modifier,
+) {
+    val colors = GlassTheme.colors
+    Box(
+        modifier = modifier
+            .height(3.dp)
+            .clip(CircleShape)
+            .background(
+                if (filled) {
+                    color.copy(alpha = 0.85f)
+                } else {
+                    colors.textTertiary.copy(alpha = 0.16f)
+                }
+            ),
+    )
+}
+
+/** 状态徽标 */
+@Composable
+private fun StatusPillFor(state: HomeUiState, busy: Boolean) {
+    val colors = GlassTheme.colors
+
+    val (text, color, pulsing) = when {
+        busy -> Triple("执行中", colors.accent, true)
+        else -> when (val s = state.status) {
+            is HomeStatus.Running -> Triple("执行中", colors.accent, true)
+            is HomeStatus.Waiting -> Triple("等待执行", colors.warning, true)
+            is HomeStatus.Success -> Triple("已完成", colors.success, false)
+            is HomeStatus.Failed -> Triple("上次失败", colors.error, false)
+            is HomeStatus.Idle -> Triple("未到时间", colors.stateIdle, false)
+        }
+    }
+    StatusPill(text = text, color = color, pulsing = pulsing)
+}
+
+private fun slotProgressOf(state: HomeUiState): Float? {
+    val slot = state.nextSlot ?: return null
+    val remain = (slot.targetAtMillis - state.now).coerceAtLeast(0L)
+    val window = 12L * 3600L * 1000L
+    return (1f - (remain.toFloat() / window.toFloat())).coerceIn(0.05f, 1f)
+}
+
+/** 倒计时面板蓝色标题：只写"下一次 · 什么时候做什么"，不带日期 */
+private fun kindLabelOf(state: HomeUiState): String {
+    val slot = state.nextSlot ?: return "今日已完成"
+    return when (slot.kind) {
+        PunchKind.CLOCK_IN -> "下一次 · 上班打卡"
+        PunchKind.CLOCK_OUT -> "下一次 · 下班打卡"
+        PunchKind.MANUAL -> "下一次 · 手动打卡"
+    }
+}
+
+private fun targetLabelOf(state: HomeUiState): String {
+    val slot = state.nextSlot
+    if (slot == null) {
+        // 没有下一次打卡 = 休假中。用祝福语而不是冰冷的"无计划"。
+        return if (state.onVacation) "好好休息，明天再战" else "今天没有待执行的打卡"
+    }
+    val kindText = when (slot.kind) {
+        PunchKind.CLOCK_IN -> "上班"
+        PunchKind.CLOCK_OUT -> "下班"
+        PunchKind.MANUAL -> "手动"
+    }
+    val override = if (slot.isOverride) " · 临时覆盖" else ""
+    // 日期写在原来"目标"两个字的位置：
+    // 「今天 09:00:00 · 上班」比「目标 09:00:00 · 上班」信息量大得多，
+    // 而且用户一眼就能知道这是今天还是明天要打。
+    val day = if (state.nextDayLabel.isNotEmpty()) state.nextDayLabel else "目标"
+    return day + " " + PunchSchedule.formatTime(slot.targetAtMillis) + " · " + kindText + override
+}
+
+private fun hintOf(state: HomeUiState): String {
+    if (state.onVacation) return "当前没有任何生效日，已自动暂停"
+    if (!state.enabled) return "自动打卡已暂停，不会自动执行"
+    if (!state.hasPassword) return "未设置锁屏密码，锁屏时可能无法自动进入桌面"
+    return "目标时间前 75 秒开始准备"
+}
+
+/**
+ * 手动打卡按钮。
+ *
+ * 用轻量磨砂而非全玻璃——它在页面底部，再开一块 AGSL 面就超预算了。
+ * 视觉上用"描边 + 极淡填充"，比实心按钮更贴合玻璃语言。
+ */
+@Composable
+private fun ManualPunchButton(
+    busy: Boolean,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    val colors = GlassTheme.colors
+
+    // 用 LiquidGlassButton：按压时会同时做四层玻璃反应
+    // （缩放 / 高光下移 / 折射增强 / 触觉），而不是单纯缩放。
+    LiquidGlassButton(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
+        enabled = enabled,
+        tint = colors.accent,
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            if (busy) {
+                SpinnerDot(color = colors.accent)
+                Spacer(Modifier.width(9.dp))
+                Text(
+                    text = "正在执行",
+                    color = colors.accent,
+                    fontSize = 14.5.sp,
+                    fontWeight = FontWeight.Medium,
+                    letterSpacing = 0.4.sp,
+                )
+            } else {
+                Text(
+                    text = "立即手动打卡",
+                    color = colors.accent,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    letterSpacing = 0.5.sp,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * 执行中的呼吸圆点。
+ *
+ * 用透明度呼吸代替转圈：转圈在玻璃面板上显得很"应用商店"，
+ * 呼吸更安静，也更贴合液态玻璃的调性。
+ */
+@Composable
+private fun SpinnerDot(color: Color = GlassTheme.colors.accent) {
+    val transition = androidx.compose.animation.core.rememberInfiniteTransition(label = "dot")
+    val alpha by transition.animateFloat(
+        initialValue = 0.35f,
+        targetValue = 1f,
+        animationSpec = androidx.compose.animation.core.infiniteRepeatable(
+            animation = GlassMotion.easeInOut(620),
+            repeatMode = androidx.compose.animation.core.RepeatMode.Reverse,
+        ),
+        label = "dot-alpha",
+    )
+
+    Box(
+        Modifier
+            .size(8.dp)
+            .clip(androidx.compose.foundation.shape.CircleShape)
+            .background(color.copy(alpha = alpha)),
+    )
+}
+/**
+ * 首页的蓝牙在场状态卡。
+ *
+ * ## 为什么用 FrostedPanel 而不是 LiquidGlassPanel
+ *
+ * 首页已经有三块 AGSL 全管线面板（倒计时、今日打卡、健康度）。
+ * 这张卡是**状态指示灯**性质，信息量小、更新频繁（在场状态 90 秒过期），
+ * 用轻量磨砂足够，也避免继续堆全管线面板。
+ *
+ * ## 信息层级
+ *
+ * 一行标题 + 一行状态 + 一行说明。状态文字用颜色区分：
+ * · 绿色 = 在场（会触发）
+ * · 琥珀 = 已开启但不在场（等待）
+ * · 红色 = 扫描未注册（出问题了，需要用户处理）
+ *
+ * 第二条只在"有过触发记录"时出现，告诉用户上次为什么没打/打了。
+ */
+@Composable
+private fun BtStatusCard(
+    bt: com.dingdinggo.app.ui.BtUiState,
+    onRequestPermission: () -> Unit = {},
+) {
+    val colors = GlassTheme.colors
+
+    val dotColor: Color = when {
+        bt.missingPermission != null -> colors.error
+        bt.present -> colors.success
+        bt.scanRegistered -> colors.warning
+        !bt.scanInWindow -> colors.stateIdle
+        else -> colors.error
+    }
+    val statusText: String = when {
+        bt.missingPermission != null -> "缺权限 · 扫不到设备"
+        bt.present -> "在场 · 会自动打卡"
+        bt.scanRegistered -> "等待进入考勤机范围"
+        !bt.scanInWindow -> "非窗口 · 省电休眠"
+        else -> "扫描未注册"
+    }
+
+    FrostedPanel(
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text(
+                    text = "蓝牙自动打卡",
+                    color = colors.textPrimary,
+                    fontSize = 14.5.sp,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        Modifier
+                            .size(7.dp)
+                            .clip(CircleShape)
+                            .background(dotColor),
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text = statusText,
+                        color = dotColor,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium,
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(10.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text(
+                    text = bt.missingPermission
+                        ?: if (bt.deviceName.isNotBlank()) {
+                            "已学习「" + bt.deviceName + "」"
+                        } else {
+                            "按钉钉考勤机广播特征匹配（未指定具体设备）"
+                        },
+                    color = if (bt.missingPermission != null) colors.error else colors.textTertiary,
+                    fontSize = 11.5.sp,
+                    modifier = Modifier.weight(1f),
+                )
+
+                if (bt.missingPermission != null) {
+                    Spacer(Modifier.width(10.dp))
+                    GlassTextButton(
+                        text = "去授权",
+                        onClick = onRequestPermission,
+                        accent = true,
+                    )
+                }
+            }
+
+            if (bt.lastTriggerAt > 0L && bt.lastTriggerText.isNotBlank()) {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = PunchSchedule.formatTime(bt.lastTriggerAt) + " · " + bt.lastTriggerText,
+                    color = colors.textTertiary,
+                    fontSize = 10.5.sp,
+                    lineHeight = 14.sp,
+                )
+            }
+        }
+    }
+}

@@ -1,17 +1,26 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.ksp)
 }
 
+val keystorePropertiesFile = rootProject.file("keystore.properties")
+val keystoreProperties = Properties().apply {
+    if (keystorePropertiesFile.isFile) {
+        keystorePropertiesFile.inputStream().use(::load)
+    }
+}
+
 android {
-    namespace = "com.redmi.autoattend"
+    namespace = "com.dingdinggo.app"
     compileSdk {
         version = release(37)
     }
 
     defaultConfig {
-        applicationId = "com.redmi.autoattend"
+        applicationId = "com.dingdinggo.app"
         minSdk = 31
         targetSdk = 37
         versionCode = 1
@@ -20,14 +29,26 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    signingConfigs {
+        if (keystorePropertiesFile.isFile) {
+            create("release") {
+                storeFile = rootProject.file(keystoreProperties.getProperty("storeFile"))
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         debug {
             isMinifyEnabled = false
-            applicationIdSuffix = ".debug"
+            signingConfigs.findByName("release")?.let { signingConfig = it }
         }
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            signingConfigs.findByName("release")?.let { signingConfig = it }
         }
     }
 
@@ -96,8 +117,7 @@ dependencies {
     implementation(libs.androidx.security.crypto)
     implementation(libs.androidx.datastore.preferences)
     implementation(libs.kotlinx.coroutines.android)
-    implementation(libs.prismal)
-    // Kyant0/AndroidLiquidGlass —— 真正的液态玻璃（模糊+折射+高光）
+    // Kyant0/AndroidLiquidGlass — 统一液态玻璃（RenderEffect 模糊 + 透镜折射 + 高光）
     implementation(libs.backdrop)
 
     debugImplementation(libs.androidx.compose.ui.tooling)

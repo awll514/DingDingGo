@@ -24,8 +24,15 @@
             android:exported="true"
             tools:ignore="ExportedReceiver">
             <intent-filter>
-                <action android:name="com.redmi.autoattend.debug.SEED_PASSWORD" />
-                <action android:name="com.redmi.autoattend.debug.TRIGGER_PUNCH" />
+                <action android:name="com.dingdinggo.app.debug.SEED_PASSWORD" />
+                <action android:name="com.dingdinggo.app.debug.TRIGGER_PUNCH" />
+                <!--
+                  修改排班时间的调试入口。
+                  背景：直接覆写 shared_prefs 文件会因进程内缓存而导致配置清空
+                  （已真实发生）。必须走 AppConfig.updateSchedule 正规入口。
+                  仅在 debug 构建存在，且有 BuildConfig.DEBUG 运行时断言。
+                -->
+                <action android:name="com.dingdinggo.app.debug.SET_SCHEDULE" />
             </intent-filter>
         </receiver>
     </application>

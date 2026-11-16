@@ -1,19 +1,28 @@
-# 快速验证：钉钉自动打卡 App 的闹钟与运行状态
+﻿# 快速验证：钉钉GO 的闹钟与运行状态
 #
 # 用法：.\verify-alarm.ps1 [-Package <包名>]
-# 默认包名是 debug 变体
 
 param(
-    [string]$Package = "com.redmi.autoattend.debug"
+    [string]$Package = "com.dingdinggo.app"
 )
 
 $ErrorActionPreference = "Continue"
 
 # 自动查找 adb
 $adb = $null
+$sdkFromLocal = $null
+$localProps = Join-Path $PSScriptRoot "local.properties"
+if (Test-Path $localProps) {
+    $line = Get-Content $localProps | Where-Object { $_ -match '^sdk\.dir=' } | Select-Object -First 1
+    if ($line) {
+        $sdkFromLocal = ($line -replace '^sdk\.dir=', '') -replace '\\\\', '\' -replace '\\:', ':'
+    }
+}
 $candidates = @(
+    $(if ($sdkFromLocal) { Join-Path $sdkFromLocal "platform-tools\adb.exe" }),
     "$env:ANDROID_HOME\platform-tools\adb.exe",
     "$env:ANDROID_SDK_ROOT\platform-tools\adb.exe",
+    "C:\AndroidTools\sdk\platform-tools\adb.exe",
     "E:\dev\android-sdk\platform-tools\adb.exe",
     "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
 )
@@ -51,7 +60,7 @@ Write-Host ""
 
 # ── 1. 已注册的闹钟 ──
 Write-Host "── 1. 已注册的闹钟 ─────────────────────────" -ForegroundColor Yellow
-$alarms = & $adb shell dumpsys alarm 2>$null | Select-String -Pattern "autoattend"
+$alarms = & $adb shell dumpsys alarm 2>$null | Select-String -Pattern $Package
 if (-not $alarms) {
     Write-Host "❌ 没有找到任何闹钟！" -ForegroundColor Red
     Write-Host "   可能原因："
@@ -87,7 +96,7 @@ Write-Host ""
 # ── 3. 无障碍服务 ──
 Write-Host "── 3. 无障碍服务是否在线 ────────────────────" -ForegroundColor Yellow
 $acc = (& $adb shell settings get secure enabled_accessibility_services 2>$null | Out-String)
-if ($acc -match "autoattend") {
+if ($acc -match [regex]::Escape($Package)) {
     Write-Host "✅ 无障碍服务已启用" -ForegroundColor Green
 } else {
     Write-Host "⚠️  无障碍服务未启用，只能依赖 root 通道" -ForegroundColor Yellow
@@ -132,5 +141,5 @@ Write-Host "══════════════════════�
 Write-Host " 提示："
 Write-Host "  • 如果第 1 项为空，先手动打开一次 App"
 Write-Host "  • 重启手机后再跑一遍本脚本，是验证自启动的唯一可靠方法"
-Write-Host "  • 完整验证清单见 README.md 第五节"
+Write-Host "  • 完整验证清单见 README.md 第四节"
 Write-Host "════════════════════════════════════════════" -ForegroundColor Cyan

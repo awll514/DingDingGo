@@ -11,10 +11,10 @@
 
 ## 技术栈约束
 - 语言：Kotlin
-- UI：Jetpack Compose（Material 3 为基础，但外观由自定义玻璃 Modifier 主导，不直接套用 Material 默认卡片）
-- 液态玻璃：使用 PrismalAGSL（`io.github.styropyr0:prismalagsl` 或等价 AGSL Compose 库），目标设备 API 36 将走完整 AGSL 管线；对少量大玻璃面板使用全管线，列表项使用轻量磨砂 + 高光描边
+- UI：Jetpack Compose（Material 3 为基础，但外观由自定义玻璃管线主导，不直接套用 Material 默认卡片）
+- 液态玻璃：使用 `io.github.kyant0:backdrop-android:2.0.1`（`Backdrop` + `RenderEffect.createBlurEffect(CLAMP)` + `lens` + `Highlight`/`Shadow`/`InnerShadow`），配合 `SystemBlur` / `DialogSystemBlur` 系统窗口模糊；核心容器走 `LiquidGlassPanel`，次要/健康度与蓝牙状态卡片走 `FrostedPanel`，保留 `GlassPerfGuard` 自动降级兜底
 - 调度：AlarmManager.setExactAndAllowWhileIdle 作为硬调度主干；前台服务作为执行编排器，不依赖 WorkManager 做打卡准点触发（Android 16 对前台服务关联的后台作业有配额限制）
-- 持久化：Room（日志）+ EncryptedSharedPreferences（锁屏密码等敏感配置）
+- 持久化：Room（日志）+ EncryptedSharedPreferences（锁屏密码等敏感配置；不可用时降级并在 UI 诚实告警）
 - 执行后端可插拔：无障碍服务为首选，root shell `input` 作为降级/备用通道
 
 ## 功能需求（逐项实现，不要遗漏）
@@ -92,230 +92,59 @@
 | **Harmony（和谐）** | 同心圆角：嵌套元素的圆角半径逐级递减，共享同一圆心。胶囊控件统一 `RoundedCornerShape(999.dp)` |
 | **Consistency（一致）** | 全应用同一套材质参数，不做「这个页面特殊」的例外 |
 
-### 材质规格（可直接对照实现）
+### 材质规格（`GlassTheme` / `GlassColors` / `GlassDimens`）
 
-参考 Apple 官方与公开设计文档的量化数据：
+全应用统一双主题色板：**夜幕琉璃蓝（Dark）** 与 **晨曦晶透蓝（Light）**，语义色与材质参数经 `GlassThemeProvider` 平滑过渡（`GlassMotion.THEME_TRANSITION`）：
 
 | 参数 | 规格 | 说明 |
 |------|------|------|
-| 玻璃透明度 | **20%–40% 不透明** | 即填充 alpha 0.06–0.20，其余靠模糊与折射 |
-| 背景模糊 | `blur(40px)` 档 | AGSL 面板的 blurRadius 对应此量级 |
-| 渐变叠加 | **5%–10%** alpha | 制造层次感，不可更高 |
-| 圆角 | 16–24dp（内容）/ 全圆（胶囊控件） | 同心圆角逐级递减 |
-| 内边距 | 16–24dp | 玻璃面板内部 |
-| 卡片间距 | 12–16dp | 玻璃面板之间 |
-| 动效时长 | **300–600ms** | 自定义 cubic-bezier，不要用默认线性 |
-| 高光描边 | 顶部亮、底部近乎无光 | 光源在上方，垂直渐变 |
+| 主玻璃面板（`LiquidGlassPanel`） | `backdrop-android:2.0.1`（`vibrancy` + `RenderEffect` 高斯模糊 + 边沿 `lens` 折射 + `Highlight`/`InnerShadow`） | 浅色淡蓝叠加、深色深蓝半透，顶部高亮底部收敛 |
+| 次要磨砂面板（`FrostedPanel`） | 垂直通透渐变 + 顶部高光描边（深色 `0.34~0.48` alpha；浅色 `0.26~0.52` cool ice alpha） | 用于 `BtStatusCard`、`HealthCard` 及 `GlassPerfGuard` 降级兜底 |
+| 背景流动层（`FlowingBackground`） | 约 24fps 正余弦极光流场（纯绘制阶段读取 `progress`，`paused` 时完全停帧） | 前台轻柔流动，退后台或息屏即停止调度 |
+| 圆角与间距（`GlassDimens`） | 卡片 `24.dp` / 按钮全圆 `999.dp` / 内缩边距 `16.dp` | 同心圆角层级统一 |
+| 动效时长（`GlassMotion`） | 统一 `IosEaseOut` / `IosEaseInOut` | 无默认线性，无僵硬跳变 |
 
-**Do / Don't**：
-- ✅ 玻璃只用于**导航/控件层**（tab bar、按钮、悬浮提示、sheet）
-- ✅ 靠**边缘描边 + 折射**定义形状
-- ❌ 不用纯色实底卡片
-- ❌ 不用 Material 默认 elevation 阴影
-- ❌ 不把玻璃用在内容卡片上（列表、表格、媒体容器）
-- ❌ 不叠多层玻璃（玻璃上再放玻璃）
+### 底栏（`GlassTabBar`）
 
-### 底栏（Tab Bar）
+- 居中悬浮胶囊（约 `0.60f` 屏幕宽，高 `58.dp`，底部边距 `21.dp`），完全脱离屏幕边缘并采样 `combinedBackdrop` 折射背后页面内容
+- **图标 + 文字垂直堆叠**（`Home` / `Settings` Rounded 图标 + 标签），选中指示器为独立液态胶囊（`96.dp × 46.dp`）
+- 拖拽页面时通过 `liveOffsetProvider: () -> Float` 在 `snapshotFlow` 内读取，**零重组**同步页面滑动偏移，拖拽放大倍率 `BarDragScale = 1.26f`；点击切换时播放液滴拉伸动效
+- 浅色模式下指示器采用高透晶莹白渐变（`BodyBrushLight` + `EdgeBrushLight`）配极淡冷蓝阴影，深色模式下采用夜幕冰蓝半透椭圆
 
-严格按 iOS 26 规格：
+### 动效规格（`GlassMotion` · iOS 标准非线性缓动）
 
-- **内缩 21dp**：左右各 21dp、底部 21dp。这是"悬浮"的量化标准，不是估算值
-- 高度 58dp，`RoundedCornerShape(999.dp)` 全圆端头
-- 完全脱离屏幕边缘，四周都能看到背后内容透出
-- 选中指示器为**独立灰色椭圆**，拖拽时**放大到 1.14x 并溢出容器上下边界**
-- 切换 tab 时指示器做**液滴拉伸**：宽 ↑ 高 ↓（面积近似守恒），两端保持半圆
-- 松手吸附用 `spring(dampingRatio = 0.70, stiffness = 420)`
+全应用交互状态切换统一收敛到 `GlassMotion.kt`（`IosEaseOut = CubicBezierEasing(0.32f, 0.72f, 0f, 1f)`，`IosEaseInOut = CubicBezierEasing(0.42f, 0f, 0.58f, 1f)`），拖拽与点击分流处理（滑动结束用 `scrollToPage` / 静默归位，点击切换播放完整翻页与拉伸曲线）：
 
-### 动效规格（iOS 18 标准 · 强制）
+| 场景 | 时长 / 常量 | 曲线 |
+|------|------|------|
+| 底栏指示器位移 | `TAB_INDICATOR = 420ms` | `IosEaseOut` |
+| 液滴拉伸 / 收回 | `260ms` / `460ms` | `IosEaseOut` / `IosEaseInOut` |
+| 页面切换 / 弹窗入场 | `PAGE_SCROLL = 460ms` / `280ms` | `IosEaseOut` |
+| 明细展开与主题过渡 | `DISCLOSURE = 280ms` / `THEME_TRANSITION = 450ms` | `IosEaseOut` / `IosEaseInOut` |
+| 按压反馈 | 缩放 `0.97f` + `drawBehind` 镜面高光下移（`PRESS = 180ms` / `RELEASE = 340ms`） | `IosEaseOut` |
 
-> **总原则：全应用禁用 `spring()`，一律使用「非线性慢速」动画。**
-> 用户原话：「把整个动画速率放慢，现在太快了，并不优雅，
-> 界面所有的动画都保持非线性慢速动画（iOS18 标准）」。
+### 按钮、时间滚轮与弹窗（`LiquidGlassButton` / `GlassWheelTimePicker` / `ConfirmDialog` / `TimeEditorSheet`）
 
-#### 为什么禁用 spring
+- **按钮**：`drawBehind` 阶段绘制按压高光移动与透镜边缘提亮，无每帧重组或笔刷分配，伴随 `HapticFeedback`
+- **时间选择器**：自定义 `GlassWheelTimePicker`，居中玻璃透镜高亮条（`0.76f` 宽 × `itemHeight` × `14.dp` 圆角）
+- **弹层**：背景轻量退避遮罩（绝不压黑），由 `DialogSystemBlur` 通过反射枚举 `WindowManagerGlobal.mViews` 精准对 `TYPE_APPLICATION` 弹窗窗口开启系统 `FLAG_BLUR_BEHIND`（默认 `28.dp`，实机约 `91px`）与低 `dimAmount = 0.06f`，并用 `LocalLiquidBackdrop provides SharedBackdrop.sceneBackdrop` 供给前景模糊纹理
 
-Spring 的物理回弹适合「拖拽跟手」这类**无明确终点**的交互，
-但在**明确的目标切换**（点 tab、开弹层）里会显得毛躁、廉价。
-iOS 18 在这些场景用的是一条**快速起步、极缓收尾**的减速曲线，
-落点稳、无多余弹跳。
+### 屏幕接管提示（`ControlHudOverlay`）
 
-#### 标准缓动曲线
-
-```kotlin
-// 主曲线：接近 CSS cubic-bezier(0.32, 0.72, 0, 1)
-// Apple 在 sheet / tab 切换 / 控制中心里反复使用同一条
-val IosEaseOut   = CubicBezierEasing(0.32f, 0.72f, 0f, 1f)
-
-// 双向平滑：用于「回到原位」这类两头都要柔和的运动
-val IosEaseInOut = CubicBezierEasing(0.42f, 0f, 0.58f, 1f)
-```
-
-#### 时长表
-
-| 场景 | 时长 | 曲线 | 备注 |
-|------|------|------|------|
-| 底栏指示器位移 | **420ms** | `IosEaseOut` | 点击切换 |
-| 液滴拉伸（抻开） | **260ms** | `IosEaseOut` | |
-| 液滴拉伸（收回） | **460ms** | `IosEaseInOut` | 收得比抻开慢，显「黏稠」 |
-| 发光脉冲淡出 | **520ms** | `IosEaseInOut` | |
-| 按下放大 | **180ms** | `IosEaseOut` | |
-| 松手回落 | **340ms** | `IosEaseOut` | |
-| tab 文字变色 | **380ms** | `IosEaseInOut` | |
-| 页面切换 | **460ms** | `IosEaseOut` | `animateScrollToPage` |
-| 弹层入场 | **280ms** | `IosEaseOut` | 缩放 0.90→1.0 + 淡入 |
-| 悬浮提示展开 | **520ms** | `IosEaseOut` | **不要更快** |
-| 悬浮提示收回 | **420ms** | `IosEaseInOut` | |
-
-#### 拖拽 vs 点击：两条不同路径（真机踩坑）
-
-**用户原话**：「我都拖拽过去了它还是重复一遍点击的动作」。
-
-拖拽松手后**绝不能**再播完整的翻页动画 —— 页面已经跟着手指挪了一大半，
-再从头播一遍就是「重复动作」。
-
-```kotlin
-onSelect = { target, fromDrag ->
-    if (fromDrag) {
-        pagerState.scrollToPage(target)       // 零动画，跟手结束即到位
-    } else {
-        pagerState.animateScrollToPage(...)   // 完整翻页动画
-    }
-}
-```
-
-同理，指示器的 `settleTo()` 也分流：
-
-```kotlin
-settleTo(index, fromX, stretch = !bySwipe)
-// bySwipe=true → snapTo 静默归位，不拉伸
-// bySwipe=false → 播放液滴拉伸
-```
-
-**状态传递必须用普通 `var`，不能用 `mutableStateOf`** ——
-写 `mutableStateOf` 会触发重组，但 `LaunchedEffect` 的 key 此刻还没变
-就不会重启，等 key 真变了标记可能已被覆盖。这是实测过的时序竞争。
-
-### 按钮：液态玻璃交互材质
-
-普通按钮只有缩放。本项目按钮必须有**材质层面的反应**（对应 Apple `.interactive()`）：
-
-1. 缩放 0.97 + spring 回弹
-2. **镜面高光偏移**：按压时高光从顶部滑向中心（模拟手指遮挡光源）
-3. **折射增强**：边缘透镜带亮度提升（玻璃被压薄，透光更多）
-4. 触觉反馈
-
-### 弹层（Dialog / Sheet）
-
-- **背景绝不压黑。** 之前用 `Black 55%` 把整屏压成灰黑，与 Apple 体验完全相反
-- 浅色主题：`Color(0xFF0A1220).copy(alpha = 0.10f)`
-- 深色主题：`Color.Black.copy(alpha = 0.30f)`
-- 只做"轻微后退"，让玻璃面板自己通过折射产生层次
-
-### 屏幕接管提示（ControlHud）
-
-- **只在 App 真的要操作界面时出现**（打开钉钉、点击打卡），平时完全不渲染
-- **展开方向跟着位置走**：靠右时向左伸展，靠左时向右伸展
-- 宽度**刚好包住内容**，不留大片空白
-- 含两个微型按钮：暂停（26dp）/ 取消（26dp）
+- **只在自动打卡接管屏幕时出现**，平时不常驻视图；靠近屏幕左右边缘时自动反向展开，宽度贴合内容
+- 提供暂停/继续（`II` / `▶`）与取消（`X`）快捷操作，`setPaused()` 精确更新文本容器 `root.getChildAt(0)` 与按钮 `root.getChildAt(2)`
 
 ### 页面结构
 
-- 底部两 tab：**首页 / 设置**
-- 首页：倒计时玻璃面板（显示"今天/明天/周几/日期 + 时间"）→ 今日双状态卡 → 「立即手动打卡」→ 保活健康度 → 跳过/恢复（低权重文字按钮）
-- 设置页分组顺序：自动打卡 → 外观 → 打卡时间 → 安全 → 通知 → 打卡日志 → 关于 → 权限与保活（**必须在最底部**）
+- 底部两 tab：**首页 / 设置**（底部预留 `GlassDimens.bottomBarReserved = 124.dp` 滚动安全空间）
+- **首页（`HomeScreen`）**：标题与状态胶囊 → Hero 倒计时面板（`54.sp` 等宽数字 `tnum`、周期进度条、F2.3 内联 `HomeStatus.Failed` 失败原因横幅与重试入口）→ 今日双状态卡 → 「立即手动打卡」主按钮 → `BtStatusCard`（缺蓝牙权限时提供「去授权」快捷入口）→ `HealthCard`（可展开/收起「明细」列表，诚实边界说明）→ 跳过/恢复文字按钮
+- **设置页（`SettingsScreen`）**：分组严格按 **自动打卡 → 外观 → 打卡时间 → 蓝牙自动打卡 → 安全 → 通知 → 打卡日志 → 关于 → 权限与保活** 排列；支持「密码定位自动滚动」（`BringIntoViewRequester`）与 `secureStorageDegraded` 降级黄色告警
 
-### 玻璃实现（PrismalAGSL）
+### 玻璃分层与采样规范（`LocalLiquidBackdrop` / `SharedBackdrop`）
 
-- 使用 `LiquidGlassPanel`（AGSL 全管线）做主面板，`FrostedPanel`（轻量磨砂）做次要控件
-- 玻璃面板必须**采样背后真实内容**（流动背景 / 可滚动内容），不能是静态半透明
-- AGSL 面数量上限 3 的旧约束**已解除** —— 用户明确"不用考虑性能消耗"
-- 但保留 `GlassPerfGuard` 降级路径作为兜底（设备过热/降频时自动退到磨砂）
-
-#### ⚠️ 采样源的三条铁律（真机血泪）
-
-**1. 主界面卡片绝不能采样 `contentLayer`**
-
-`contentLayer` 是正在录制的主界面内容本身。卡片如果采样它，就形成
-「录制 → 渲染进录制层 → 重新录制」的无限递归，**必崩**（已实测）。
-
-```kotlin
-// 主界面：只能用只含背景的 backdropLayer
-CompositionLocalProvider(LocalBackdropLayer provides backdropLayer) { ... }
-
-// 弹窗：用 LocalDialogBackdrop 显式传入 contentLayer（弹窗不在内容层里）
-CompositionLocalProvider(LocalDialogBackdrop provides SharedBackdrop.contentLayer) { ... }
-```
-
-**2. Compose Dialog 是 subcomposition，会继承父级 CompositionLocal**
-
-弹窗里 `LocalBackdropLayer.current` **不是 null**，而是主窗口的背景层。
-那层只录了光斑、没有内容 → 弹窗玻璃背后一片纯色，看起来像塑料板。
-必须用 `LocalDialogBackdrop` 显式覆盖。
-
-**3. 首帧降级会让 AGSL 永久失效，不要用**
-
-```kotlin
-// ✗ 曾经这样写，结果所有面板永久停在 FrostedPanel
-var agslReady by remember { mutableStateOf(false) }
-LaunchedEffect(Unit) { withFrameNanos {}; withFrameNanos {}; agslReady = true }
-```
-
-`withFrameNanos` 在面板频繁重组时会被反复取消，`agslReady` 永远来不及置 true。
-实测所有卡片/底栏都在「FROSTED降级」路径，而那条路**没有模糊、没有折射** ——
-这正是「调 blurRadius 完全没效果」的原因。
-
-**冷启动多 30~50ms 换正确的玻璃质感，这个取舍是明确的。**
-
-#### tint 必须是「彩色」的，不能是白色
-
-**核心规律：白色 tint 无论 alpha 多少都会把面板推向灰色。**
-
-实测序列（浅色主题）：
-
-| tint | alpha | 结果 | 判定 |
-|------|-------|------|------|
-| `0xFFF0FAFF`（G高） | 0.036 | RGB(136,202,244) 203° | 青绿 ✗ |
-| `0xFFFFFFFF`（白） | 0.036 | 灰 | ✗ |
-| `0xFFEAF2FF`（B高） | 0.036 | 蓝但过浓 | ✗ |
-| 白 | 0.20/0.23/0.42 | RGB(197~211, 恒等, 恒等) | 全灰 ✗ |
-| **`0xFFA0CFFF`（蓝）** | **0.09** | **RGB(145,191,250)** | **✓** |
-
-目标参考是设置页卡片 `RGB(160,198,247)`（`FrostedPanel` 的淡雅蓝）。
-
-**为什么**：`PrismalGlassSurface` 会先采样图层再做合成，
-白色 tint 相当于对采样值做「向灰平均」；
-而 `FrostedPanel` 是 Canvas 半透明叠加，白色不会稀释底下的蓝。
-**两者对白色 tint 的响应完全不同，不能用同一个 alpha 去匹配。**
-
-#### 弹窗背景模糊必须走系统管线
-
-AGSL 的 `blurRadius` 只能模糊**它采集的 GraphicsLayer**。
-弹窗打开后主界面被遮挡、不再重绘，录制层冻结 →
-调 blurRadius 从 32dp 到 52dp 画面**毫无变化**（已实测 3 轮）。
-
-正确做法：`Window.setBackgroundBlurRadius()`（API 31+）。
-
-**取 Window 的正确方式**（踩了 8 次的坑）：
-
-```kotlin
-// ✗ view.parent / view.rootView.mAttachInfo 拿到的永远是 **Activity 窗口**
-// ✓ 枚举 WindowManagerGlobal.mViews，按 type == TYPE_APPLICATION 筛选
-val wmg = Class.forName("android.view.WindowManagerGlobal")
-    .getMethod("getInstance").invoke(null)
-val views = wmgClass.getDeclaredField("mViews").apply { isAccessible = true }.get(wmg) as List<View>
-for (v in views) {
-    val lp = v.layoutParams as WindowManager.LayoutParams
-    if (lp.type == TYPE_APPLICATION && lp.packageName.contains(我们的包名)) {
-        lp.flags = lp.flags or FLAG_BLUR_BEHIND
-        lp.setBlurBehindRadius(px)
-        lp.dimAmount = 0.06f      // 默认 ~0.6 会把模糊结果压暗
-        wm.updateViewLayout(v, lp)
-    }
-}
-```
-
-验证方式：`dumpsys window windows | grep blurBehindRadius`，
-确认它出现在 `type=2` 的窗口上，而不是主窗口。
+1. **三层Backdrop 管线**：`bgBackdrop`（仅录制 `FlowingBackground`）供主/设置页所有 `LiquidGlassPanel` 采样，避免内容自录制递归；`contentBackdrop` 录制主内容层；`combinedBackdrop = rememberCombinedBackdrop(bgBackdrop, contentBackdrop)` 供悬浮底栏 `GlassTabBar` 采样并写入 `SharedBackdrop.sceneBackdrop`。
+2. **Compose Dialog 跨 Window 采样**：弹窗所在 subcomposition 显式覆盖 `LocalLiquidBackdrop provides SharedBackdrop.sceneBackdrop`，再叠加系统级 `DialogSystemBlur` 实时虚化底层窗口。
+3. **无首帧伪降级延迟**：不使用会导致材质长期锁死在降级路径的 `withFrameNanos` 首帧开关；仅当 `Build.VERSION.SDK_INT < S`、`RenderEffect` 不可用或 `GlassPerfGuard` 主动触发降级时切换到 `FrostedPanel`。
 
 ### 后台零消耗红线
 
@@ -323,10 +152,10 @@ for (v in views) {
 
 这是唯一不可妥协的性能约束，语义是**不做无谓的持续开销**：
 
-1. 后台（无界面显示）时**不得有任何持续渲染**（禁止后台跑 Compose 动画 / AGSL）
+1. 后台（`onStop` 后 / 无界面显示）时**不得有任何持续渲染**（`FlowingBackground(paused = true)` 停止时间步进，主窗口后台 0 帧渲染）
 2. 保活服务只做定时自检，不发动画、不轮询 UI
 3. 前台服务只有在打卡窗口临近时才持唤醒锁
-4. 隐藏的悬浮组件必须 `return` 掉，不能只把 alpha 设为 0
+4. 隐藏的悬浮组件必须 `return` / 移除，不能仅设为透明
 ## 关键代码约束与验收标准
 
 1. **AlarmManager 必须使用 `setExactAndAllowWhileIdle`**，并在 `BOOT_COMPLETED` 后重新调度；验收时杀掉 App 进程，闹钟仍能触发 BroadcastReceiver。

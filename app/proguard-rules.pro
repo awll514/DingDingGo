@@ -1,3 +1,3 @@
 -keepattributes *Annotation*
--keep class com.redmi.autoattend.data.** { *; }
+-keep class com.dingdinggo.app.data.** { *; }
 -dontwarn org.jetbrains.annotations.**

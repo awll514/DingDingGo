@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# 快速验证：钉钉自动打卡 App 的闹钟与运行状态
+# 快速验证：钉钉GO 的闹钟与运行状态
 #
 # 用法：./verify-alarm.sh [包名]
-# 默认包名是 debug 变体（com.redmi.autoattend.debug）
 
 set -u
 
-PKG="${1:-com.redmi.autoattend.debug}"
+PKG="${1:-com.dingdinggo.app}"
 
 if ! command -v adb >/dev/null 2>&1; then
   echo "❌ 找不到 adb，请把 Android SDK 的 platform-tools 加进 PATH"
@@ -33,7 +32,7 @@ echo "════════════════════════�
 echo
 
 echo "── 1. 已注册的闹钟 ─────────────────────────"
-ALARMS=$(adb shell dumpsys alarm | grep -i "autoattend" )
+ALARMS=$(adb shell dumpsys alarm | grep -i "$PKG" )
 if [ -z "$ALARMS" ]; then
   echo "❌ 没有找到任何闹钟！"
   echo "   可能原因："
@@ -58,7 +57,7 @@ echo
 
 echo "── 3. 无障碍服务是否在线 ────────────────────"
 ACC=$(adb shell settings get secure enabled_accessibility_services 2>/dev/null | tr -d '\r')
-if echo "$ACC" | grep -q "autoattend"; then
+if echo "$ACC" | grep -q "$PKG"; then
   echo "✅ 无障碍服务已启用"
 else
   echo "⚠️  无障碍服务未启用，只能依赖 root 通道"
@@ -95,5 +94,5 @@ echo "════════════════════════�
 echo " 提示："
 echo "  • 如果第 1 项为空，先手动打开一次 App"
 echo "  • 重启手机后再跑一遍本脚本，是验证自启动的唯一可靠方法"
-echo "  • 完整验证清单见 README.md 第五节"
+echo "  • 完整验证清单见 README.md 第四节"
 echo "════════════════════════════════════════════"

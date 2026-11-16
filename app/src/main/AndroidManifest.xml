@@ -42,6 +42,124 @@
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
         tools:ignore="QueryAllPackagesPermission" />
 
+    <!--
+      ==================== 蓝牙考勤机在场检测 ====================
+
+      【旧蓝牙权限】
+      minSdk 是 31（Android 12），旧权限只到 30 为止，
+      31+ 走下面的 BLUETOOTH_SCAN / BLUETOOTH_CONNECT。
+    -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_ADMIN"
+        android:maxSdkVersion="30" />
+
+    <!--
+      Android 12+ 的「附近的设备」权限。只需要 SCAN：我们只读广播，不连接、不广播。
+
+      ## 为什么**不**声明 neverForLocation（重要决策）
+
+      直觉上本项目应该声明它 —— 我们确实不推导位置。但 AOSP 的实现里
+      neverForLocation 有一个**隐含副作用**：
+
+        GattService.java:
+          if (client.hasDisavowedLocation) {
+              if (mLocationDenylistPredicate.test(result)) continue;   // 直接丢弃
+          }
+
+      默认黑名单是 `⊆0016AAFE/00FFFFFF`（Eddystone，0xFEAA）
+      与 `⊆00FF4C0002/00FFFFFFFF`（iBeacon，0x004C / subtype 0002）。
+
+      也就是说：**如果公司考勤机用 iBeacon 广播，声明 neverForLocation
+      会让系统直接把这些扫描结果丢掉 —— 而且是静默丢弃，一条日志都没有。**
+
+      钉钉官方硬件 SDK 规定的广播格式是 16-bit Service UUID 0xFE3C，
+      按此推断不会被黑名单命中。但我们**无法在用户设备上预先确认**
+      考勤机固件是否额外包了一层 iBeacon，所以这里选择不冒这个风险：
+      不声明 neverForLocation，改为在运行时申请邻近设备权限。
+
+      【真机结论（2026-11-13，K90 / HyperOS 3）】
+      不声明 neverForLocation 的代价**不是"个别 ROM 可能需要"，
+      而是本机**必然**需要定位权限才能出扫描结果：
+      只给 BLUETOOTH_SCAN 时 startScan 注册成功、扫描在跑，
+      但结果是永远 0（实测连续 82 秒 0 结果）。补上定位权限立刻正常。
+      详见 README「HyperOS 3 必开系统设置」说明。
+    -->
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+
+    <!--
+      BLUETOOTH_CONNECT：读取设备名 / 已配对列表需要它。
+
+      虽然本应用**不做配对、不建立连接**，但：
+        · ScanRecord.deviceName 的读取路径在部分实现下受该权限约束；
+        · 「学习当前考勤机」要拿设备名做展示与二次匹配；
+        · 缺少它时部分 ROM 会直接让扫描回调收不到设备信息。
+
+      这条是真机验证时发现遗漏的（代码里申请了、manifest 却没声明），
+      属于"运行期申请安静失败"的典型 —— 必须显式声明。
+    -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+    <!--
+      ==================== 定位权限（真机强制项）====================
+
+      【这不是可选项，是本机的硬门槛】
+
+      2026-11-13 真机实测：只给 BLUETOOTH_SCAN、不给 ACCESS_FINE_LOCATION 时，
+        · startScan() 注册成功（dumpsys 里能看到 Registered）
+        · 扫描在跑（Scan time 持续增长）
+        · **但结果是 0，连续 82 秒一条都没有**
+      补上 ACCESS_FINE_LOCATION 后，同一个扫描立刻开始出结果。
+
+      为什么会有这个依赖：因为我们**故意没有**声明 neverForLocation
+      （理由见上：它会让 AOSP 按位置推断黑名单静默过滤 iBeacon/Eddystone）。
+      不声明 neverForLocation 的应用，平台会按"可能用于定位"对待，
+      于是要求定位权限。
+
+      【隐私边界】
+      本应用**不读取位置、不做虚拟定位、不做位置伪造**，
+      只在扫描 BLE 广播时使用这条权限满足平台要求。
+      不声明 ACCESS_BACKGROUND_LOCATION —— 我们从不后台读位置。
+    -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+
+    <!--
+      ==================== 必须与 FINE 成对声明的 COARSE ====================
+
+      【P0 修复】没有这一行，上面的 FINE 权限**永远申请不下来**。
+
+      Android 运行时权限规则：请求 ACCESS_FINE_LOCATION 时，
+      如果 targetSdk >= 31（本项目是 37）且**没有同时请求**
+      ACCESS_COARSE_LOCATION，系统会直接**静默忽略整个请求**，
+      Logcat 里只有一行：
+        ACCESS_FINE_LOCATION must be requested with ACCESS_COARSE_LOCATION
+
+      对本应用的后果是致命的：
+        · 设置页「去授权」点了没有任何弹窗；
+        · onBtPermissionResult(false)，看起来像"用户拒绝了"；
+        · blocker() 报"缺少定位权限"，但用户按提示去系统设置里也开不了
+          （因为应用根本没资格申请）；
+        · 而缺定位权限 = 扫描注册成功但永远 0 结果（见上），
+          → 蓝牙触发彻底失效，且用户**无法自救**。
+
+      两个都声明、且**必须两个一起申请**（见 BtScanner.missingPermissions）。
+      实际使用上我们只需要 FINE 的精度，COARSE 是平台强制的配对项。
+
+      【隐私边界不变】本应用不读取位置、不做虚拟定位。
+    -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <!--
+      蓝牙适配器可用性。
+      uses-feature required="false"：这台设备一定有蓝牙，但声明成非必需
+      可以避免在极少数无蓝牙的构建变体上装不上。
+    -->
+    <uses-feature
+        android:name="android.hardware.bluetooth_le"
+        android:required="false" />
+
     <!-- 需要看到钉钉的包，才能拉起它 -->
     <queries>
         <package android:name="com.alibaba.android.rimet" />
@@ -78,11 +196,29 @@
             android:name=".exec.PunchAlarmReceiver"
             android:exported="false">
             <intent-filter>
-                <action android:name="com.redmi.autoattend.action.PREWARM" />
-                <action android:name="com.redmi.autoattend.action.FIRE" />
-                <action android:name="com.redmi.autoattend.action.RETRY" />
+                <action android:name="com.dingdinggo.app.action.PREWARM" />
+                <action android:name="com.dingdinggo.app.action.FIRE" />
+                <action android:name="com.dingdinggo.app.action.RETRY" />
             </intent-filter>
         </receiver>
+
+        <!--
+          BLE 扫描结果的系统投递接收器。
+
+          【为什么必须是静态注册 + exported=false】
+          · 静态注册：进程被杀后系统仍能把广播投递过来 ——
+            这正是本功能"不依赖进程存活"的物理基础；
+          · exported=false：PendingIntent 是**显式**指向这个组件的，
+            系统投递不经过 exported 检查，所以 false 完全不影响功能，
+            但能挡住第三方 App 伪造扫描结果来触发我们的打卡。
+
+          【为什么不需要 intent-filter】
+          PendingIntent 里已经写死了 ComponentName（见 BtScanner），
+          是显式广播，不需要 action 匹配。
+        -->
+        <receiver
+            android:name=".ble.BleScanReceiver"
+            android:exported="false" />
 
         <!--
           开机等系统事件。
@@ -136,17 +272,33 @@
           都能给它发这个 action，反复拉起我们的进程（等于给外部提供了一个
           "免权限唤醒"的把手），与「后台零消耗」相悖。
 
-          【真机验证怎么办】
-          不需要 exported。adb 的 -n 直接指定组件名时同样能投递到
-          exported=false 的组件（adb shell 有 BROADCAST 权限）：
-              adb shell am broadcast -n com.redmi.autoattend/.exec.HeartbeatReceiver \
-                  -a com.redmi.autoattend.action.HEARTBEAT
+          【真机验证的正确方法 —— 原注释在这里是错的，已更正】
+
+          原注释声称"adb 的 -n 直接指定组件名时同样能投递到 exported=false
+          的组件（adb shell 有 BROADCAST 权限）"。**真机实测推翻了它**：
+
+              adb shell am broadcast -n <pkg>/.exec.HeartbeatReceiver -a ...HEARTBEAT
+              → Broadcast completed: result=0
+              → 接收器日志一行都没有，代码完全没执行
+
+          而同一时刻、同一个 shell 去发 exported=true 的 receiver
+          （DebugPasswordSeedReceiver），代码是真的会执行的。
+
+          结论：exported=false 确实挡住了 adb shell 的广播投递。
+
+          注意：不能靠 result=0 判断失败 —— manifest 声明的静态 receiver
+          本来就是异步投递，成功时也是 result=0。要判断是否真的执行，
+          必须看接收器自己写的日志或持久化状态。
+
+          正确验证方式（二选一）：
+            · 临时把 exported 改为 true 再发广播（验证完改回）；
+            · 或直接等真实闹钟触发（用 dumpsys alarm 查下次触发时刻）。
         -->
         <receiver
             android:name=".exec.HeartbeatReceiver"
             android:exported="false">
             <intent-filter>
-                <action android:name="com.redmi.autoattend.action.HEARTBEAT" />
+                <action android:name="com.dingdinggo.app.action.HEARTBEAT" />
             </intent-filter>
         </receiver>
 

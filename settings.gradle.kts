@@ -34,5 +34,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "DingDingAuto"
+rootProject.name = "DingDingGo"
 include(":app")
