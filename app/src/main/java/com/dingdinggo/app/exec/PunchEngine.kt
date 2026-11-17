@@ -1280,7 +1280,7 @@ class PunchEngine(private val context: Context) {
         //
         // 所以不能靠固定时长，必须「滑 → 验证 → 没就绪就再滑」。
         // 详见本函数头部的完整真机记录。
-        val pinPadReady = swipeUntilPinPadReady()
+        val pinPadReady = swipeUntilPinPadReady(pm)
 
         if (!hasPassword) {
             log("无密码模式，仅上滑")
@@ -1298,33 +1298,44 @@ class PunchEngine(private val context: Context) {
         // 绝不写日志、绝不进 trace、绝不进 Room。
         try {
             repeat(MAX_RETRY) { attempt ->
-                // 若重试期间屏幕熄灭（锁屏 10s 超时）先重唤醒；若 PIN 面板未挂起则补上滑一次
+                // 若期间屏幕熄灭（锁屏 10s userActivityTimeout 超时）先重唤醒
                 if (!pm.isInteractive) {
-                    log("重试前屏幕已息屏，重新唤醒")
+                    log("解锁前屏幕已息屏，重新唤醒")
                     if (RootShell.isAvailable()) RootShell.wakeUp()
                     waitUntil(1_500L) { pm.isInteractive }
                     delay(450)
                 }
                 if (attempt > 0 && isKeyguardLocked() && !isPinPadReady()) {
-                    swipeUpOnce(attempt + 2)
-                    repeat(PIN_READY_POLL_TIMES) {
-                        delay(PIN_READY_POLL_MS)
-                        if (isKeyguardUnlocked() || isPinPadReady()) return@repeat
+                    var reopened = false
+                    if (RootShell.isAvailable()) {
+                        RootShell.dismissKeyguard()
+                        delay(350)
+                        reopened = isKeyguardUnlocked() || isPinPadReady()
+                    }
+                    if (!reopened) {
+                        swipeUpOnce(attempt + 2)
+                        repeat(PIN_READY_POLL_TIMES) {
+                            delay(PIN_READY_POLL_MS)
+                            if (isKeyguardUnlocked() || isPinPadReady()) return@repeat
+                        }
                     }
                 }
 
-                // 【P0 修复】每次都从干净状态开始：先清掉上一轮可能残留的数字。
-                clearPinField()
+                // 仅在失败重试时清空残留数字：首次弹起面板为空，省去 ~5 秒的 keyevent 67 删除耗时
+                if (attempt > 0) {
+                    clearPinField(password.length)
+                }
 
                 // 注意：日志里只说"第 N 次"，绝不带密码值
                 log("输入锁屏密码，第 " + (attempt + 1) + " 次")
                 if (inputPassword(password)) {
-                    if (waitUntil(6_000L) { isKeyguardUnlocked() }) return true
+                    waitUntil(5_000L) { isKeyguardUnlocked() || !pm.isInteractive }
+                    if (isKeyguardUnlocked()) return true
                 }
 
                 // 已经解锁就别再重试（少数 ROM 会自动确认）
                 if (isKeyguardUnlocked()) return true
-                delay(500)
+                delay(350)
             }
 
             // 兜底：再发一次回车（部分 ROM 需要确认）
@@ -1426,10 +1437,33 @@ class PunchEngine(private val context: Context) {
      *
      * @return 面板是否成功挂起；false 表示超时（调用方决定是否仍然尝试）
      */
-    private suspend fun swipeUntilPinPadReady(): Boolean {
+    private suspend fun swipeUntilPinPadReady(pm: PowerManager): Boolean {
+        if (isKeyguardUnlocked()) return true
+        if (isPinPadReady()) {
+            log("PIN 面板已处于就绪态")
+            return true
+        }
+
+        // 优先使用 wm dismiss-keyguard 直接唤起 PIN 面板（免触摸手势，不受锁屏通知或防误触吞滑动影响）
+        if (RootShell.isAvailable()) {
+            RootShell.dismissKeyguard()
+            delay(350)
+            if (isKeyguardUnlocked()) return true
+            if (isPinPadReady()) {
+                log("PIN 面板就绪（wm dismiss-keyguard）")
+                return true
+            }
+        }
+
         val deadline = System.currentTimeMillis() + PIN_READY_TIMEOUT_MS
         var round = 0
         while (System.currentTimeMillis() < deadline) {
+            if (!pm.isInteractive) {
+                log("上滑前屏幕已息屏，重新唤醒")
+                if (RootShell.isAvailable()) RootShell.wakeUp()
+                waitUntil(1_200L) { pm.isInteractive }
+                delay(400)
+            }
             round++
             swipeUpOnce(round)
 
@@ -1443,24 +1477,23 @@ class PunchEngine(private val context: Context) {
                     return true
                 }
             }
+
+            if (round % 2 == 0 && RootShell.isAvailable()) {
+                RootShell.dismissKeyguard()
+            }
         }
         return false
     }
 
     /**
-     * 清空锁屏密码输入框。
-     *
-     * 发一串 KEYCODE_DEL（67）：我们拿不到面板里到底有几个字符
-     * （无障碍只监听钉钉），多发几次在空输入框上是无害的 no-op。
-     *
-     * 一次 su 里连发，避免 fork 12 次 su 进程。
+     * 清空锁屏密码输入框（仅用于失败重试，首次弹起无需调用）。
+     * 仅发送与密码等长 + 2 个 KEYCODE_DEL（67），避免固定 12 次消耗 5 秒以上。
      */
-    private suspend fun clearPinField() {
+    private suspend fun clearPinField(digitCount: Int = 6) {
         if (!RootShell.isAvailable()) return
-        RootShell.execQuiet(
-            "input keyevent 67 67 67 67 67 67 67 67 67 67 67 67",
-            timeoutMs = 6_000,
-        )
+        val count = (digitCount + 2).coerceIn(4, 12)
+        val keys = List(count) { "67" }.joinToString(" ")
+        RootShell.execQuiet("input keyevent " + keys, timeoutMs = 8_000)
         delay(120)
     }
 

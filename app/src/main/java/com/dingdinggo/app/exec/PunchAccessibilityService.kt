@@ -554,8 +554,8 @@ class PunchAccessibilityService : AccessibilityService() {
         return root.packageName?.toString()
     }
 
-    /** 上滑手势（用于解锁及列表滑动；起点避开屏下指纹区域 ~640,2100） */
-    fun swipeUp(): Boolean = GestureExecutor.swipe(950f, 1850f, 950f, 750f, 320)
+    /** 上滑手势（用于解锁及列表滑动；起点避开屏下指纹区域 ~640,2100 与中部通知列表） */
+    fun swipeUp(): Boolean = GestureExecutor.swipe(300f, 2350f, 300f, 1050f, 240)
 
     /** 返回键 */
     fun pressBack(): Boolean =

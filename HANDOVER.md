@@ -13,8 +13,9 @@
    - 源码目录：`app/src/main/java/com/dingdinggo/app/`、单测目录：`app/src/test/java/com/dingdinggo/app/`、Room Schema：`app/schemas/com.dingdinggo.app.data.db.AppDatabase/`。
 
 2. **已完成的核心链路与近期关键修复**
-   - **双通道打卡与防误触系统设置**：
+   - **双通道打卡与锁屏解锁可靠性加固**：
      - `RootShell.launchPackage` 已移除 `monkey` 启动方式（实测 `monkey` 会向系统注入 `MonkeyRotationEven#injectEvent`，意外关闭系统「方向锁定」），改用 `cmd package resolve-activity --brief -c android.intent.category.LAUNCHER` 解析真实入口 Activity 后由 `am start -n` 拉起。
+     - `PunchEngine.unlock` 与 `RootShell.dismissKeyguard`：优先调用 `wm dismiss-keyguard` 直接唤起 PIN 面板（避免锁屏通知堆积、杂志锁屏或唤醒过渡吞掉上滑触摸手势），备用上滑坐标调至底部安全区 `(300, 2350 -> 300, 1050)`；仅在失败重试（`attempt > 0`）时执行 `clearPinField(password.length)`（规避首轮 12 次退格键消耗 ~5.25 秒撞上 HyperOS 锁屏 10 秒超时）；每轮尝试前校验亮屏并即时重唤醒；`RootShell.inputText` 排空子进程输出防阻塞，`isAvailable()` 的 `false` 缓存 30 秒自动过期重探。
      - `AccessibilityKeeper.ensureEnabled` 在 `settings get` 返回空或超时时增加了 `Settings.Secure.getString` 兜底检查，避免误覆写其它已开启的无障碍服务。
    - **钉钉娘双窗口悬浮控制条（`ControlHudOverlay.kt`）**：
      - 拆分为 `mascotHost` 与 `bubbleHost` 两个协调同步位置的 `WindowManager` 窗口，解决气泡展开/收起时悬浮像素精灵坐标跳变（瞬移）的问题。

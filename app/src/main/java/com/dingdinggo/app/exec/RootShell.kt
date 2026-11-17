@@ -48,9 +48,14 @@ object RootShell {
     private const val SHELL_READ_PW_AND_INPUT =
         "read -r PW; input text \"\$PW\""
 
-    /** root 可用性缓存，避免每次都 fork su 探测 */
+    /** root 可用性缓存，避免每次都 fork su 探测；false 结果 30 秒后自动过期重探 */
     @Volatile
     private var cachedAvailability: Boolean? = null
+
+    @Volatile
+    private var cachedUnavailableAt: Long = 0L
+
+    private const val UNAVAILABLE_CACHE_TTL_MS = 30_000L
 
     /**
      * 探测 root 是否可用。
@@ -59,18 +64,24 @@ object RootShell {
      */
     fun isAvailable(force: Boolean = false): Boolean {
         if (!force) {
-            cachedAvailability?.let { return it }
+            val cached = cachedAvailability
+            if (cached == true) return true
+            if (cached == false && System.currentTimeMillis() - cachedUnavailableAt < UNAVAILABLE_CACHE_TTL_MS) {
+                return false
+            }
         }
         val ok = runCatching {
             exec("id", timeoutMs = 6_000).contains("uid=0")
         }.getOrDefault(false)
         cachedAvailability = ok
+        cachedUnavailableAt = if (ok) 0L else System.currentTimeMillis()
         Log.i(TAG, "root available = " + ok)
         return ok
     }
 
     fun invalidateCache() {
         cachedAvailability = null
+        cachedUnavailableAt = 0L
     }
 
     /**
@@ -159,9 +170,18 @@ object RootShell {
         execQuiet("input keyevent 224", 8_000)
     }
 
-    /** 上滑解锁，无密码时使用（避开屏幕中下方屏下指纹区域 ~640,2100） */
+    /** 上滑解锁，无密码时使用（避开屏幕中下方指纹区 ~640,2100 与中部通知列表） */
     fun swipeUp() {
-        execQuiet("input swipe 950 1850 950 750 320", 10_000)
+        execQuiet("input swipe 300 2350 300 1050 240", 10_000)
+    }
+
+    /**
+     * 通过 WindowManager 直接唤起锁屏密码面板（无密码锁时直接解开锁屏）。
+     * 相比触摸上滑，不会受锁屏通知遮挡、杂志锁屏或唤醒动画吞手势的影响。
+     */
+    fun dismissKeyguard(): Boolean {
+        val out = exec("wm dismiss-keyguard", timeoutMs = 5_000)
+        return !out.contains("Error") && !out.contains("Exception") && !out.contains("[timeout]")
     }
 
     /**
@@ -192,20 +212,34 @@ object RootShell {
             val process = ProcessBuilder("su", "-c", SHELL_READ_PW_AND_INPUT)
                 .redirectErrorStream(true)
                 .start()
-            process.outputStream.use { os ->
-                // 只写密码值本身 —— 与上面的 `read -r PW` 严格配对。
-                // 绝不能写成 "PW=" + text：read -r 不解析 K=V，会把前缀
-                // 一起当成密码内容传给 input text。
-                os.write((text + "\n").toByteArray())
-                os.flush()
+            try {
+                process.outputStream.use { os ->
+                    // 只写密码值本身 —— 与上面的 `read -r PW` 严格配对。
+                    // 绝不能写成 "PW=" + text：read -r 不解析 K=V，会把前缀
+                    // 一起当成密码内容传给 input text。
+                    os.write((text + "\n").toByteArray())
+                    os.flush()
+                }
+                // 排空 stdout/stderr 避免子进程写满管道阻塞
+                process.inputStream.use { ins ->
+                    val buf = ByteArray(512)
+                    val deadline = System.currentTimeMillis() + 10_000L
+                    while (System.currentTimeMillis() < deadline) {
+                        while (ins.available() > 0) {
+                            if (ins.read(buf) <= 0) break
+                        }
+                        if (!process.isAlive) break
+                        Thread.sleep(20)
+                    }
+                }
+                !process.isAlive && process.exitValue() == 0
+            } finally {
+                runCatching {
+                    if (process.isAlive) process.destroy()
+                    process.waitFor(300L, java.util.concurrent.TimeUnit.MILLISECONDS)
+                    if (process.isAlive) process.destroyForcibly()
+                }
             }
-            val deadline = System.currentTimeMillis() + 10_000L
-            while (process.isAlive && System.currentTimeMillis() < deadline) {
-                Thread.sleep(20)
-            }
-            val finished = !process.isAlive && process.exitValue() == 0
-            runCatching { process.destroy() }
-            finished
         }.getOrDefault(false)
 
         if (viaStdin) {
