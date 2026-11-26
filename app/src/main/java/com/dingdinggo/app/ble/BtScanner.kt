@@ -1,19 +1,28 @@
 package com.dingdinggo.app.ble
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.PendingIntent
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
+import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
+import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.ParcelUuid
+import android.os.PowerManager
 import android.util.Log
 import androidx.core.content.ContextCompat
+import com.dingdinggo.app.core.ArrivalTriggerCoordinator
 import com.dingdinggo.app.core.BtTriggerStore
+import com.dingdinggo.app.exec.PunchForegroundService
+import com.dingdinggo.app.exec.RootShell
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /**
  * 钉钉蓝牙考勤机的 BLE 扫描注册器。
@@ -163,6 +172,40 @@ object BtScanner {
             context, Manifest.permission.ACCESS_FINE_LOCATION,
         ) == PackageManager.PERMISSION_GRANTED
 
+    /** 后台定位权限（息屏 / 后台接收 PendingIntent BLE 广播的硬门槛） */
+    fun hasBackgroundLocationPermission(context: Context): Boolean =
+        ContextCompat.checkSelfPermission(
+            context, Manifest.permission.ACCESS_BACKGROUND_LOCATION,
+        ) == PackageManager.PERMISSION_GRANTED
+
+    /** 前台定位已给但缺少后台“始终允许”定位权限 */
+    fun needsBackgroundLocation(context: Context): Boolean =
+        hasLocationPermission(context) && !hasBackgroundLocationPermission(context)
+
+    /**
+     * 后台阻塞原因：不影响前台学习设备，但会导致息屏/后台收不到广播。
+     */
+    fun backgroundBlocker(context: Context): String? =
+        if (needsBackgroundLocation(context)) {
+            "缺少「始终允许」后台定位权限（息屏后台将收不到蓝牙广播）"
+        } else {
+            null
+        }
+
+    /**
+     * 通过 Root 一键授予后台定位权限并放行定位 AppOps。
+     */
+    fun grantBackgroundLocationViaRoot(context: Context): Boolean {
+        if (!RootShell.isAvailable()) return false
+        val pkg = context.packageName
+        RootShell.execQuiet("pm grant $pkg android.permission.ACCESS_BACKGROUND_LOCATION", 8_000)
+        RootShell.execQuiet("cmd appops set $pkg FINE_LOCATION allow", 6_000)
+        RootShell.execQuiet("cmd appops set $pkg COARSE_LOCATION allow", 6_000)
+        val ok = hasBackgroundLocationPermission(context)
+        Log.i(TAG, "Root 授予后台定位权限结果=" + ok)
+        return ok
+    }
+
     /**
      * 返回所有**实际会导致扫不到**的缺失权限（用于一次性申请）。
      *
@@ -268,9 +311,8 @@ object BtScanner {
         )
 
         val settings = ScanSettings.Builder()
-            // LOW_POWER：约 140ms/1400ms 的占空比（≈10%）。
-            // 考勤机在门口常驻广播，不需要低延迟。
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)
+            // 仅在有效打卡窗口内扫描，窗口外会彻底停止；使用 BALANCED 提高息屏/Doze 下捕捉考勤机广播的概率。
+            .setScanMode(ScanSettings.SCAN_MODE_BALANCED)
             // 只上报"找到"，不做 match-lost（PendingIntent 扫描不支持 lost 回调）
             .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
             .build()
@@ -625,6 +667,15 @@ object BtScanner {
         val (clockInDoneToday, clockOutDoneToday) = com.dingdinggo.app.core.AlarmScheduler
             .readDoneToday(context, now)
 
+        com.dingdinggo.app.core.LateConfirmStore.init(context)
+        val lateWindowMin = if (!clockInDoneToday &&
+            !com.dingdinggo.app.core.LateConfirmStore.hasPromptedToday(context, now)
+        ) {
+            com.dingdinggo.app.core.LateConfirmRule.DEFAULT_LATE_SCAN_WINDOW_MINUTES
+        } else {
+            0
+        }
+
         com.dingdinggo.app.core.BtPunchRule.shouldKeepScanAlive(
             nowMillis = now,
             settings = settings,
@@ -632,6 +683,160 @@ object BtScanner {
             isActiveDay = isActiveDay,
             clockInDoneToday = clockInDoneToday,
             clockOutDoneToday = clockOutDoneToday,
+            lateConfirmWindowMinutes = lateWindowMin,
         )
     }.getOrDefault(true)
+
+    /** 校验扫描结果是否匹配目标考勤机（UUID 必选 + MAC/名称增强，兼容 RPA 地址轮换） */
+    internal fun matchesTargetDevice(result: ScanResult): Boolean {
+        val uuids = runCatching { result.scanRecord?.serviceUuids }.getOrNull()
+        val hasUuid = uuids != null && uuids.any {
+            it.uuid.toString().equals(ATTENDANCE_SERVICE_UUID.uuid.toString(), true)
+        }
+        val uuidUnknown = uuids == null || uuids.isEmpty()
+        if (!hasUuid && !uuidUnknown) return false
+
+        val learnedMac = BtTriggerStore.deviceMac.value
+        if (learnedMac.isNotBlank()) {
+            val actual = runCatching { result.device?.address }.getOrNull()
+            if (actual != null && actual.equals(learnedMac, ignoreCase = true)) return true
+            val learnedName = BtTriggerStore.deviceName.value
+            val actualName = runCatching { result.scanRecord?.deviceName }.getOrNull()
+            if (learnedName.isNotBlank() && actualName != null &&
+                actualName.equals(learnedName, ignoreCase = true)
+            ) {
+                return true
+            }
+            return hasUuid || uuidUnknown
+        }
+
+        return hasUuid || uuidUnknown
+    }
+
+    private const val ACTIVE_BURST_INTERVAL_MS = 90_000L
+
+    @Volatile
+    private var lastActiveBurstAtMs = 0L
+
+    @Volatile
+    private var activeBurstRunning = false
+
+    private val activeBurstLock = Any()
+
+    /**
+     * 在有效打卡窗内执行一次短暂高灵敏度（LOW_LATENCY）主动扫描，唤醒深度 Doze 下被挂起的蓝牙控制器。
+     *
+     * 严格受节流保护（常规至少间隔 90 秒，仅首次连上公司 Wi-Fi 或刚解锁等强事件可传 force=true），
+     * 并在 finally 里保证 stopScan 与释放 WakeLock。
+     */
+    @SuppressLint("MissingPermission")
+    fun activeBurstScanAndHandle(
+        context: Context,
+        durationMs: Long = 4_000L,
+        force: Boolean = false,
+    ) {
+        val app = context.applicationContext
+        runCatching {
+            com.dingdinggo.app.core.AppConfig.init(app)
+            com.dingdinggo.app.core.AppConfig.reload()
+            BtTriggerStore.init(app)
+        }
+
+        if (!BtTriggerStore.enabled.value) return
+        if (blocker(app) != null) return
+        if (!shouldKeepScanAliveNow(app)) return
+
+        val now = System.currentTimeMillis()
+        BtTriggerStore.refreshPresence()
+        if (!force && BtTriggerStore.present.value) return
+
+        synchronized(activeBurstLock) {
+            if (activeBurstRunning) return
+            if (!force && lastActiveBurstAtMs > 0L && now - lastActiveBurstAtMs < ACTIVE_BURST_INTERVAL_MS) {
+                return
+            }
+            activeBurstRunning = true
+            lastActiveBurstAtMs = now
+        }
+
+        try {
+            val scanner = runCatching { adapter(app)?.bluetoothLeScanner }.getOrNull() ?: return
+            val pm = app.getSystemService(Context.POWER_SERVICE) as PowerManager
+            val wl = runCatching {
+                pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "autoattend:bt_burst").apply {
+                    setReferenceCounted(false)
+                    acquire(durationMs + 3_000L)
+                }
+            }.getOrNull()
+
+            val latch = CountDownLatch(1)
+            val matchedResult = java.util.concurrent.atomic.AtomicReference<ScanResult?>(null)
+            val activeCb = java.util.concurrent.atomic.AtomicReference<ScanCallback?>(null)
+
+            try {
+                val cb = object : ScanCallback() {
+                    override fun onScanResult(callbackType: Int, result: ScanResult) {
+                        if (matchedResult.get() == null && matchesTargetDevice(result)) {
+                            if (matchedResult.compareAndSet(null, result)) {
+                                latch.countDown()
+                            }
+                        }
+                    }
+
+                    override fun onBatchScanResults(results: MutableList<ScanResult>) {
+                        if (matchedResult.get() != null) return
+                        val hit = results.firstOrNull { matchesTargetDevice(it) }
+                        if (hit != null && matchedResult.compareAndSet(null, hit)) {
+                            latch.countDown()
+                        }
+                    }
+
+                    override fun onScanFailed(errorCode: Int) {
+                        Log.w(TAG, "主动短扫失败 errorCode=" + errorCode)
+                        latch.countDown()
+                    }
+                }
+                activeCb.set(cb)
+
+                val filters = listOf(
+                    ScanFilter.Builder()
+                        .setServiceUuid(ATTENDANCE_SERVICE_UUID)
+                        .build(),
+                )
+                val settings = ScanSettings.Builder()
+                    .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                    .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
+                    .build()
+
+                scanner.startScan(filters, settings, cb)
+                latch.await(durationMs, TimeUnit.MILLISECONDS)
+            } catch (t: Throwable) {
+                Log.w(TAG, "主动短扫异常: " + t.javaClass.simpleName)
+            } finally {
+                activeCb.get()?.let { cb -> runCatching { scanner.stopScan(cb) } }
+                runCatching {
+                    if (wl != null && wl.isHeld) wl.release()
+                }
+            }
+
+            val hit = matchedResult.get()
+            if (hit != null) {
+                val hitAt = System.currentTimeMillis()
+                BtTriggerStore.markSeen(hitAt)
+                Log.i(
+                    TAG,
+                    "主动短扫命中考勤机 mac=" + runCatching { hit.device?.address }.getOrNull() +
+                        " rssi=" + hit.rssi +
+                        " name=" + runCatching { hit.scanRecord?.deviceName }.getOrNull(),
+                )
+                ArrivalTriggerCoordinator.onCompanyArrival(
+                    context = app,
+                    source = PunchForegroundService.SOURCE_BLUETOOTH,
+                    nowMillis = hitAt,
+                )
+            }
+        } finally {
+            activeBurstRunning = false
+        }
+    }
 }

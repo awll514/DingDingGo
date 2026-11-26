@@ -1,6 +1,6 @@
 # 钉钉GO · 开发与维护交接文档（v1.0.0）
 
-> 最后更新：2026-11-16 · 目标设备：Redmi K90 至尊版（HyperOS 3 / Android 16 / API 36）  
+> 最后更新：2026-11-26 · 目标设备：Redmi K90 至尊版（HyperOS 3 / Android 16 / API 36）  
 > 仓库：`https://github.com/awll514/DingDingGo.git` · 分支：`master` · 包名：`com.dingdinggo.app` · 版本：`1.0.0`（`versionCode = 1`）
 
 ---
@@ -34,9 +34,21 @@
      - 通过 `hourState` / `minuteState` + `rememberUpdatedState` 消除跨列闭包覆盖串扰；在 `!listState.isScrollInProgress` 下才响应外部补对齐，不打断手指甩动惯性；`SelectedMinuteReadout` 隔离状态读取，避免拖动期间外层玻璃面板重组。
    - **蓝牙考勤机特征与安全阀（`BleScanReceiver.kt` / `BtScanner.kt` / `BtDeviceLearner.kt` / `BtPunchRule.kt`）**：
      - 稳定特征为 `ServiceUuid = 0000fe3c-0000-1000-8000-00805f9b34fb`（16-bit `0xFE3C` + 22 字节 Manufacturer Data + 设备名/SN），兼容未配对设备 BLE RPA 随机 MAC 轮换（`UUID` 必选 + `MAC`/`名称` 增强确认）。
-     - 首页与设置页 UI 文案均明确展示当前学习到的设备名称、MAC 与 `UUID 0xFE3C` 特征。
+     - 窗口内扫描已由 `SCAN_MODE_LOW_POWER` 调整为 `SCAN_MODE_BALANCED`（窗口外仍完全停止），提高有效时段捕捉率；首页与设置页 UI 文案均明确展示当前学习到的设备名称、MAC 与 `UUID 0xFE3C` 特征。
+   - **调度 RETRY 保活与 UCWebView 点击稳定性修复（2026-11-18，`AlarmScheduler.kt` / `PunchEngine.kt` / `PunchAccessibilityService.kt`）**：
+     - `AlarmScheduler`：`markSlotFired()` 不再同步写入 `justFiredTargetAt`，仅在 `onPunchFinished(markFired = true)` 结案后写入；新增 `shouldRegisterImmediateFire()` 防止已触发过 `FIRE` 后再次立即重排，确保 `PREWARM`/`FIRE` 失败后 `RETRY` 补执行闹钟不被误取消。
+     - `PunchEngine`：`clickPunchButton()` 在 `PunchAccessibilityService` 在线且 `readAllText()` 非空时不再触发 `RootShell.dumpUiHierarchy`（避免 `uiautomator dump` 踢掉无障碍服务），改为第 1/3 次优先手势点击、第 2 次优先 `ACTION_CLICK`，并把 `lastClickDiagnostic` 与页面文本摘要记录入 `trace`；`holdUntilTarget` 预热结束时复检亮屏与解锁状态；`prepareScreen()` 明确区分记录初始亮屏 / WakeLock / Root `keyevent 224` 唤醒来源。
+     - `PunchAccessibilityService`：新增 `AccessibilityTextMatcher`（忽略空白与换行拆分），节点与文本遍历上限提至深度 `64` / `3000` 节点，第 3 轮子树聚合不再要求 H5 父容器 `isClickable == true`，并在 `clickNode()` 校验屏幕边界且支持手势点击失败后回退 `ACTION_CLICK`。
+   - **公司 Wi-Fi + 蓝牙考勤机双通道早到触发与后台定位修复（2026-11-21）**：
+     - 声明 `ACCESS_BACKGROUND_LOCATION` 并实现前/后台定位分步申请（优先通过 Root `pm grant` 静默授予），在活动窗口内增加 4 秒 `SCAN_MODE_LOW_LATENCY` 主动脉冲扫描（90 秒节流 + `WakeLock`）与亮屏/解锁复检；
+     - 新增公司 Wi-Fi 事件驱动触发链路（`WifiStatusParser` / `WifiPresenceReader` 含 `cmd wifi status` Root 兜底 / `WifiTriggerStore` / `WifiTriggerMonitor` / `ArrivalTriggerCoordinator` 60 秒共享防抖），首页与设置页补齐 `WifiStatusCard` 与 `WifiSettingsGroup`。
+   - **早上首次触发迟到确认（2026-11-21）**：
+     - 新增 `LateConfirmRule` / `LateConfirmStore` / `LateConfirmCoordinator` / `LateConfirmOverlay` / `LateConfirmReceiver`；
+     - 早上首次由定时闹钟、蓝牙或 Wi-Fi 触发且落入迟到区间（超过目标 + 55 秒、3 小时内、今日未打卡且未问过）时，发送高优先级通知（`确认打迟到卡` / `今天不打` + 代码级震动提示音）并在亮屏已解锁时同步弹出 60 秒自动关闭确认窗（锁屏期间触发则在 15 分钟内首次解锁自动补弹；超时严格默认不打卡，且仅放行 `CLOCK_IN`，绝不绕过下班早退红线）；首页手动迟到打卡同步增加明确迟到二次确认。
+   - **钉钉「已经打过卡了」弹窗识别与清理（2026-11-26，`DingTalkUi.kt` / `PunchEngine.kt`）**：
+     - 新增 `ALREADY_PUNCHED_DIALOG_SIGNALS` 与 `containsAlreadyPunchedDialog()`（覆盖 `你已经打过卡了`、`已经打过卡了，上班时间以最早打卡时间为准` / `下班时间以最晚打卡时间为准`），并在 `isTargetDone()`、`judgeResult()`、`isAttendancePage()`、`waitUntilInRange()` 中按班次归属校验（避免早班弹窗误判为下班已完成/成功），完成后顺手点击「我知道了」关闭弹窗并重新回读状态卡实际打卡时间。
    - **设置页分组结构（`SettingsScreen.kt`）**：
-     - 依次为：自动打卡 → 外观 → 打卡时间 → 蓝牙自动打卡 → 安全 → 通知 → 打卡日志 → 关于（`版本 1.0.0`）→ **调试（「预览钉钉娘悬浮窗」独立单行卡片）** → **权限与保活**。
+     - 依次为：自动打卡 → 外观 → 打卡时间 → 蓝牙自动打卡 → 公司 Wi-Fi 自动打卡 → 安全 → 通知 → 打卡日志 → 关于（`版本 1.0.0`）→ **调试（「预览钉钉娘悬浮窗」与「预览迟到确认弹窗」）** → **权限与保活**。
 
 ---
 
@@ -48,6 +60,9 @@
    - 打卡成功必须以钉钉界面真实文本反馈为准（先查失败/外勤信号再查成功信号），记录于数据库 `evidence` 字段。
 2. **HyperOS 3 设备特性**
    - 不声明 `neverForLocation` 是为了避免系统黑名单静默丢弃 iBeacon/特定考勤机广播，代价是本机必须同时申请 `BLUETOOTH_SCAN`、`BLUETOOTH_CONNECT`、`ACCESS_FINE_LOCATION`、`ACCESS_COARSE_LOCATION`。
+   - 深度 Doze 下系统蓝牙控制器会处于 `Suspended`（真机实测休眠期间广播会延迟至 AP 唤醒后才批处理上报），因此蓝牙通道作为增强唤醒，准点闹钟仍是兜底主力。
+   - 钉钉考勤页为 `UCWebView` 且页面时钟每秒刷新：`uiautomator dump` 会稳定超时（`ERROR: could not get idle state.`）并注册 `UiTestAutomationService` 导致 `PunchAccessibilityService` 被系统解绑，在线读屏时严禁混用 `dumpUiHierarchy`。
+   - KernelSU 默认对 `adb shell`（uid 2000）隐藏 `su`、仅对授权 App UID 放行，`adb shell su` 报 `not found` 不代表 App 无 root 权限。
    - `adb install` 新包名时需保持屏幕解锁，否则 MIUI 安全中心会直接返回 `INSTALL_FAILED_USER_RESTRICTED`。
    - 通知发出后必须保留代码级 `Vibrator` + `ToneGenerator` 反馈（防止通知渠道被系统/用户静音）。
 3. **跨列 / 动效与 Backdrop 注意事项**
@@ -59,7 +74,7 @@
 ## 三、开发、测试与验收命令
 
 ```powershell
-# 1. 运行全部单元测试（20 个测试类 / 185 个用例）
+# 1. 运行全部单元测试（23 个测试类 / 201 个用例）
 #    因 AGP 9.x 下 testDebugUnitTest 存在运行时 classpath 缺陷，统一使用该脚本直跑 JUnitCore
 powershell -ExecutionPolicy Bypass -File run-tests.ps1
 

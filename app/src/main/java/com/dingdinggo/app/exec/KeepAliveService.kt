@@ -5,18 +5,25 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import com.dingdinggo.app.MainActivity
 import com.dingdinggo.app.R
 import com.dingdinggo.app.core.AlarmScheduler
 import com.dingdinggo.app.core.AppConfig
+import com.dingdinggo.app.core.BtTriggerStore
+import com.dingdinggo.app.core.LateConfirmStore
 import com.dingdinggo.app.core.PunchSchedule
+import com.dingdinggo.app.core.WifiTriggerStore
+import com.dingdinggo.app.wifi.WifiTriggerMonitor
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.Dispatchers
@@ -100,6 +107,55 @@ class KeepAliveService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
+    @Volatile
+    private var screenReceiverRegistered = false
+
+    @Volatile
+    private var lastScreenArrivalCheckAt = 0L
+
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent?) {
+            val action = intent?.action ?: return
+            if (action != Intent.ACTION_USER_PRESENT && action != Intent.ACTION_SCREEN_ON) return
+
+            val unlocked = action == Intent.ACTION_USER_PRESENT
+            scope.launch(Dispatchers.IO) {
+                runCatching {
+                    AppConfig.init(this@KeepAliveService)
+                    BtTriggerStore.init(this@KeepAliveService)
+                    WifiTriggerStore.init(this@KeepAliveService)
+                    LateConfirmStore.init(this@KeepAliveService)
+
+                    if (unlocked) {
+                        LateConfirmCoordinator.showOverlayOnUnlockIfPending(this@KeepAliveService)
+                    }
+
+                    val now = System.currentTimeMillis()
+                    if (now - lastScreenArrivalCheckAt < 60_000L) return@runCatching
+                    lastScreenArrivalCheckAt = now
+
+                    if (!AppConfig.enabled.value) return@runCatching
+                    val inWindow = com.dingdinggo.app.ble.BtScanner
+                        .shouldKeepScanAliveNow(this@KeepAliveService)
+                    if (!inWindow) return@runCatching
+
+                    if (WifiTriggerStore.enabled.value) {
+                        WifiTriggerMonitor.checkNow(this@KeepAliveService)
+                    }
+                    if (BtTriggerStore.enabled.value) {
+                        com.dingdinggo.app.ble.BtScanner.activeBurstScanAndHandle(
+                            context = this@KeepAliveService,
+                            durationMs = 4_000L,
+                            force = unlocked,
+                        )
+                    }
+                }.onFailure {
+                    Log.w(TAG, "亮屏/解锁到岗检测异常: " + it.javaClass.simpleName)
+                }
+            }
+        }
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
@@ -118,13 +174,16 @@ class KeepAliveService : Service() {
         // 必须尽快 startForeground，否则系统会在 5 秒内判定 ANR
         startForeground(NOTIFICATION_ID, buildNotification())
 
+        runCatching {
+            AppConfig.init(this)
+            BtTriggerStore.init(this)
+            WifiTriggerStore.init(this)
+            LateConfirmStore.init(this)
+            WifiTriggerMonitor.sync(this)
+            registerScreenReceiverIfNeeded()
+        }
+
         // 启动时就把无障碍准备好。
-        //
-        // 【启动性能】onStartCommand 跑在主线程，而 ensureEnabled 内部会
-        // fork su + 轮询等待系统重新 bind 无障碍，最长接近 2 秒。
-        // 这里是**保活服务**，晚几百毫秒做这件事完全无影响，
-        // 但直接在主线程做就会阻塞任何正在进行的界面绘制。
-        // 所以放到 scope（Dispatchers.Default）里。
         scope.launch {
             runCatching { AccessibilityKeeper.ensureEnabled(this@KeepAliveService) }
         }
@@ -136,13 +195,36 @@ class KeepAliveService : Service() {
     }
 
     override fun onDestroy() {
-        // 复位自检循环标志：服务被销毁后 scope 会被 cancel，
-        // 循环协程随之退出（finally 里也会复位，这里再兜一次）。
-        // 不复位的话，服务重建后 startSelfCheckLoop 会因为标志仍为 true
-        // 而永久跳过 —— 那样自检就彻底不跑了，比重复更糟。
+        unregisterScreenReceiver()
+        runCatching { WifiTriggerMonitor.stop(this) }
         selfCheckLoopRunning = false
         runCatching { scope.cancel() }
         super.onDestroy()
+    }
+
+    private fun registerScreenReceiverIfNeeded() {
+        if (screenReceiverRegistered) return
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_USER_PRESENT)
+            addAction(Intent.ACTION_SCREEN_ON)
+        }
+        runCatching {
+            ContextCompat.registerReceiver(
+                this,
+                screenReceiver,
+                filter,
+                ContextCompat.RECEIVER_NOT_EXPORTED,
+            )
+            screenReceiverRegistered = true
+        }.onFailure {
+            Log.w(TAG, "注册亮屏/解锁监听失败: " + it.javaClass.simpleName)
+        }
+    }
+
+    private fun unregisterScreenReceiver() {
+        if (!screenReceiverRegistered) return
+        screenReceiverRegistered = false
+        runCatching { unregisterReceiver(screenReceiver) }
     }
 
     // ---------- 自检循环 ----------
@@ -221,29 +303,31 @@ class KeepAliveService : Service() {
             }
         }
 
-        // 【自愈 2】BLE 扫描注册检查（蓝牙触发功能的核心保活点）
-        //
-        // ## 为什么必须在这里重注册
-        //
-        // BLE 的 PendingIntent 扫描注册**只存在于蓝牙栈进程的内存里**：
-        // · 手机重启 → 丢失；
-        // · 蓝牙开关切换 → 丢失；
-        // · 系统对长时扫描做降级（约 30 分钟后转为 opportunistic）→ 实质失效。
-        //
-        // 而 PendingIntent 扫描的注册是**幂等**的（AOSP: 同一个 PI 重复注册
-        // 会被直接忽略），所以每 15 分钟无脑重注册一次是安全且必要的。
-        // 不这样做的话，"重开机后蓝牙触发悄悄失效"是必然发生的 ——
-        // 而且用户完全无从察觉。
+        // 【自愈 2】BLE 扫描注册检查（遵循窗外省电停扫规则，仅在打卡窗口内续期活跃）
         runCatching {
-            com.dingdinggo.app.core.BtTriggerStore.init(this)
-            com.dingdinggo.app.core.BtTriggerStore.refreshPresence()
-            if (com.dingdinggo.app.core.BtTriggerStore.enabled.value) {
-                val ok = com.dingdinggo.app.ble.BtScanner.ensureRegistered(this)
-                Log.i(TAG, "BLE 扫描自检：注册" + if (ok) "成功" else "失败")
+            BtTriggerStore.init(this)
+            BtTriggerStore.refreshPresence()
+            if (BtTriggerStore.enabled.value) {
+                com.dingdinggo.app.ble.BtScanner.renewAndReschedule(this)
+                Log.i(
+                    TAG,
+                    "BLE 扫描自检：inWindow=" + com.dingdinggo.app.ble.BtScanner.shouldKeepScanAliveNow(this),
+                )
             } else {
                 com.dingdinggo.app.ble.BtScanner.stop(this)
             }
         }.onFailure { Log.w(TAG, "BLE 扫描自检异常: " + it.javaClass.simpleName) }
+
+        // 【自愈 3】公司 Wi-Fi 监听与在场复核
+        runCatching {
+            WifiTriggerStore.init(this)
+            WifiTriggerMonitor.sync(this)
+            if (WifiTriggerStore.enabled.value &&
+                com.dingdinggo.app.ble.BtScanner.shouldKeepScanAliveNow(this)
+            ) {
+                WifiTriggerMonitor.checkNow(this)
+            }
+        }.onFailure { Log.w(TAG, "Wi-Fi 监听自检异常: " + it.javaClass.simpleName) }
 
         if (!AppConfig.enabled.value) {
             Log.i(TAG, "自动打卡已关闭，跳过自检")

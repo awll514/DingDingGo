@@ -473,10 +473,17 @@ object AlarmScheduler {
         }
 
         // FIRE：本班目标时刻还没到 → 按目标时刻排；
-        // 已经过了但仍在补执行窗口内 → 允许立刻补一次（这是补执行的语义）。
+        // 已经过了但仍在补执行窗口内 → 只有"尚未触发过 FIRE/RETRY"才立刻补一次，
+        // 已经触发过 FIRE 但执行失败时不再把 FIRE 钳到立刻，交给既有的 RETRY 闹钟兜底。
+        val alreadyFired = hasSlotFired(context, target, slot.kind)
         val fireAt = when {
             slot.targetAtMillis > now -> slot.targetAtMillis
-            now - slot.targetAtMillis <= PunchSchedule.RETRY_WINDOW_SECONDS * 1000L -> registerNow
+            shouldRegisterImmediateFire(
+                slotTargetAt = slot.targetAtMillis,
+                nowMillis = now,
+                retryWindowSeconds = PunchSchedule.RETRY_WINDOW_SECONDS,
+                alreadyFired = alreadyFired,
+            ) -> registerNow
             else -> 0L
         }
         if (fireAt > 0L) {
@@ -552,13 +559,35 @@ object AlarmScheduler {
      *        执行失败传 false，让 nextSlot 在补执行窗口内仍能排回本班，
      *        这样 RETRY 还有机会救一次。
      */
+    /**
+     * 补执行窗口内是否需要把 FIRE 钳到"立即补发"。
+     *
+     * 只有在目标时刻已过、仍在补执行窗口内、且本班尚未触发过 FIRE/RETRY 时才返回 true；
+     * 若本班 FIRE 已经触发过（即使预热/执行刚失败），不得再次立即注册 FIRE，交由 RETRY 闹钟兜底。
+     */
+    internal fun shouldRegisterImmediateFire(
+        slotTargetAt: Long,
+        nowMillis: Long,
+        retryWindowSeconds: Long,
+        alreadyFired: Boolean,
+    ): Boolean {
+        if (alreadyFired) return false
+        if (slotTargetAt > nowMillis) return false
+        return nowMillis - slotTargetAt <= retryWindowSeconds * 1000L
+    }
+
     fun onPunchFinished(context: Context, slot: NextPunchSlot?, markFired: Boolean) {
         runCatching {
-            if (markFired && slot != null) {
-                // 【审计 §2.4】这里必须用持久化版 markSlotFired，不能用只写内存的
-                // markJustFired —— 否则进程重启后"本班已处理"丢失。
-                markSlotFired(context, slot.targetAtMillis, slot.kind)
-                markSlotDoneOnDate(context, slot.targetAtMillis, slot.kind)
+            if (slot != null) {
+                if (markFired) {
+                    // 【审计 §2.4】持久化已触发标记，并标记"本班已结案"以跳过到下一班
+                    markSlotFired(context, slot.targetAtMillis, slot.kind)
+                    markJustFired(slot.targetAtMillis, slot.kind)
+                    markSlotDoneOnDate(context, slot.targetAtMillis, slot.kind)
+                } else if (isJustFired(slot)) {
+                    // 失败或过早被拒时绝不能把本班当作已结案，否则 scheduleNext 会提前取消 RETRY
+                    clearJustFired()
+                }
             }
             scheduleNext(context)
         }.onFailure { Log.w(TAG, "onPunchFinished 重排失败: " + it.javaClass.simpleName) }
@@ -606,7 +635,11 @@ object AlarmScheduler {
      * 与 AppConfig.saveLockPassword 已有的"必须 commit 不能 apply"判据一致。
      */
     fun markSlotFired(context: Context, targetAt: Long, kind: com.dingdinggo.app.data.db.PunchKind) {
-        markJustFired(targetAt, kind)
+        // 只记录"FIRE/RETRY 已触发"用于 reusePreviousAlarms 保活 RETRY，
+        // 不要写入 justFiredTargetAt —— 否则 FIRE 触发后若 PREWARM/本次失败，
+        // onPunchFinished(markFired=false) 调 scheduleNext 会误判本班已结案并取消 RETRY。
+        firedSlotTargetAt = targetAt
+        firedSlotKind = kind.name
         runCatching {
             val p = context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
             p.edit()
@@ -618,6 +651,7 @@ object AlarmScheduler {
 
     /** 清掉"已触发"标记（跨天 / 手动改配置时用）。内存与持久化同时清，避免残留值误命中 */
     fun clearSlotFired(context: Context) {
+        clearJustFired()
         firedSlotTargetAt = 0L
         firedSlotKind = null
         runCatching {

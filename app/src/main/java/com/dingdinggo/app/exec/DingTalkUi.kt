@@ -195,6 +195,25 @@ object DingTalkUi {
     )
 
     /**
+     * 钉钉「已经打过卡了」弹窗提示（当今日某班次已有记录时，再次点击或进入考勤页可能弹出）。
+     *
+     * 按带班次说明的具体文案优先排序，便于后续判断归属哪一班：
+     * - "已经打过卡了，上班时间以最早打卡时间为准" → 明确归属上班卡；
+     * - "已经打过卡了，下班时间以最晚打卡时间为准" → 明确归属下班卡；
+     * - 通用短语（"你已经打过卡了" 等）兜底。
+     */
+    val ALREADY_PUNCHED_DIALOG_SIGNALS = listOf(
+        "已经打过卡了，上班时间以最早打卡时间为准",
+        "已经打过卡了，下班时间以最晚打卡时间为准",
+        "上班时间以最早打卡时间为准",
+        "下班时间以最晚打卡时间为准",
+        "你已经打过卡了",
+        "已经打过卡了",
+        "您已经打过卡了",
+        "已打过卡了",
+    )
+
+    /**
      * 明确表示"这个时段还没打"的信号。
      *
      * 真机上未完成时状态卡写的是「未打卡」。
@@ -320,6 +339,15 @@ object DingTalkUi {
     /** 是否命中"已打卡" */
     fun containsAlreadyDone(text: String): String? =
         ALREADY_DONE_SIGNALS.firstOrNull { text.contains(it) }
+
+    /** 是否命中钉钉「已经打过卡了」弹窗提示 */
+    fun containsAlreadyPunchedDialog(text: String): String? {
+        if (text.isEmpty()) return null
+        val normalized = text.replace(',', '，')
+        ALREADY_PUNCHED_DIALOG_SIGNALS.firstOrNull { normalized.contains(it) }?.let { return it }
+        val compact = normalized.replace(Regex("\\s+"), "")
+        return ALREADY_PUNCHED_DIALOG_SIGNALS.firstOrNull { compact.contains(it) }
+    }
 
     /** 是否命中失败信号 */
     fun containsFailure(text: String): String? =

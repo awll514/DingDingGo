@@ -66,6 +66,12 @@ data class PunchResult(
      */
     val rejectedTooEarly: Boolean = false,
 
+    /** 本次上班打卡因超过迟到边界被闸门拦截 */
+    val rejectedLate: Boolean = false,
+
+    /** 若被迟到闸门拦截，超出目标上班时刻的秒数 */
+    val lateSeconds: Long = 0L,
+
     /** 从钉钉界面/极速打卡横幅解析出的真实打卡时间戳（毫秒，0 表示未解析到） */
     val actualAt: Long = 0L,
 
@@ -142,7 +148,14 @@ class PunchEngine(private val context: Context) {
             var from = 0
             while (true) {
                 val idx = blob.indexOf(key, from)
-                if (idx < 0) return false
+                if (idx < 0) {
+                    DingTalkUi.containsAlreadyPunchedDialog(blob)?.let { signal ->
+                        if (alreadyPunchedDialogMatchesKind(signal, blob, kind, requireExplicitShift = true)) {
+                            return true
+                        }
+                    }
+                    return false
+                }
 
                 // ---- 两栏横排卡片配对判定（如 "上班 09:30 下班 18:30 09:30已打卡 18:30未打卡"）----
                 //
@@ -506,6 +519,13 @@ class PunchEngine(private val context: Context) {
                 // 命中的成功文案属于**另一班**：不能算本次成功，继续往下走。
             }
 
+            // ---- 2.5 「已经打过卡了」弹窗确认（例如重复打卡/极速打卡后弹窗遮住状态卡）----
+            DingTalkUi.containsAlreadyPunchedDialog(blob)?.let { signal ->
+                if (alreadyPunchedDialogMatchesKind(signal, blob, kind, requireExplicitShift = false)) {
+                    return "钉钉提示已打过卡（" + signal + "）"
+                }
+            }
+
             // ---- 3. 状态翻转（极速打卡 / 卡片静默更新）----
             //
             // 只有"点击前未完成 → 现在已完成"才算。
@@ -517,6 +537,71 @@ class PunchEngine(private val context: Context) {
             }
 
             return null
+        }
+
+        /**
+         * 判断「已经打过卡了」弹窗文案是否归属当前目标班次。
+         *
+         * @param requireExplicitShift true 用于点击前基线校验（通用弹窗不跳过班次，防止误跳过下班）；
+         *        false 用于点击后结果确认（明确属于另一班时仍拒绝）。
+         */
+        internal fun alreadyPunchedDialogMatchesKind(
+            signal: String,
+            blob: String,
+            kind: PunchKind,
+            requireExplicitShift: Boolean,
+        ): Boolean {
+            if (kind == PunchKind.MANUAL) return !requireExplicitShift
+
+            val signalHasIn = signal.contains("上班")
+            val signalHasOut = signal.contains("下班")
+            if (signalHasIn || signalHasOut) {
+                return when (kind) {
+                    PunchKind.CLOCK_IN -> signalHasIn && !signalHasOut
+                    PunchKind.CLOCK_OUT -> signalHasOut && !signalHasIn
+                    PunchKind.MANUAL -> !requireExplicitShift
+                }
+            }
+
+            val compact = blob.replace(',', '，').replace(Regex("\\s+"), "")
+            val blobHasIn = compact.contains("上班时间以最早打卡时间为准")
+            val blobHasOut = compact.contains("下班时间以最晚打卡时间为准")
+            if (blobHasIn && !blobHasOut) return kind == PunchKind.CLOCK_IN
+            if (blobHasOut && !blobHasIn) return kind == PunchKind.CLOCK_OUT
+
+            return !requireExplicitShift
+        }
+
+        /** 判断当前页面文本是否属于考勤打卡页（含弹窗遮挡态，纯函数可单测） */
+        internal fun isAttendancePage(text: String): Boolean {
+            if (text.isEmpty()) return false
+
+            // 推送格式是 "考勤打卡: 11-11 考勤全部正常"，特征是「考勤打卡」后紧跟冒号。
+            if (text.contains("考勤打卡:") || text.contains("考勤打卡：")) {
+                val strong = text.contains("上班打卡") || text.contains("下班打卡") ||
+                    text.contains("未进入考勤范围") || text.contains("可外勤打卡") ||
+                    DingTalkUi.containsAlreadyPunchedDialog(text) != null
+                if (!strong) return false
+            }
+
+            if (DingTalkUi.containsAlreadyPunchedDialog(text) != null) return true
+            if (text.contains("上班打卡") || text.contains("下班打卡")) return true
+
+            val hasIn = text.contains("上班")
+            val hasOut = text.contains("下班")
+            val hasDone = text.contains("已打卡")
+            if (hasIn && hasOut && hasDone) return true
+            if ((hasIn || hasOut) && text.contains("更新打卡")) return true
+
+            if (text.contains("未进入考勤范围") || text.contains("可外勤打卡") ||
+                text.contains("如需内勤打卡")
+            ) {
+                return true
+            }
+
+            if ((hasIn || hasOut) && (text.contains("打卡记录") || text.contains("补卡"))) return true
+
+            return false
         }
 
         /**
@@ -857,6 +942,10 @@ class PunchEngine(private val context: Context) {
          * 非蓝牙来源传 0，行为与原来**完全一致**。
          */
         earlyWindowMs: Long = 0L,
+        /**
+         * 是否经用户显式确认放行迟到红线（仅对 [PunchKind.CLOCK_IN] 生效）。
+         */
+        allowLate: Boolean = false,
     ): PunchResult {
         trace.clear()
 
@@ -1012,10 +1101,28 @@ class PunchEngine(private val context: Context) {
                 } else {
                     log("预热期间已过目标时刻（超出 " + (-waitMs / 1000L) + " 秒），直接进入点击")
                 }
+
+                // 预热等待可能持续数十秒：若期间屏幕自动熄灭或重新上锁，先恢复亮屏与解锁
+                val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+                if (!pm.isInteractive || !isKeyguardUnlocked()) {
+                    log("预热结束前检测到息屏/上锁，重新点亮并解锁")
+                    val rewakeLock = acquireScreenWakeLockForUnlock()
+                    try {
+                        if (!prepareScreen()) return fail(PunchStage.WAKE, "预热后无法重新点亮屏幕")
+                        if (!unlock()) return fail(PunchStage.UNLOCK, "预热后重新解锁失败")
+                    } finally {
+                        runCatching {
+                            if (rewakeLock != null && rewakeLock.isHeld) rewakeLock.release()
+                        }
+                    }
+                    if (!launchDingTalk()) {
+                        return fail(PunchStage.LAUNCH, "预热恢复后钉钉切回失败")
+                    }
+                }
             }
 
             // ---- 5.5 安全闸门（绝不能跳过） ----
-            val guard = checkSafetyGate(kind, targetAt, earlyWindowMs)
+            val guard = checkSafetyGate(kind, targetAt, earlyWindowMs, allowLate)
             if (guard != null) {
                 return guard
             }
@@ -1051,7 +1158,7 @@ class PunchEngine(private val context: Context) {
             // 正确顺序：先看基线 → 已完成就直接收工 → 否则才点。
             if (alreadyDoneBefore) {
                 ControlHudOverlay.hide()
-                val actual = extractLiveActualTime(kind)
+                val actual = extractActualTimeWithPopupCleanup(kind)
                 val evidence = "极速打卡（无需点击）：进入考勤页时目标时段已是已打卡状态"
                 log("判定成功，依据: " + evidence + (actual?.let { "（真实时间=" + it.displayText + "）" } ?: ""))
                 return PunchResult(
@@ -1079,7 +1186,7 @@ class PunchEngine(private val context: Context) {
                 }
                 if (fastEvidence != null) {
                     ControlHudOverlay.hide()
-                    val actual = extractLiveActualTime(kind)
+                    val actual = extractActualTimeWithPopupCleanup(kind)
                     val evidence = "点击阶段检测到打卡已完成（" + fastEvidence + "）"
                     log("判定成功，依据: " + evidence + (actual?.let { "（真实时间=" + it.displayText + "）" } ?: ""))
                     return PunchResult(
@@ -1106,7 +1213,7 @@ class PunchEngine(private val context: Context) {
             }
 
             ControlHudOverlay.hide()
-            val actual = extractLiveActualTime(kind)
+            val actual = extractActualTimeWithPopupCleanup(kind)
             log("判定成功，依据: " + verdict + (actual?.let { "（真实时间=" + it.displayText + "）" } ?: ""))
             return PunchResult(
                 success = true,
@@ -1183,6 +1290,18 @@ class PunchEngine(private val context: Context) {
         }
     }.getOrNull()
 
+    /** 提取真实打卡时间，并在存在「已经打过卡了」弹窗时顺手关闭，便于读取底层状态卡并保持界面干净 */
+    private suspend fun extractActualTimeWithPopupCleanup(kind: PunchKind): ExtractedPunchTime? {
+        var actual = extractLiveActualTime(kind)
+        if (DingTalkUi.containsAlreadyPunchedDialog(readCurrentPageText()) != null) {
+            runCatching { PunchAccessibilityService.get()?.let { dismissPopups(it) } }
+            if (actual == null) {
+                actual = extractLiveActualTime(kind)
+            }
+        }
+        return actual
+    }
+
     /** 从当前考勤页及最近横幅事件缓存里提取本次打卡的真实时间戳 */
     private fun extractLiveActualTime(kind: PunchKind): ExtractedPunchTime? {
         val service = PunchAccessibilityService.get()
@@ -1203,8 +1322,13 @@ class PunchEngine(private val context: Context) {
     /** 点亮屏幕：优先临时亮屏锁 + root KEYCODE_WAKEUP，失败时重试与 Activity 兜底 */
     private suspend fun prepareScreen(): Boolean {
         val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+        val initiallyInteractive = pm.isInteractive
+        if (initiallyInteractive) {
+            log("屏幕唤醒：初始已点亮（pm.isInteractive=true）")
+            return true
+        }
         if (waitUntil(600L) { pm.isInteractive }) {
-            log("屏幕已点亮")
+            log("屏幕唤醒：WakeLock 点亮成功")
             return true
         }
 
@@ -1214,7 +1338,10 @@ class PunchEngine(private val context: Context) {
                 log("root 点亮屏幕 input keyevent 224（第 " + (idx + 1) + " 次）")
                 channelUsed = "root"
                 RootShell.wakeUp()
-                if (waitUntil(2_000L) { pm.isInteractive }) return true
+                if (waitUntil(2_000L) { pm.isInteractive }) {
+                    log("屏幕唤醒：root keyevent 224 成功")
+                    return true
+                }
             }
         } else {
             log("root 不可用，跳过 input keyevent 224")
@@ -1813,41 +1940,11 @@ class PunchEngine(private val context: Context) {
      */
     private fun looksLikeAttendancePage(text: String): Boolean {
         if (text.isEmpty()) return false
-
-        // ---- 先排除消息列表的推送文案 ----
-        // 推送格式是 "考勤打卡: 11-11 考勤全部正常"，特征是「考勤打卡」后紧跟冒号。
-        // 真正的考勤页不会这么写 —— 那里是按钮和状态卡。
-        if (text.contains("考勤打卡:") || text.contains("考勤打卡：")) {
-            val strong = text.contains("上班打卡") || text.contains("下班打卡") ||
-                text.contains("未进入考勤范围") || text.contains("可外勤打卡")
-            if (!strong) {
-                log("疑似消息列表推送（含考勤打卡:），不判定为考勤页")
-                return false
-            }
+        val ok = isAttendancePage(text)
+        if (!ok && (text.contains("考勤打卡:") || text.contains("考勤打卡："))) {
+            log("疑似消息列表推送（含考勤打卡:），不判定为考勤页")
         }
-
-        // ---- 强证据 1：打卡按钮 ----
-        if (text.contains("上班打卡") || text.contains("下班打卡")) return true
-
-        // ---- 强证据 2：状态卡组合 ----
-        // 真实状态卡："上班09:30 09:19已打卡 下班18:30 18:30已打卡 更新打卡"
-        val hasIn = text.contains("上班")
-        val hasOut = text.contains("下班")
-        val hasDone = text.contains("已打卡")
-        if (hasIn && hasOut && hasDone) return true
-        if ((hasIn || hasOut) && text.contains("更新打卡")) return true
-
-        // ---- 强证据 3：外勤提示 ----
-        if (text.contains("未进入考勤范围") || text.contains("可外勤打卡") ||
-            text.contains("如需内勤打卡")
-        ) {
-            return true
-        }
-
-        // ---- 弱证据：班次词 + 打卡记录/补卡 ----
-        if ((hasIn || hasOut) && (text.contains("打卡记录") || text.contains("补卡"))) return true
-
-        return false
+        return ok
     }
     /** root 通道：靠 uiautomator dump 解析坐标后 input tap */
     private suspend fun navigateWithRoot(): Boolean {
@@ -1956,24 +2053,41 @@ class PunchEngine(private val context: Context) {
             if (pref != ChannelPreference.ROOT_ONLY) {
                 val service = PunchAccessibilityService.get()
                 if (service != null) {
-                    // H5/UCWebView 按钮对 ACTION_CLICK 经常静默吞掉，优先派发屏幕坐标手势点击
-                    if (service.clickByText(candidates, preferGesture = true)) {
-                        log("无障碍点击打卡按钮（第 " + (attempt + 1) + " 次）")
+                    // 第 1/3 次优先手势坐标点击（绕过 H5/UCWebView 吞 ACTION_CLICK）；
+                    // 第 2 次改走 ACTION_CLICK 优先（clickNode 失败时仍会双路互备）。
+                    val preferGesture = attempt != 1
+                    if (service.clickByText(candidates, preferGesture = preferGesture)) {
+                        log(
+                            "无障碍点击打卡按钮（第 " + (attempt + 1) + " 次，" +
+                                service.lastClickDiagnostic + "）",
+                        )
                         delay(1500)
                         return true
                     }
+                    log(
+                        "无障碍第 " + (attempt + 1) + " 次未击中打卡按钮（" +
+                            service.lastClickDiagnostic + "）",
+                    )
                     // 没点到按钮时立即复检是否因极速打卡刚完成并覆盖了按钮，避免后续 dump 卡住导致横幅消逝
                     if (checkQuickPunchOrDone(kind, alreadyDoneBefore) != null) {
                         log("无障碍未找到按钮，但检测到极速打卡已完成")
                         return false
                     }
+                    // 若未命中当前班次，但存在「已经打过卡了」弹窗遮挡（例如残留的早班弹窗挡住下班按钮），先关闭弹窗再重试
+                    if (DingTalkUi.containsAlreadyPunchedDialog(service.readAllText()) != null) {
+                        dismissPopups(service)
+                    }
                 }
             }
 
-            val needRootFallback = pref == ChannelPreference.ROOT_ONLY ||
-                PunchAccessibilityService.get() == null ||
-                PunchAccessibilityService.get()?.readAllText().orEmpty().isEmpty() ||
-                attempt >= 1
+            // 注意：在钉钉 UCWebView（动态时钟每秒刷新）下执行 uiautomator dump 不仅会卡 3 秒超时，
+            // 还会通过 UiTestAutomationService 强制解绑并重连 PunchAccessibilityService。
+            // 因此只要无障碍在线且能读到当前界面文本，就不再在重试循环里跑 uiautomator dump；
+            // 仅在 ROOT_ONLY、无障碍离线、或无障碍读不到任何文本时才走 root dump 兜底。
+            val currentService = PunchAccessibilityService.get()
+            val hasLiveAccessibilityUi = currentService != null &&
+                currentService.readAllText().isNotBlank()
+            val needRootFallback = pref == ChannelPreference.ROOT_ONLY || !hasLiveAccessibilityUi
             if (needRootFallback && pref != ChannelPreference.ACCESSIBILITY_ONLY && RootShell.isAvailable()) {
                 // 限制 dump 超时为 3 秒，避免长时间阻塞让极速打卡顶部横幅消失
                 val xml = RootShell.dumpUiHierarchy(timeoutMs = 3_000L)
@@ -1989,6 +2103,14 @@ class PunchEngine(private val context: Context) {
                 }
             }
             delay(800)
+        }
+        val sampleLines = PunchAccessibilityService.get()
+            ?.readTextLines()
+            ?.take(12)
+            ?.joinToString(" | ")
+            .orEmpty()
+        if (sampleLines.isNotBlank()) {
+            log("点击打卡按钮失败时页面文本摘要：" + sampleLines.take(240))
         }
         return false
     }
@@ -2025,6 +2147,7 @@ class PunchEngine(private val context: Context) {
         kind: PunchKind,
         scheduledTargetAt: Long,
         earlyWindowMs: Long = 0L,
+        allowLate: Boolean = false,
     ): PunchResult? {
         // ---------- 闸门 1：时间窗口 ----------
         val now = System.currentTimeMillis()
@@ -2115,22 +2238,28 @@ class PunchEngine(private val context: Context) {
 
             is TimeWindowVerdict.Late -> {
                 val lateText = PunchSchedule.formatRemainSeconds(verdict.lateSec)
-                log("拒绝：已超迟到边界 " + lateText + "，避免生成迟到卡")
-                return PunchResult(
-                    success = false,
-                    stage = PunchStage.CLICK,
-                    message = "已过上班时间 " + lateText +
-                        "（迟到边界 1 分钟，留 5 秒安全余量），为避免迟到记录已跳过。" +
-                        "如需打卡请手动操作。",
-                    trace = trace.toList(),
-                    channelUsed = channelUsed,
-                    abandonedByGate = true,
-                )
+                if (com.dingdinggo.app.core.LateConfirmRule.isLateAllowedForKind(kind, allowLate)) {
+                    log("用户已确认补打迟到卡，放行迟到边界（已过 " + lateText + "）")
+                } else {
+                    log("拒绝：已超迟到边界 " + lateText + "，避免生成迟到卡")
+                    return PunchResult(
+                        success = false,
+                        stage = PunchStage.CLICK,
+                        message = "已过上班时间 " + lateText +
+                            "（迟到边界 1 分钟，留 5 秒安全余量），为避免迟到记录已跳过。" +
+                            "如需打卡请手动操作。",
+                        trace = trace.toList(),
+                        channelUsed = channelUsed,
+                        abandonedByGate = true,
+                        rejectedLate = true,
+                        lateSeconds = verdict.lateSec,
+                    )
+                }
             }
         }
 
         // ---------- 闸门 2：外勤检查（需要读界面，可能要等） ----------
-        val outdoorVerdict = waitUntilInRange(kind, targetAt)
+        val outdoorVerdict = waitUntilInRange(kind, targetAt, allowLate)
         if (outdoorVerdict != null) return outdoorVerdict
 
         // ---------- 闸门 3：等待结束后**必须重新过一遍时间闸门** ----------
@@ -2151,7 +2280,7 @@ class PunchEngine(private val context: Context) {
         // 但上班卡的 55 秒窗口根本撑不住这种等待。
         //
         // 所以这里用等待结束后的真实时间**再判一次**，语义与首次完全一致。
-        return recheckTimeWindow(kind, targetAt, earlyWindowMs)
+        return recheckTimeWindow(kind, targetAt, earlyWindowMs, allowLate)
     }
 
     /**
@@ -2164,6 +2293,7 @@ class PunchEngine(private val context: Context) {
         kind: PunchKind,
         targetAt: Long,
         earlyWindowMs: Long = 0L,
+        allowLate: Boolean = false,
     ): PunchResult? {
         val now = System.currentTimeMillis()
 
@@ -2197,16 +2327,22 @@ class PunchEngine(private val context: Context) {
                 val mustStopAt = clockInMustStopAt(targetAt)
                 if (now > mustStopAt) {
                     val lateSec = (now - targetAt) / 1000L
-                    log("外勤等待后复查：已超出迟到停手点 " + lateSec + " 秒，放弃本次打卡")
-                    return PunchResult(
-                        success = false,
-                        stage = PunchStage.CLICK,
-                        message = "外勤等待期间已越过迟到边界（已过 " + lateSec +
-                            " 秒），为避免生成迟到记录已跳过。如需打卡请手动操作。",
-                        trace = trace.toList(),
-                        channelUsed = channelUsed,
-                        abandonedByGate = true,
-                    )
+                    if (com.dingdinggo.app.core.LateConfirmRule.isLateAllowedForKind(kind, allowLate)) {
+                        log("外勤等待后复查：用户已确认打迟到卡，放行迟到边界（已过 " + lateSec + " 秒）")
+                    } else {
+                        log("外勤等待后复查：已超出迟到停手点 " + lateSec + " 秒，放弃本次打卡")
+                        return PunchResult(
+                            success = false,
+                            stage = PunchStage.CLICK,
+                            message = "外勤等待期间已越过迟到边界（已过 " + lateSec +
+                                " 秒），为避免生成迟到记录已跳过。如需打卡请手动操作。",
+                            trace = trace.toList(),
+                            channelUsed = channelUsed,
+                            abandonedByGate = true,
+                            rejectedLate = true,
+                            lateSeconds = lateSec,
+                        )
+                    }
                 }
             }
 
@@ -2229,7 +2365,11 @@ class PunchEngine(private val context: Context) {
      *
      * @return null 表示可以打；非 null 表示本次放弃
      */
-    private suspend fun waitUntilInRange(kind: PunchKind, targetAt: Long): PunchResult? {
+    private suspend fun waitUntilInRange(
+        kind: PunchKind,
+        targetAt: Long,
+        allowLate: Boolean = false,
+    ): PunchResult? {
         val service = PunchAccessibilityService.get()
         val startedAt = System.currentTimeMillis()
         var attempt = 0
@@ -2237,7 +2377,11 @@ class PunchEngine(private val context: Context) {
         while (true) {
             attempt++
             // 上班卡已超过迟到停手点时不必再等 15 分钟外勤轮询，交由 recheckTimeWindow 立即按红线中止
-            if (kind == PunchKind.CLOCK_IN && targetAt > 0L && System.currentTimeMillis() > clockInMustStopAt(targetAt)) {
+            if (kind == PunchKind.CLOCK_IN &&
+                !com.dingdinggo.app.core.LateConfirmRule.isLateAllowedForKind(kind, allowLate) &&
+                targetAt > 0L &&
+                System.currentTimeMillis() > clockInMustStopAt(targetAt)
+            ) {
                 log("外勤检查：已超出上班迟到停手点，停止等待并交由时间窗复查中止")
                 return null
             }
@@ -2249,11 +2393,14 @@ class PunchEngine(private val context: Context) {
             }
 
             // 已打卡状态：不需要再打
-            DingTalkUi.containsAlreadyDone(blob)?.let { signal ->
+            val alreadySignal = DingTalkUi.containsAlreadyDone(blob)
+                ?: DingTalkUi.containsAlreadyPunchedDialog(blob)
+            alreadySignal?.let { signal ->
                 // 但要排除"今天的上班已打卡，现在该打下班"这种正常情况：
                 // 只有当目标按钮本身已经是"已打卡"时才中止。
                 if (targetAlreadyDone(blob, kind)) {
-                    val actual = extractLiveActualTime(kind)
+                    ControlHudOverlay.hide()
+                    val actual = extractActualTimeWithPopupCleanup(kind)
                     log("外勤检查：目标时段已打卡（" + signal + "），无需重复" +
                         (actual?.let { "（真实时间=" + it.displayText + "）" } ?: ""))
                     return PunchResult(

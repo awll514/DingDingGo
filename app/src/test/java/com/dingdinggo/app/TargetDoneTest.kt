@@ -316,4 +316,31 @@ class TargetDoneTest {
             PunchEngine.isTargetDone(singleTokenTwoCol, PunchKind.CLOCK_OUT),
         )
     }
+
+    @Test
+    fun alreadyPunchedDialogRespectsExplicitShiftInPreClickBaseline() {
+        val clockInDialog = "你已经打过卡了 已经打过卡了，上班时间以最早打卡时间为准 我知道了"
+        assertTrue(
+            "明确说明上班时间以最早打卡时间为准时，上班卡基线应判已完成",
+            PunchEngine.isTargetDone(clockInDialog, PunchKind.CLOCK_IN),
+        )
+        assertFalse(
+            "上班「已经打过卡了」弹窗绝不能误判为下班已完成",
+            PunchEngine.isTargetDone(clockInDialog, PunchKind.CLOCK_OUT),
+        )
+        assertFalse(
+            "MANUAL 仍恒为 false",
+            PunchEngine.isTargetDone(clockInDialog, PunchKind.MANUAL),
+        )
+
+        val genericDialog = "你已经打过卡了 我知道了"
+        assertFalse(
+            "不带班次的通用「你已经打过卡了」弹窗，点击前基线不得跳过上班或下班",
+            PunchEngine.isTargetDone(genericDialog, PunchKind.CLOCK_IN),
+        )
+        assertFalse(
+            "不带班次的通用「你已经打过卡了」弹窗，点击前基线不得跳过下班",
+            PunchEngine.isTargetDone(genericDialog, PunchKind.CLOCK_OUT),
+        )
+    }
 }

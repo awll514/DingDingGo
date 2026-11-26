@@ -38,7 +38,11 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.kyant.backdrop.backdrops.layerBackdrop
 import com.kyant.backdrop.backdrops.rememberCombinedBackdrop
 import com.kyant.backdrop.backdrops.rememberLayerBackdrop
+import com.dingdinggo.app.core.PunchSchedule
+import com.dingdinggo.app.exec.LateConfirmCoordinator
+import com.dingdinggo.app.exec.PunchForegroundService
 import com.dingdinggo.app.ui.MainViewModel
+import com.dingdinggo.app.ui.components.ConfirmDialog
 import com.dingdinggo.app.ui.components.GlassTabBar
 import com.dingdinggo.app.ui.components.LaunchOverlay
 import com.dingdinggo.app.ui.glass.FlowingBackground
@@ -52,6 +56,7 @@ import com.dingdinggo.app.ui.screens.HomeScreen
 import com.dingdinggo.app.ui.screens.SettingsScreen
 import com.dingdinggo.app.ui.theme.GlassTheme
 import com.dingdinggo.app.ui.theme.GlassThemeProvider
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
@@ -75,8 +80,32 @@ class MainActivity : ComponentActivity() {
      */
     private val vm: MainViewModel by viewModels()
 
+    private var pendingBgFromUserClick = false
+
     private val notificationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
+    private val bgLocationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        android.util.Log.i("MainActivity", "后台定位权限申请结果 granted=" + granted)
+        vm.refreshBtState()
+        vm.refreshHealth()
+        if (granted) {
+            vm.repairBluetoothScan { }
+        }
+    }
+
+    private val wifiLocationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        android.util.Log.i("MainActivity", "Wi-Fi 定位权限申请结果 granted=" + granted)
+        vm.refreshBtState()
+        vm.refreshHealth()
+        if (granted) {
+            requestBackgroundLocationStep(userTriggered = true)
+        }
+    }
 
     /**
      * 「附近的设备」权限申请器。
@@ -92,6 +121,8 @@ class MainActivity : ComponentActivity() {
         val granted = result.values.any { it }
         android.util.Log.i("MainActivity", "蓝牙权限申请结果 granted=" + granted)
         val remaining = com.dingdinggo.app.ble.BtScanner.missingPermissions(this)
+        val fromClick = pendingBgFromUserClick
+        pendingBgFromUserClick = false
         if (!granted && remaining.isNotEmpty()) {
             val canAskAgain = remaining.any { perm ->
                 ActivityCompat.shouldShowRequestPermissionRationale(this, perm)
@@ -106,6 +137,9 @@ class MainActivity : ComponentActivity() {
             }
         }
         vm.onBtPermissionResult(granted)
+        if (remaining.isEmpty()) {
+            requestBackgroundLocationStep(userTriggered = fromClick)
+        }
     }
 
     /**
@@ -222,6 +256,7 @@ class MainActivity : ComponentActivity() {
 
         requestNotificationPermission()
         requestBtPermissionIfNeeded()
+        handleLaunchIntent(intent)
 
         // 启动常驻保活服务：挂一条"正在守护"通知，并每 15 分钟自检闹钟是否还在。
         // 这是用户要求的可见 + 自愈能力。
@@ -235,8 +270,26 @@ class MainActivity : ComponentActivity() {
             AppRoot(
                 // 设置页的按钮 = 无条件申请（用户主动点击时不看"是否问过"）
                 onRequestBtPermission = { forceRequestBtPermissions() },
+                onRequestWifiPermission = { requestWifiLocationPermission() },
                 backgroundPaused = !isUiVisible,
             )
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleLaunchIntent(intent)
+    }
+
+    private fun handleLaunchIntent(intent: Intent?) {
+        val openLate = intent?.getBooleanExtra(
+            LateConfirmCoordinator.EXTRA_OPEN_LATE_CONFIRM,
+            false,
+        ) == true
+        if (openLate) {
+            intent.removeExtra(LateConfirmCoordinator.EXTRA_OPEN_LATE_CONFIRM)
+            vm.reloadLateConfirm(forceReopen = true)
         }
     }
 
@@ -250,6 +303,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         sawTouchDown = false
+        vm.reloadLateConfirm(forceReopen = false)
         if (hasPausedOnce) {
             vm.refreshBtState()
             vm.refreshHealth()
@@ -374,7 +428,10 @@ class MainActivity : ComponentActivity() {
         // 缺失时必须主动申请，否则功能会以"看起来正常、实际失效"的
         // 方式静默不工作。
         val needed = com.dingdinggo.app.ble.BtScanner.missingPermissions(this)
-        if (needed.isEmpty()) return
+        if (needed.isEmpty()) {
+            requestBackgroundLocationStep(userTriggered = false)
+            return
+        }
 
         // 已经明确拒绝过的权限不再自动弹窗打扰（与通知权限同一策略），
         // 由设置页的「授权扫描」按钮显式触发。
@@ -386,6 +443,7 @@ class MainActivity : ComponentActivity() {
             "申请蓝牙权限 " + needed + " (曾拒绝=" + permanentlyDenied + ")",
         )
 
+        pendingBgFromUserClick = false
         runCatching { btPermissionLauncher.launch(needed.toTypedArray()) }
             .onFailure { android.util.Log.w("MainActivity", "申请蓝牙权限失败: " + it.javaClass.simpleName) }
     }
@@ -399,6 +457,10 @@ class MainActivity : ComponentActivity() {
     fun forceRequestBtPermissions() {
         val needed = com.dingdinggo.app.ble.BtScanner.missingPermissions(this)
         if (needed.isEmpty()) {
+            if (com.dingdinggo.app.ble.BtScanner.needsBackgroundLocation(this)) {
+                requestBackgroundLocationStep(userTriggered = true)
+                return
+            }
             android.util.Log.i("MainActivity", "蓝牙权限已齐全，检查蓝牙状态并尝试重注册扫描")
             if (!com.dingdinggo.app.ble.BtScanner.isBluetoothOn(this) ||
                 com.dingdinggo.app.ble.BtScanner.blocker(this) != null
@@ -415,8 +477,78 @@ class MainActivity : ComponentActivity() {
             }
             return
         }
+        pendingBgFromUserClick = true
         runCatching { btPermissionLauncher.launch(needed.toTypedArray()) }
-            .onFailure { android.util.Log.w("MainActivity", "强制申请蓝牙权限失败: " + it.javaClass.simpleName) }
+            .onFailure {
+                pendingBgFromUserClick = false
+                android.util.Log.w("MainActivity", "强制申请蓝牙权限失败: " + it.javaClass.simpleName)
+            }
+    }
+
+    /**
+     * Android 10+ 后台定位权限分步申请：先尝试 Root 静默授权，失败再由用户授权。
+     * 绝不把 ACCESS_BACKGROUND_LOCATION 混在首次前后台权限请求组里，防止系统静默吞掉弹窗。
+     */
+    private fun requestBackgroundLocationStep(userTriggered: Boolean) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        if (!com.dingdinggo.app.ble.BtScanner.needsBackgroundLocation(this)) return
+
+        vm.tryGrantBackgroundLocationViaRoot { grantedByRoot ->
+            if (grantedByRoot) {
+                vm.refreshBtState()
+                vm.refreshHealth()
+                if (userTriggered) {
+                    vm.repairBluetoothScan { ok ->
+                        android.widget.Toast.makeText(
+                            this,
+                            if (ok) "已通过 Root 授予始终允许定位，扫描已重新注册"
+                            else "已通过 Root 授予后台定位，但扫描注册失败",
+                            android.widget.Toast.LENGTH_SHORT,
+                        ).show()
+                    }
+                }
+                return@tryGrantBackgroundLocationViaRoot
+            }
+
+            // Android 11+ 调用 ACCESS_BACKGROUND_LOCATION 会直接跳转系统位置设置页，
+            // 冷启动静默检查时不打扰用户，由用户点击「去授权」或开启开关时主动引导。
+            if (!userTriggered && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                Log.i("MainActivity", "后台定位未授权（始终允许），等待用户主动点击授权")
+                return@tryGrantBackgroundLocationViaRoot
+            }
+
+            runCatching {
+                bgLocationPermissionLauncher.launch(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+            }.onFailure {
+                if (userTriggered) {
+                    com.dingdinggo.app.core.HealthCheck.openAppDetails(this)
+                }
+            }
+        }
+    }
+
+    fun requestWifiLocationPermission() {
+        val hasFine = ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.ACCESS_FINE_LOCATION,
+        ) == PackageManager.PERMISSION_GRANTED
+        if (!hasFine) {
+            runCatching {
+                wifiLocationPermissionLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+            }.onFailure {
+                com.dingdinggo.app.core.HealthCheck.openAppDetails(this)
+            }
+            return
+        }
+        if (com.dingdinggo.app.ble.BtScanner.needsBackgroundLocation(this)) {
+            requestBackgroundLocationStep(userTriggered = true)
+            return
+        }
+        android.widget.Toast.makeText(
+            this,
+            "Wi-Fi 所需定位权限已就绪",
+            android.widget.Toast.LENGTH_SHORT,
+        ).show()
     }
 
     private fun requestNotificationPermission() {
@@ -456,6 +588,8 @@ class MainActivity : ComponentActivity() {
 private fun AppRoot(
     /** 请求蓝牙扫描权限（运行时申请必须由 Activity 发起） */
     onRequestBtPermission: () -> Unit = {},
+    /** 请求 Wi-Fi 所需定位权限（运行时申请必须由 Activity 发起） */
+    onRequestWifiPermission: () -> Unit = {},
     backgroundPaused: Boolean = false,
 ) {
     val vm: MainViewModel = viewModel()
@@ -517,6 +651,9 @@ private fun AppRoot(
         androidx.compose.runtime.mutableIntStateOf(0)
     }
     var focusScheduleSignal by androidx.compose.runtime.remember {
+        androidx.compose.runtime.mutableIntStateOf(0)
+    }
+    var focusWifiSignal by androidx.compose.runtime.remember {
         androidx.compose.runtime.mutableIntStateOf(0)
     }
 
@@ -709,7 +846,7 @@ private fun AppRoot(
                             0 -> HomeScreen(
                                 state = state,
                                 busy = busy,
-                                onManualPunch = { vm.manualPunch() },
+                                onManualPunch = { allowLate -> vm.manualPunch(allowLate) },
                                 onFixHealth = { item ->
                                     handlePermissionFix(
                                         vm = vm,
@@ -719,6 +856,11 @@ private fun AppRoot(
                                             gotoSettings()
                                         },
                                         onNeedBtPermission = onRequestBtPermission,
+                                        onNeedWifiPermission = onRequestWifiPermission,
+                                        onNeedWifiSettings = {
+                                            focusWifiSignal++
+                                            gotoSettings()
+                                        },
                                         onNeedScheduleSettings = {
                                             focusScheduleSignal++
                                             gotoSettings()
@@ -727,6 +869,7 @@ private fun AppRoot(
                                 },
                                 onSkipToday = { vm.setSkipToday(it) },
                                 onRequestBtPermission = onRequestBtPermission,
+                                onRequestWifiPermission = onRequestWifiPermission,
                                 backgroundPaused = backgroundPaused,
                             )
 
@@ -748,12 +891,16 @@ private fun AppRoot(
                                             focusPasswordSignal++
                                         },
                                         onNeedBtPermission = onRequestBtPermission,
+                                        onNeedWifiPermission = onRequestWifiPermission,
+                                        onNeedWifiSettings = {
+                                            focusWifiSignal++
+                                        },
                                         onNeedScheduleSettings = {
                                             focusScheduleSignal++
                                         },
                                     )
                                 },
-                                                    onRecheckRoot = { vm.recheckRoot() },
+                                onRecheckRoot = { vm.recheckRoot() },
                                 onClearLogs = { vm.clearLogs() },
                                 onThemeChange = { vm.setThemeMode(it) },
                                 onRefreshPersistent = {
@@ -771,8 +918,16 @@ private fun AppRoot(
                                 onBtLearn = { cb -> vm.learnBtDevice(cb) },
                                 onBtClearDevice = { vm.clearBtDevice() },
                                 onBtResetToday = { vm.resetBtToday() },
+                                // ---- 公司 Wi-Fi 自动打卡 ----
+                                onWifiToggle = { enabled ->
+                                    vm.setWifiEnabled(enabled)
+                                },
+                                onRequestWifiPermission = onRequestWifiPermission,
+                                onWifiLearn = { cb -> vm.learnWifiNetwork(cb) },
+                                onWifiClear = { vm.clearWifiNetwork() },
                                 focusPasswordSignal = focusPasswordSignal,
                                 focusScheduleSignal = focusScheduleSignal,
+                                focusWifiSignal = focusWifiSignal,
                             )
                         }
                     }
@@ -807,6 +962,39 @@ private fun AppRoot(
                 }
                 }
 
+                val pendingLate = state.pendingLateConfirm
+                if (pendingLate != null) {
+                    var remainingSeconds by remember(pendingLate.promptedAt) {
+                        mutableIntStateOf(
+                            (com.dingdinggo.app.core.LateConfirmRule.OVERLAY_AUTO_DISMISS_MS / 1000L).toInt(),
+                        )
+                    }
+                    LaunchedEffect(pendingLate.promptedAt) {
+                        while (remainingSeconds > 0) {
+                            delay(1_000L)
+                            remainingSeconds--
+                        }
+                        // 超时默认不打迟到卡，仅收起弹窗并保留通知操作入口
+                        vm.dismissPendingLatePromptLocally()
+                    }
+                    val targetText = PunchSchedule.formatTime(pendingLate.plannedTargetAt)
+                    val lateMinutes = (pendingLate.lateSeconds / 60L).coerceAtLeast(1L)
+                    val sourceLabel = when (pendingLate.source) {
+                        PunchForegroundService.SOURCE_WIFI -> "公司 Wi-Fi"
+                        PunchForegroundService.SOURCE_BLUETOOTH -> "考勤机蓝牙"
+                        else -> "定时闹钟"
+                    }
+                    ConfirmDialog(
+                        title = "是否打迟到上班卡？",
+                        message = "已由「$sourceLabel」首次触发，当前比预定上班时间（$targetText）晚约 ${lateMinutes} 分钟（已迟到 ${pendingLate.lateSeconds} 秒）。\n\n确认后将立即解锁并打开钉钉打卡；${remainingSeconds} 秒后自动关闭（默认不打卡）。",
+                        confirmText = "确认打迟到卡",
+                        dismissText = "今天不打",
+                        danger = true,
+                        onConfirm = { vm.confirmPendingLatePunch() },
+                        onDismiss = { vm.declinePendingLatePunch() },
+                    )
+                }
+
                 // 第 4 层：窗口内全屏液态玻璃弹窗宿主（含状态栏实时模糊背板与真实光学折射）
                 CompositionLocalProvider(
                     LocalLiquidBackdrop provides modalSceneBackdrop,
@@ -829,6 +1017,8 @@ private fun handlePermissionFix(
     key: String,
     onNeedPasswordEditor: () -> Unit = {},
     onNeedBtPermission: () -> Unit = {},
+    onNeedWifiPermission: () -> Unit = {},
+    onNeedWifiSettings: () -> Unit = {},
     onNeedScheduleSettings: () -> Unit = {},
 ) {
     val ctx = vm.getApplication<android.app.Application>()
@@ -857,6 +1047,32 @@ private fun handlePermissionFix(
         "bluetooth" -> {
             onNeedBtPermission()
             return
+        }
+        "wifi_trigger" -> {
+            val rootOk = vm.ui.value.health?.items?.any { it.key == "root" && it.ok } == true
+            val wifiEnabled = runCatching {
+                (ctx.applicationContext.getSystemService(android.content.Context.WIFI_SERVICE)
+                    as? android.net.wifi.WifiManager)?.isWifiEnabled == true
+            }.getOrDefault(false)
+            if (!wifiEnabled) {
+                runCatching {
+                    ctx.startActivity(
+                        Intent(Settings.ACTION_WIFI_SETTINGS)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                    )
+                }
+                return
+            }
+            val hasFine = ContextCompat.checkSelfPermission(
+                ctx,
+                Manifest.permission.ACCESS_FINE_LOCATION,
+            ) == PackageManager.PERMISSION_GRANTED
+            val needsBg = com.dingdinggo.app.ble.BtScanner.needsBackgroundLocation(ctx)
+            if ((!hasFine || needsBg) && !rootOk) {
+                onNeedWifiPermission()
+                return
+            }
+            onNeedWifiSettings()
         }
         "schedule_order" -> onNeedScheduleSettings()
         "alarm_registered" -> {

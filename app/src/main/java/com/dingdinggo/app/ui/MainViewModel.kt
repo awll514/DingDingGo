@@ -3,19 +3,29 @@ package com.dingdinggo.app.ui
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.dingdinggo.app.ble.BtDeviceLearner
+import com.dingdinggo.app.ble.BtScanner
 import com.dingdinggo.app.core.AlarmScheduler
 import com.dingdinggo.app.core.AppConfig
+import com.dingdinggo.app.core.BtPunchRule
+import com.dingdinggo.app.core.BtTriggerStore
 import com.dingdinggo.app.core.ChannelPreference
 import com.dingdinggo.app.core.HealthCheck
+import com.dingdinggo.app.core.LateConfirmStore
 import com.dingdinggo.app.core.NextPunchSlot
 import com.dingdinggo.app.core.PunchSchedule
+import com.dingdinggo.app.core.WifiTriggerStore
 import com.dingdinggo.app.data.db.AppDatabase
 import com.dingdinggo.app.data.db.PunchKind
 import com.dingdinggo.app.data.db.PunchLogEntity
 import com.dingdinggo.app.data.db.PunchOutcome
+import com.dingdinggo.app.exec.LateConfirmCoordinator
+import com.dingdinggo.app.exec.PunchForegroundService
 import com.dingdinggo.app.exec.PunchNotifier
 import com.dingdinggo.app.exec.RootShell
 import com.dingdinggo.app.ui.theme.ThemeMode
+import com.dingdinggo.app.wifi.WifiPresenceReader
+import com.dingdinggo.app.wifi.WifiTriggerMonitor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -27,9 +37,6 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import com.dingdinggo.app.ble.BtDeviceLearner
-import com.dingdinggo.app.ble.BtScanner
-import com.dingdinggo.app.core.BtTriggerStore
 import java.util.Calendar
 
 /**
@@ -95,7 +102,34 @@ data class HomeUiState(
 
     /** 蓝牙触发源的实时状态（首页状态卡与设置页共用） */
     val bt: BtUiState = BtUiState(),
+
+    /** 公司 Wi-Fi 触发源的实时状态 */
+    val wifi: WifiUiState = WifiUiState(),
+
+    /** 待处理的早上首次迟到确认（非 null 时在应用内弹出液态玻璃确认窗） */
+    val pendingLateConfirm: LateConfirmStore.PendingLateConfirm? = null,
+
+    /** 当前首页点击「立即手动打卡」是否会落入上班迟到区间 */
+    val manualPunchIsLate: Boolean = false,
+
+    /** 当前点击「立即手动打卡」时的已迟到时长文案 */
+    val manualPunchLateText: String = "",
 )
+
+/**
+ * 公司 Wi-Fi 触发源在 UI 上的状态快照。
+ */
+data class WifiUiState(
+    val enabled: Boolean = false,
+    val targetSsid: String = "",
+    val targetBssid: String = "",
+    val connected: Boolean = false,
+    val lastTriggerText: String = "",
+    val lastTriggerAt: Long = 0L,
+) {
+    val targetLabel: String
+        get() = targetSsid.ifBlank { targetBssid }
+}
 
 /**
  * 蓝牙触发源在 UI 上的状态快照。
@@ -225,7 +259,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             withContext(Dispatchers.IO) {
                 runCatching {
                     BtTriggerStore.init(app)
+                    WifiTriggerStore.init(app)
+                    LateConfirmStore.init(app)
                     BtScanner.sync(app)
+                    WifiTriggerMonitor.sync(app)
                 }
             }
         }
@@ -274,6 +311,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     @Volatile
     private var cachedScanInWindow: Boolean = true
+
+    @Volatile
+    private var latePromptDismissedEpoch: Long = 0L
 
     private companion object {
         /**
@@ -427,6 +467,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             cachedScanInWindow = runCatching {
                 BtScanner.shouldKeepScanAliveNow(getApplication())
             }.getOrDefault(true)
+            runCatching {
+                LateConfirmStore.reload(getApplication())
+                WifiTriggerStore.reload()
+            }
             cachedDayKey = todayKey
             lastDbQueryAt = now
         }
@@ -448,27 +492,34 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val cal = Calendar.getInstance().apply { timeInMillis = now }
         val isActive = cal.get(Calendar.DAY_OF_WEEK) in settings.activeDays
 
+        val inferredKind = inferManualKindFrom(now, settings, inLog, outLog)
+        val clockInTarget = startOfToday + settings.clockInMinute * 60_000L
+        val manualLateSec = if (inferredKind == PunchKind.CLOCK_IN &&
+            now > BtPunchRule.clockInMustStopAt(clockInTarget)
+        ) {
+            ((now - clockInTarget) / 1000L).coerceAtLeast(0L)
+        } else {
+            0L
+        }
+        val rawPending = LateConfirmStore.pendingPrompt.value
+        val visiblePending = if (rawPending != null && rawPending.promptedAt != latePromptDismissedEpoch) {
+            rawPending
+        } else {
+            null
+        }
+
         _ui.value = _ui.value.copy(
             now = now,
             nextSlot = slot,
             status = status,
-            // 跳过标记的语义：**当前是否存在一个仍然有效的跳过**。
-            //
-            // 注意不能写成 "被跳过日期 == 下次打卡日期"：
-            // nextSlot 已经把被跳过的日期排除了，两者永远不可能相等 ——
-            // 那样按钮会永远显示"跳过X"，永远无法取消。
-            //
-            // 正确判断：被跳过的日期 >= 今天（还没过期）就算生效中。
             skipToday = skippedDate != 0 && skippedDate >= todayKey,
-            // 日期标签：今天 / 明天 / 周几 / M月d日
-            // 没有任何生效日时给休假文案，而不是留空
             nextDayLabel = slot?.let {
-                com.dingdinggo.app.core.PunchSchedule.dayLabel(
+                PunchSchedule.dayLabel(
                     nowMillis = now,
                     targetAtMillis = it.targetAtMillis,
                     activeDays = settings.activeDays,
                 )
-            } ?: com.dingdinggo.app.core.PunchSchedule.vacationLabel(settings.activeDays),
+            } ?: PunchSchedule.vacationLabel(settings.activeDays),
             onVacation = slot == null,
             skippedDayLabel = PunchSchedule.dayLabelForKey(now, skippedDate),
             todayClockIn = inLog,
@@ -479,11 +530,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             isActiveDay = isActive,
             hasPassword = AppConfig.hasPassword.value,
             themeMode = AppConfig.themeMode.value,
-            // 蓝牙状态：从 store 的 StateFlow 读实时快照。
-            // 放在 tick 里同步而不是另起一个 collect，是为了让
-            // 首页所有信息在同一次重组里更新，不会出现"倒计时变了、
-            // 蓝牙状态还停在上一秒"的撕裂感。
             bt = readBtState(),
+            wifi = readWifiState(),
+            pendingLateConfirm = visiblePending,
+            manualPunchIsLate = manualLateSec > 0L,
+            manualPunchLateText = if (manualLateSec > 0L) {
+                PunchSchedule.formatRemainSeconds(manualLateSec)
+            } else {
+                ""
+            },
         )
     }
 
@@ -689,8 +744,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** 手动触发一次打卡（兜底按钮） */
-    fun manualPunch() {
-        android.util.Log.i("MainViewModel", "manualPunch called, busy=" + _busy.value)
+    fun manualPunch(allowLate: Boolean = false) {
+        android.util.Log.i("MainViewModel", "manualPunch called, busy=" + _busy.value + " allowLate=" + allowLate)
         if (_busy.value) return
         _busy.value = true
         viewModelScope.launch {
@@ -698,46 +753,30 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 val intent = android.content.Intent(
                     getApplication(),
-                    com.dingdinggo.app.exec.PunchForegroundService::class.java,
+                    PunchForegroundService::class.java,
                 ).apply {
-                    action = com.dingdinggo.app.exec.PunchForegroundService.ACTION_EXECUTE
-                    // 手动打卡要落到"当前真正该打的那一次"上，
-                    // 否则首页的今日上班/下班状态永远不会更新
-                    // （首页只查 CLOCK_IN / CLOCK_OUT，MANUAL 不在统计里）。
+                    action = PunchForegroundService.ACTION_EXECUTE
                     putExtra(
                         com.dingdinggo.app.exec.PunchAlarmReceiver.EXTRA_KIND,
                         kind.name,
                     )
-
-                    // 【关键】targetAt 必须是**该班次的计划时刻**，不能是「此刻」。
-                    //
-                    // 真机踩到的坑：晚上的手动打卡传了 now 当 targetAt，
-                    // 而上班卡闸门窗口是 [target-75s, target+55s] —— target=now
-                    // 时永远放行，于是 21:38 打出了一张「上班卡」。
-                    //
-                    // 传入今天的计划时刻后：
-                    //   · 晚上点「手动打卡」→ kind=CLOCK_OUT、target=18:30
-                    //   · 闸门按 18:30 判定 → 正确；超出补卡窗口会如实拒绝。
-                    //
-                    // 这也让首页的"今日上班/下班"能落到正确的一格。
                     val settings = AppConfig.settings.value
-                    val startOfDay = com.dingdinggo.app.core.PunchSchedule
-                        .startOfDay(System.currentTimeMillis())
+                    val startOfDay = PunchSchedule.startOfDay(System.currentTimeMillis())
                     val minute = when (kind) {
-                        com.dingdinggo.app.data.db.PunchKind.CLOCK_OUT -> settings.clockOutMinute
+                        PunchKind.CLOCK_OUT -> settings.clockOutMinute
                         else -> settings.clockInMinute
                     }
                     putExtra(
                         com.dingdinggo.app.exec.PunchAlarmReceiver.EXTRA_TARGET_AT,
                         startOfDay + minute * 60_000L,
                     )
+                    putExtra(PunchForegroundService.EXTRA_SOURCE, PunchForegroundService.SOURCE_MANUAL)
+                    putExtra(PunchForegroundService.EXTRA_ALLOW_LATE, allowLate && kind == PunchKind.CLOCK_IN)
                 }
                 androidx.core.content.ContextCompat.startForegroundService(getApplication(), intent)
             } catch (t: Throwable) {
-                // 启动失败时用通知告知
                 PunchNotifier.notifyStartBlocked(getApplication(), kind)
             } finally {
-                // 打卡完成后立刻让首页重新查库，不用等 3 秒节流窗口
                 delay(1_500)
                 invalidateTodayCache()
                 _busy.value = false
@@ -745,47 +784,36 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /**
-     * 推断手动打卡应该记成上班还是下班。
-     *
-     * 规则：上班还没打 → 记上班；上班已打、下班没打 → 记下班；
-     * 都打过 → 按当前时间（中午前记上班，下午记下班）。
-     */
     private fun inferManualKind(): PunchKind {
         val s = _ui.value
+        return inferManualKindFrom(
+            now = System.currentTimeMillis(),
+            settings = AppConfig.settings.value,
+            clockIn = s.todayClockIn,
+            clockOut = s.todayClockOut,
+        )
+    }
 
-        // 【必须按 DB 判断，不能只看首页状态】
-        //
-        // 旧实现在今日两班都为 null 时直接返回 CLOCK_IN —— 这在真机上造成
-        // 「晚上 21:38 手动打卡被判成上班卡」的错误：
-        //   · DB 里今天没有记录 → todayClockIn == null → 返回 CLOCK_IN
-        //   · 而手动打卡的 targetAt 取的是「此刻」
-        //   · 上班卡闸门窗口是 [target-75s, target+55s]，target=此刻 → 永远放行
-        //   · 于是深夜也能打出一张「上班卡」
-        //
-        // 正确做法是先看**系统时钟**落在哪个班次附近：
-        //   距上班时间更近 → CLOCK_IN；距下班时间更近 → CLOCK_OUT。
-        // 只有两者都无法判断时才退回 DB 状态。
-        val now = System.currentTimeMillis()
-        val settings = AppConfig.settings.value
-        val startOfDay = com.dingdinggo.app.core.PunchSchedule.startOfDay(now)
+    private fun inferManualKindFrom(
+        now: Long,
+        settings: com.dingdinggo.app.core.ScheduleSettings,
+        clockIn: PunchLogEntity?,
+        clockOut: PunchLogEntity?,
+    ): PunchKind {
+        val startOfDay = PunchSchedule.startOfDay(now)
         val inAt = startOfDay + settings.clockInMinute * 60_000L
         val outAt = startOfDay + settings.clockOutMinute * 60_000L
 
-        // 两班都已打 → 按时间就近归属（此时多半是补卡，就近最不容易错）
-        if (s.todayClockIn != null && s.todayClockOut != null) {
+        if (clockIn != null && clockOut != null) {
             return if (kotlin.math.abs(now - outAt) <= kotlin.math.abs(now - inAt)) {
                 PunchKind.CLOCK_OUT
             } else {
                 PunchKind.CLOCK_IN
             }
         }
+        if (clockIn != null && clockOut == null) return PunchKind.CLOCK_OUT
+        if (clockIn == null && clockOut != null) return PunchKind.CLOCK_IN
 
-        // 只有一班已打 → 打另一班，这是明确无歧义的
-        if (s.todayClockIn != null && s.todayClockOut == null) return PunchKind.CLOCK_OUT
-        if (s.todayClockIn == null && s.todayClockOut != null) return PunchKind.CLOCK_IN
-
-        // 两班都没打 → 按当前时刻就近归属（关键修复：不再无条件 CLOCK_IN）
         return if (kotlin.math.abs(now - outAt) <= kotlin.math.abs(now - inAt)) {
             PunchKind.CLOCK_OUT
         } else {
@@ -872,14 +900,107 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     } else {
                         BtScanner.stop(getApplication())
                     }
+                    if (WifiTriggerStore.enabled.value) {
+                        WifiTriggerMonitor.sync(getApplication())
+                    }
                 }
                 cachedScanInWindow = runCatching {
                     BtScanner.shouldKeepScanAliveNow(getApplication())
                 }.getOrDefault(true)
             }
-            _ui.value = _ui.value.copy(bt = readBtState())
+            _ui.value = _ui.value.copy(bt = readBtState(), wifi = readWifiState())
             refreshHealth()
         }
+    }
+
+    /** 尝试通过 Root 一键授予后台“始终允许”定位权限，并同步重建扫描 */
+    fun tryGrantBackgroundLocationViaRoot(onDone: (Boolean) -> Unit) {
+        viewModelScope.launch {
+            val granted = withContext(Dispatchers.IO) {
+                val app = getApplication<android.app.Application>()
+                val ok = runCatching { BtScanner.grantBackgroundLocationViaRoot(app) }
+                    .getOrDefault(false)
+                if (ok && BtTriggerStore.enabled.value) {
+                    runCatching { BtScanner.reregister(app) }
+                }
+                ok
+            }
+            _ui.value = _ui.value.copy(bt = readBtState(), wifi = readWifiState())
+            refreshHealth()
+            onDone(granted)
+        }
+    }
+
+    // ---------- 公司 Wi-Fi 触发 ----------
+
+    fun setWifiEnabled(enabled: Boolean) {
+        WifiTriggerStore.setEnabled(enabled)
+        _ui.value = _ui.value.copy(wifi = readWifiState())
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                runCatching { WifiTriggerMonitor.sync(getApplication()) }
+            }
+            _ui.value = _ui.value.copy(wifi = readWifiState())
+            refreshHealth()
+        }
+    }
+
+    fun learnWifiNetwork(onResult: (Boolean, String) -> Unit) {
+        viewModelScope.launch {
+            val (ok, msg) = withContext(Dispatchers.IO) {
+                val app = getApplication<android.app.Application>()
+                val res = runCatching { WifiPresenceReader.learnCurrentWifi(app) }
+                    .getOrElse { e -> false to ("记录失败：" + e.javaClass.simpleName) }
+                if (res.first) {
+                    runCatching { WifiTriggerMonitor.sync(app) }
+                }
+                res
+            }
+            _ui.value = _ui.value.copy(wifi = readWifiState())
+            refreshHealth()
+            onResult(ok, msg)
+        }
+    }
+
+    fun clearWifiNetwork() {
+        WifiTriggerStore.clearNetwork()
+        _ui.value = _ui.value.copy(wifi = readWifiState())
+        refreshHealth()
+    }
+
+    // ---------- 早上首次迟到确认 ----------
+
+    fun reloadLateConfirm(forceReopen: Boolean = false) {
+        if (forceReopen) {
+            latePromptDismissedEpoch = 0L
+        }
+        LateConfirmStore.reload(getApplication())
+        val raw = LateConfirmStore.pendingPrompt.value
+        val visible = if (raw != null && raw.promptedAt != latePromptDismissedEpoch) raw else null
+        _ui.value = _ui.value.copy(pendingLateConfirm = visible)
+    }
+
+    fun confirmPendingLatePunch() {
+        val pending = LateConfirmStore.pendingPrompt.value ?: _ui.value.pendingLateConfirm
+        val targetAt = pending?.plannedTargetAt ?: 0L
+        latePromptDismissedEpoch = 0L
+        _ui.value = _ui.value.copy(pendingLateConfirm = null)
+        LateConfirmCoordinator.confirmLatePunch(getApplication(), targetAt)
+        invalidateTodayCache()
+    }
+
+    fun declinePendingLatePunch() {
+        val pending = LateConfirmStore.pendingPrompt.value ?: _ui.value.pendingLateConfirm
+        val targetAt = pending?.plannedTargetAt ?: 0L
+        latePromptDismissedEpoch = 0L
+        _ui.value = _ui.value.copy(pendingLateConfirm = null)
+        LateConfirmCoordinator.declineLatePunch(getApplication(), targetAt)
+        invalidateTodayCache()
+    }
+
+    fun dismissPendingLatePromptLocally() {
+        latePromptDismissedEpoch = LateConfirmStore.pendingPrompt.value?.promptedAt ?: 0L
+        _ui.value = _ui.value.copy(pendingLateConfirm = null)
     }
 
     /**
@@ -917,13 +1038,22 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 when {
                     !BtScanner.hasScanPermission(app) -> "缺少「附近的设备」权限"
                     !BtScanner.hasLocationPermission(app) -> "缺少定位权限（本机会因此扫不到设备）"
-                    else -> null
+                    else -> BtScanner.backgroundBlocker(app)
                 }
             } else {
                 null
             },
         )
     }
+
+    private fun readWifiState(): WifiUiState = WifiUiState(
+        enabled = WifiTriggerStore.enabled.value,
+        targetSsid = WifiTriggerStore.targetSsid.value,
+        targetBssid = WifiTriggerStore.targetBssid.value,
+        connected = WifiTriggerStore.connected.value,
+        lastTriggerText = WifiTriggerStore.lastTriggerText.value,
+        lastTriggerAt = WifiTriggerStore.lastTriggerAt.value,
+    )
 
     fun savePassword(pwd: String): Result<Unit> {
         val result = AppConfig.saveLockPassword(pwd)

@@ -177,4 +177,42 @@ class PunchResultJudgeTest {
             PunchEngine.judgeResult("已进入考勤范围 极速打卡成功", alreadyDoneBefore = false, doneNow = false, kind = com.dingdinggo.app.data.db.PunchKind.CLOCK_OUT),
         )
     }
+
+    @Test
+    fun alreadyPunchedDialogMatchesClockInAndManualOnlyWhenShiftMatches() {
+        val dialogBlob = "你已经打过卡了 已经打过卡了，上班时间以最早打卡时间为准 我知道了"
+
+        // 弹窗遮挡底层状态卡导致 doneNow=false，以及点击前已打过但弹窗确认，均应判上班打卡成功
+        assertEquals(
+            "钉钉提示已打过卡（已经打过卡了，上班时间以最早打卡时间为准）",
+            PunchEngine.judgeResult(dialogBlob, alreadyDoneBefore = false, doneNow = false, kind = com.dingdinggo.app.data.db.PunchKind.CLOCK_IN),
+        )
+        assertEquals(
+            "钉钉提示已打过卡（已经打过卡了，上班时间以最早打卡时间为准）",
+            PunchEngine.judgeResult(dialogBlob, alreadyDoneBefore = true, doneNow = true, kind = com.dingdinggo.app.data.db.PunchKind.CLOCK_IN),
+        )
+        assertNotNull(
+            PunchEngine.judgeResult(dialogBlob, alreadyDoneBefore = false, doneNow = false, kind = com.dingdinggo.app.data.db.PunchKind.MANUAL),
+        )
+        // 上班「已经打过卡了」提示绝不能误判为下班打卡成功
+        assertNull(
+            PunchEngine.judgeResult(dialogBlob, alreadyDoneBefore = false, doneNow = false, kind = com.dingdinggo.app.data.db.PunchKind.CLOCK_OUT),
+        )
+        // 失败信号仍优先于「已经打过卡了」弹窗
+        assertNull(
+            PunchEngine.judgeResult("你已经打过卡了 网络异常", alreadyDoneBefore = false, doneNow = false, kind = com.dingdinggo.app.data.db.PunchKind.CLOCK_IN),
+        )
+        // 通用「你已经打过卡了」（无班次提示）在点击后判定中放行
+        assertNotNull(
+            PunchEngine.judgeResult("你已经打过卡了 我知道了", alreadyDoneBefore = false, doneNow = false, kind = com.dingdinggo.app.data.db.PunchKind.CLOCK_IN),
+        )
+        assertNotNull(
+            PunchEngine.judgeResult("你已经打过卡了 我知道了", alreadyDoneBefore = false, doneNow = false, kind = com.dingdinggo.app.data.db.PunchKind.CLOCK_OUT),
+        )
+        assertNotNull(
+            PunchEngine.judgeResult("你已经打过卡了 我知道了", alreadyDoneBefore = false, doneNow = false, kind = com.dingdinggo.app.data.db.PunchKind.MANUAL),
+        )
+        // 仅可见弹窗窗口文本时仍能识别为考勤页面
+        org.junit.Assert.assertTrue(PunchEngine.isAttendancePage(dialogBlob))
+    }
 }

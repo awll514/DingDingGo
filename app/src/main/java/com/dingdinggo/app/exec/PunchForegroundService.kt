@@ -88,13 +88,25 @@ class PunchForegroundService : Service() {
         /** 来源：检测到公司考勤机蓝牙 */
         const val SOURCE_BLUETOOTH = "bluetooth"
 
+        /** 来源：连上公司 Wi-Fi */
+        const val SOURCE_WIFI = "wifi"
+
+        /** 来源：用户点击了早上首次迟到确认中的「确认打迟到卡」 */
+        const val SOURCE_LATE_CONFIRMED = "late_confirmed"
+
+        /** 是否允许本次上班打卡放行迟到边界（仅在用户显式确认后置 true） */
+        const val EXTRA_ALLOW_LATE = "extra_allow_late"
+
         /**
-         * 来源：蓝牙触发，但同时也带了"红线判定基准"。
+         * 来源：蓝牙或 Wi-Fi 触发，但同时也带了"红线判定基准"。
          *
-         * 蓝牙触发时用 EXTRA_BT_GATE_TARGET_AT 传**配置的计划时刻**，
+         * 到岗触发时用 EXTRA_BT_GATE_TARGET_AT 传**配置的计划时刻**，
          * 而 EXTRA_TARGET_AT 传**检测时刻**。
          */
         const val EXTRA_BT_GATE_TARGET_AT = "extra_bt_gate_target_at"
+
+        private fun isArrivalSource(src: String): Boolean =
+            src == SOURCE_BLUETOOTH || src == SOURCE_WIFI
 
         private const val CHANNEL_ID = "punch_execution"
         private const val NOTIFICATION_ID = 2001
@@ -238,12 +250,20 @@ class PunchForegroundService : Service() {
     private var punchSource: String = SOURCE_ALARM
 
     /**
-     * 蓝牙触发时的**红线判定基准**（今天配置的上下班时刻）。
+     * 蓝牙或 Wi-Fi 触发时的**红线判定基准**（今天配置的上下班时刻）。
      *
-     * 0 表示不是蓝牙来源，此时红线基准就是 [pendingTargetAt]（老语义）。
+     * 0 表示不是到岗来源，此时红线基准就是 [pendingTargetAt]（老语义）。
      */
     @Volatile
     private var btGateTargetAt: Long = 0L
+
+    /** 本次是否获用户显式确认放行上班迟到边界 */
+    @Volatile
+    private var allowLateConfirmed: Boolean = false
+
+    /** 刚弹出迟到确认窗时保留当前可见屏幕，跳过灭屏与切回 */
+    @Volatile
+    private var deferCleanupForLateConfirm: Boolean = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -361,16 +381,10 @@ class PunchForegroundService : Service() {
             // 而蓝牙来源真正该判的是"配置的计划时刻 + 早到窗口"。
             // 所以这里用 btGateTargetAt（配置时刻）做基准，并且把窗口
             // 放宽成早到窗口 —— 与 BtPunchRule 完全同口径。
-            val stillInWindow = if (btGateTargetAt > 0L) {
-                // 蓝牙来源：按班次分别判定，且**直接复用 BtPunchRule 的唯一实现**。
-                //
-                // 之前这里手写了一套算式，有两个错：
-                //  ① 早到窗口不区分 kind —— 下班卡也被套了"提前 2 小时"，
-                //     于是 18:05 按"继续"能过这一关，随后在引擎的
-                //     下班判定里被拒，白跑一次完整的解锁+拉钉钉；
-                //  ② 上界手写 +LATE_GRACE_MS(60s)，而规则是 +55s。
-                //
-                // 现在按 kind 走对应的边界函数，口径与 BtPunchRule 完全一致。
+            val stillInWindow = if (com.dingdinggo.app.core.LateConfirmRule.isLateAllowedForKind(pendingKind, allowLateConfirmed)) {
+                true
+            } else if (btGateTargetAt > 0L) {
+                // 到岗来源（蓝牙/Wi-Fi）：按班次分别判定，直接复用 BtPunchRule 的唯一实现。
                 val now = System.currentTimeMillis()
                 when (pendingKind) {
                     PunchKind.CLOCK_OUT ->
@@ -435,23 +449,11 @@ class PunchForegroundService : Service() {
         val prewarm = intentNonNull.getBooleanExtra(EXTRA_PREWARM, false)
         val source = intentNonNull.getStringExtra(EXTRA_SOURCE) ?: SOURCE_ALARM
         val gateTargetFromIntent = intentNonNull.getLongExtra(EXTRA_BT_GATE_TARGET_AT, 0L)
+        val allowLate = intentNonNull.getBooleanExtra(EXTRA_ALLOW_LATE, false)
 
-        // 【fail-closed】蓝牙来源必须同时带"红线判定基准"。
-        //
-        // ## 为什么必须在这里拒绝，而不是兜底成 targetAt
-        //
-        // 蓝牙来源的 targetAt 是"检测时刻"，而红线（迟到 60s / 下班 +2s）
-        // 必须相对"配置的计划时刻"判定。如果某个调用方写了
-        // EXTRA_SOURCE=bluetooth 却漏传 EXTRA_BT_GATE_TARGET_AT，
-        // 那么基准就会退化成检测时刻 —— 也就是 now。
-        //
-        // 而 now == targetAt 时，"迟到上界 = target+55s"这种判定
-        // **永远通过**，等于红线彻底失效。手动打卡历史上的
-        // 「晚上 21:38 打出上班卡」就是这条路径。
-        //
-        // 所以宁可放弃这次执行，也不能用错误基准去打卡。
-        if (source == SOURCE_BLUETOOTH && gateTargetFromIntent <= 0L) {
-            Log.e(TAG, "蓝牙来源缺少红线基准 (EXTRA_BT_GATE_TARGET_AT)，安全起见放弃本次执行")
+        // 【fail-closed】蓝牙/Wi-Fi 到岗来源必须同时带"红线判定基准"。
+        if (isArrivalSource(source) && gateTargetFromIntent <= 0L) {
+            Log.e(TAG, "到岗来源缺少红线基准 (EXTRA_BT_GATE_TARGET_AT)，安全起见放弃本次执行 source=" + source)
             cleanup()
             running = false
             stopSelf()
@@ -497,6 +499,8 @@ class PunchForegroundService : Service() {
         pendingTargetAt = targetAt
         punchSource = source
         btGateTargetAt = gateTargetFromIntent
+        allowLateConfirmed = allowLate
+        deferCleanupForLateConfirm = false
 
         // 记录"来之前屏幕是不是灭的"，收尾时决定要不要帮用户灭屏。
         screenWasOffAtStart = runCatching {
@@ -518,6 +522,7 @@ class PunchForegroundService : Service() {
     private fun startPunchFlow(kind: PunchKind, targetAt: Long, prewarm: Boolean = false) {
         // 服务实例若在 stopSelf 完成前被新请求复用，必须重置已清理标记，否则收尾会被跳过
         cleanedUp = false
+        deferCleanupForLateConfirm = false
         // 蓝牙来源：红线基准是"今天配置的时刻"，不是检测时刻。
         // 非蓝牙来源：两者相同（老语义，一字不改）。
         val gateTarget = if (btGateTargetAt > 0L) btGateTargetAt else targetAt
@@ -582,11 +587,14 @@ class PunchForegroundService : Service() {
         log(
             "开始执行 kind=" + kind.name +
                 (if (prewarm) "（预热模式）" else "") +
-                (if (punchSource == SOURCE_BLUETOOTH) {
-                    "（蓝牙触发，红线基准=" + PunchSchedule.formatTime(gateTargetAt) + "）"
-                } else {
-                    ""
-                }),
+                when {
+                    punchSource == SOURCE_BLUETOOTH ->
+                        "（蓝牙触发，红线基准=" + PunchSchedule.formatTime(gateTargetAt) + "）"
+                    punchSource == SOURCE_WIFI ->
+                        "（公司 Wi-Fi 触发，红线基准=" + PunchSchedule.formatTime(gateTargetAt) + "）"
+                    allowLateConfirmed -> "（用户已确认打迟到卡）"
+                    else -> ""
+                },
         )
 
         updateNotification(buildRunningNotification(kind))
@@ -598,22 +606,7 @@ class PunchForegroundService : Service() {
 
         val engine = PunchEngine(applicationContext)
 
-        // 目标时刻从 Intent 一路传进引擎：安全闸门只做判定，
-        // 不再自己去 startOfDay + 设置分钟 硬算（那样看不到单日覆盖）。
-        //
-        // prewarm=true 时引擎会把流程跑到"停在考勤页"再等目标时刻，
-        // 把 8 秒硬等 + 导航开销挪到窗口之外。
-        // 【关键】gateTargetAt 才是安全闸门的判定基准。
-        //
-        // 蓝牙触发的语义是「检测时刻 = 今日实际打卡时间」，所以 targetAt
-        // 是检测时刻；但红线（迟到 60 秒 / 下班前后 2 秒）必须相对
-        // **配置的计划时刻**判定 —— 否则基准随检测时刻漂移，边界永远
-        // 恒为通过，等于红线失效（手动打卡曾因此打出深夜"上班卡"）。
-        //
-        // 非蓝牙来源下 gateTargetAt === targetAt，行为与原来完全一致。
-        // 蓝牙来源放宽上班卡下界（早到窗口）：检测到考勤机 = 人已到公司，
-        // 早到是合法且想要的记录。其余来源传 0，行为与原来完全一致。
-        val earlyWindowMs = if (punchSource == SOURCE_BLUETOOTH) {
+        val earlyWindowMs = if (isArrivalSource(punchSource)) {
             com.dingdinggo.app.core.BtPunchRule.earlyWindowMsOf(
                 com.dingdinggo.app.core.BtTriggerStore.earlyWindowMinutes.value,
             )
@@ -626,6 +619,7 @@ class PunchForegroundService : Service() {
             targetAt = gateTargetAt,
             holdUntilTarget = prewarm,
             earlyWindowMs = earlyWindowMs,
+            allowLate = allowLateConfirmed,
         )
 
         val finishedAt = System.currentTimeMillis()
@@ -633,14 +627,81 @@ class PunchForegroundService : Service() {
         log("执行结束 success=" + result.success + " stage=" + result.stage.label +
             (result.actualTimeText?.let { " actualTime=" + it } ?: ""))
 
+        // 早上首次触发撞上迟到边界：发出高优先级通知与屏幕确认窗，不直接报警失败
+        if (result.rejectedLate && !allowLateConfirmed && kind == PunchKind.CLOCK_IN) {
+            val now = System.currentTimeMillis()
+            val settings = AppConfig.settings.value
+            val dayStart = PunchSchedule.startOfDay(now)
+            val clockInTarget = if (gateTargetAt > 0L) {
+                gateTargetAt
+            } else {
+                dayStart + settings.clockInMinute * 60_000L
+            }
+            val clockOutTarget = dayStart + settings.clockOutMinute * 60_000L
+            com.dingdinggo.app.core.LateConfirmStore.init(applicationContext)
+            val promptedDay = com.dingdinggo.app.core.LateConfirmStore
+                .promptedDateKey(applicationContext, now)
+
+            if (com.dingdinggo.app.core.LateConfirmRule.shouldPromptLateConfirm(
+                    kind = kind,
+                    nowMillis = now,
+                    clockInTargetMillis = clockInTarget,
+                    clockOutTargetMillis = clockOutTarget,
+                    clockInDoneToday = false,
+                    promptedDateKey = promptedDay,
+                ) && com.dingdinggo.app.core.LateConfirmStore.tryClaimPromptToday(
+                    context = applicationContext,
+                    nowMillis = now,
+                    plannedTargetAt = clockInTarget,
+                    lateSeconds = result.lateSeconds,
+                    source = punchSource,
+                )
+            ) {
+                ControlHudOverlay.hide()
+                val cancelEntity = PunchLogEntity(
+                    scheduledAt = clockInTarget,
+                    startedAt = startedAt,
+                    finishedAt = finishedAt,
+                    kind = kind,
+                    outcome = PunchOutcome.CANCELLED,
+                    channel = result.channelUsed,
+                    failedStage = null,
+                    message = "首次触发上班打卡已过迟到边界，已弹窗/通知等待用户确认",
+                    trace = result.trace.joinToString("\n"),
+                )
+                runCatching {
+                    AppDatabase.get(applicationContext).punchLogDao().insert(cancelEntity)
+                }.onFailure { Log.e(TAG, "写迟到确认日志失败: " + it.javaClass.simpleName) }
+
+                val shownOnScreen = LateConfirmCoordinator.triggerLateConfirmPrompt(
+                    context = applicationContext,
+                    plannedTargetAt = clockInTarget,
+                    lateSeconds = result.lateSeconds,
+                    source = punchSource,
+                )
+                if (shownOnScreen) {
+                    deferCleanupForLateConfirm = true
+                }
+                val slot = NextPunchSlot(
+                    triggerAtMillis = clockInTarget - PunchSchedule.PRE_WARM_SECONDS * 1000L,
+                    targetAtMillis = clockInTarget,
+                    kind = kind,
+                )
+                AlarmScheduler.onPunchFinished(
+                    context = applicationContext,
+                    slot = slot,
+                    markFired = true,
+                )
+                return
+            }
+        }
+
         // 落库
-        //
-        // 【蓝牙语义】scheduledAt 记的是"今日实际上班/下班时间"。
-        // 蓝牙触发时 targetAt 就是检测到考勤机的时刻，正好是要落库的值 ——
-        // 首页的「今日上班 08:47」直接读这一列，于是"同步上下班时间"
-        // 在界面上自然成立，不需要另开一个字段。
-        //
-        // 闹钟/手动来源下 targetAt 仍是计划时刻，与原来完全一致。
+        val logMessage = if (allowLateConfirmed && result.success) {
+            result.message + "（用户确认迟到补打）"
+        } else {
+            result.message
+        }
         val logEntity = PunchLogEntity(
             scheduledAt = if (targetAt > 0) targetAt else startedAt,
             startedAt = startedAt,
@@ -649,7 +710,7 @@ class PunchForegroundService : Service() {
             outcome = if (result.success) PunchOutcome.SUCCESS else PunchOutcome.FAILURE,
             channel = result.channelUsed,
             failedStage = if (result.success) null else result.stage.label,
-            message = result.message,
+            message = logMessage,
             evidence = result.evidence,
             trace = result.trace.joinToString("\n"),
             actualAt = result.actualAt,
@@ -659,13 +720,6 @@ class PunchForegroundService : Service() {
             AppDatabase.get(applicationContext).punchLogDao().insert(logEntity)
         }.onFailure { Log.e(TAG, "写日志失败: " + it.javaClass.simpleName) }
 
-        // 【蓝牙来源】成功后记一笔"今日该班次已由蓝牙触发完成"。
-        //
-        // 注意：这个标记**不参与去重决策**（去重靠 Room 的 SUCCESS 记录与冷却）。
-        // 它只用于首页/设置页展示"上次蓝牙触发的结论"，以及让
-        // BtTriggerStore 的状态对用户可见。
-        //
-        // 失败时刻意不写 —— 失败要允许用户走回考勤机旁重试。
         if (punchSource == SOURCE_BLUETOOTH && result.success) {
             runCatching {
                 com.dingdinggo.app.core.BtTriggerStore.markSynced(kind)
@@ -676,6 +730,29 @@ class PunchForegroundService : Service() {
                         PunchKind.CLOCK_OUT -> "下班打卡成功"
                         PunchKind.MANUAL -> "打卡成功"
                     },
+                )
+            }
+        }
+        if (punchSource == SOURCE_WIFI && result.success) {
+            runCatching {
+                com.dingdinggo.app.core.WifiTriggerStore.init(applicationContext)
+                com.dingdinggo.app.core.WifiTriggerStore.markTriggered(
+                    System.currentTimeMillis(),
+                    when (kind) {
+                        PunchKind.CLOCK_IN -> "公司 Wi-Fi 上班打卡成功"
+                        PunchKind.CLOCK_OUT -> "公司 Wi-Fi 下班打卡成功"
+                        PunchKind.MANUAL -> "打卡成功"
+                    },
+                )
+            }
+        }
+        if (kind == PunchKind.CLOCK_IN && result.success) {
+            runCatching {
+                PunchNotifier.cancelLateConfirm(applicationContext)
+                com.dingdinggo.app.core.LateConfirmStore.init(applicationContext)
+                com.dingdinggo.app.core.LateConfirmStore.clearPendingIfDone(
+                    applicationContext,
+                    finishedAt,
                 )
             }
         }
@@ -931,6 +1008,16 @@ class PunchForegroundService : Service() {
             return
         }
         cleanedUp = true
+
+        if (deferCleanupForLateConfirm) {
+            deferCleanupForLateConfirm = false
+            releaseWakeLock()
+            runCatching {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            }
+            log("保留迟到确认弹窗在屏幕前景，跳过切回与灭屏收尾")
+            return
+        }
 
         // 跳回 App 时就**不灭屏** —— 用户要能看到结果页。
         // 不跳回时保持原有语义：流程点亮的屏幕要负责熄灭收尾。

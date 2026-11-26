@@ -177,6 +177,7 @@ object BtPunchRule {
         isActiveDay: Boolean,
         clockInDoneToday: Boolean,
         clockOutDoneToday: Boolean,
+        lateConfirmWindowMinutes: Int = 0,
     ): Boolean {
         // 非生效日、两班都已完成 → 今天不会再有用到扫描的机会
         if (!isActiveDay) return false
@@ -187,10 +188,16 @@ object BtPunchRule {
         val clockOutTarget = dayStart + TimeUnit.MINUTES.toMillis(settings.clockOutMinute.toLong())
         val pad = PAD_MS
 
-        // 上班卡窗口
+        // 上班卡窗口（若尚未打上班卡且今日未弹窗确认过迟到，允许延续至迟到确认窗）
         if (!clockInDoneToday) {
             val start = clockInEarliestAt(clockInTarget, earlyWindowMsOf(earlyWindowMinutes)) - pad
-            val end = clockInMustStopAt(clockInTarget) + pad
+            val lateExt = TimeUnit.MINUTES.toMillis(lateConfirmWindowMinutes.coerceAtLeast(0).toLong())
+            val rawEnd = clockInMustStopAt(clockInTarget) + lateExt + pad
+            val end = if (lateExt > 0L && clockOutTarget > clockInTarget) {
+                minOf(rawEnd, clockOutEarliestAt(clockOutTarget) - pad)
+            } else {
+                rawEnd
+            }
             if (nowMillis in start..end) return true
         }
 

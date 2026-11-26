@@ -82,10 +82,11 @@ import com.dingdinggo.app.ui.theme.GlassTheme
 fun HomeScreen(
     state: HomeUiState,
     busy: Boolean,
-    onManualPunch: () -> Unit,
+    onManualPunch: (Boolean) -> Unit,
     onFixHealth: (HealthCheck.Item) -> Unit,
     onSkipToday: (Boolean) -> Unit,
     onRequestBtPermission: () -> Unit = {},
+    onRequestWifiPermission: () -> Unit = {},
     backgroundPaused: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
@@ -331,6 +332,22 @@ fun HomeScreen(
         // 只在功能开启时才显示。关着的时候这块完全不渲染 ——
         // 既符合"后台零消耗"的精神（不显示就没有任何开销），
         // 也避免让不用这个功能的人看到无意义的卡片。
+        if (state.wifi.enabled) {
+            val ctx = androidx.compose.ui.platform.LocalContext.current
+            val wifiHealthFailed = state.health?.items?.any { it.key == "wifi_trigger" && !it.ok } == true
+            val missingLoc = androidx.core.content.ContextCompat.checkSelfPermission(
+                ctx,
+                android.Manifest.permission.ACCESS_FINE_LOCATION,
+            ) != android.content.pm.PackageManager.PERMISSION_GRANTED ||
+                com.dingdinggo.app.ble.BtScanner.needsBackgroundLocation(ctx)
+            Spacer(Modifier.height(GlassDimens.cardGap))
+            WifiStatusCard(
+                wifi = state.wifi,
+                needsPermission = wifiHealthFailed && missingLoc,
+                onRequestPermission = onRequestWifiPermission,
+            )
+        }
+
         if (state.bt.enabled) {
             Spacer(Modifier.height(GlassDimens.cardGap))
             BtStatusCard(
@@ -416,17 +433,37 @@ fun HomeScreen(
 
     // ---------- 二次确认 ----------
     if (showPunchConfirm) {
-        ConfirmDialog(
-            title = "立即执行一次打卡？",
-            message = "会现在打开钉钉并真实点击打卡按钮，可能产生一条考勤记录。" +
-                "如果不是上下班时间，钉钉可能拒绝或记为异常。",
-            confirmText = "立即打卡",
-            onConfirm = {
-                showPunchConfirm = false
-                onManualPunch()
-            },
-            onDismiss = { showPunchConfirm = false },
-        )
+        if (state.manualPunchIsLate) {
+            val lateHint = if (state.manualPunchLateText.isNotBlank()) {
+                "当前已比预定上班时间晚 ${state.manualPunchLateText}（超过 55 秒迟到红线）"
+            } else {
+                "当前已超过上班迟到红线"
+            }
+            ConfirmDialog(
+                title = "当前已迟到，仍要打上班卡？",
+                message = "$lateHint。\n\n继续将立即解锁并打开钉钉完成打卡；若不打请点「暂不打卡」。",
+                confirmText = "确认打迟到卡",
+                dismissText = "暂不打卡",
+                danger = true,
+                onConfirm = {
+                    showPunchConfirm = false
+                    onManualPunch(true)
+                },
+                onDismiss = { showPunchConfirm = false },
+            )
+        } else {
+            ConfirmDialog(
+                title = "立即执行一次打卡？",
+                message = "会现在打开钉钉并真实点击打卡按钮，可能产生一条考勤记录。" +
+                    "如果不是上下班时间，钉钉可能拒绝或记为异常。",
+                confirmText = "立即打卡",
+                onConfirm = {
+                    showPunchConfirm = false
+                    onManualPunch(false)
+                },
+                onDismiss = { showPunchConfirm = false },
+            )
+        }
     }
 
     if (showSkipConfirm) {

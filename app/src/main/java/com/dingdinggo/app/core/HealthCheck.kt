@@ -333,9 +333,10 @@ object HealthCheck {
             BtTriggerStore.init(context)
             if (BtTriggerStore.enabled.value) {
                 val blocker = BtScanner.blocker(context)
+                val bgBlocker = BtScanner.backgroundBlocker(context)
                 val scanOk = BtTriggerStore.scanRegistered.value
                 val inWindow = BtScanner.shouldKeepScanAliveNow(context)
-                val btOk = blocker == null && (scanOk || !inWindow)
+                val btOk = blocker == null && bgBlocker == null && (scanOk || !inWindow)
                 items.add(
                     Item(
                         key = "bluetooth",
@@ -343,6 +344,7 @@ object HealthCheck {
                         ok = btOk,
                         detail = when {
                             blocker != null -> blocker
+                            bgBlocker != null -> bgBlocker
                             scanOk && BtTriggerStore.present.value ->
                                 "扫描已注册 · 当前在考勤机范围内"
                             scanOk -> "扫描已注册 · 等待进入范围"
@@ -350,6 +352,35 @@ object HealthCheck {
                             else -> "扫描未注册（点「修复」可立即重新注册）"
                         },
                         canFix = !btOk,
+                    )
+                )
+            }
+        }
+
+        // 7.6 公司 Wi-Fi 触发（只在用户开启该功能时才检查）
+        runCatching {
+            WifiTriggerStore.init(context)
+            if (WifiTriggerStore.enabled.value) {
+                val targetName = WifiTriggerStore.targetSsid.value.ifBlank {
+                    WifiTriggerStore.targetBssid.value
+                }
+                val hasTarget = targetName.isNotBlank()
+                val canReadBg = BtScanner.hasBackgroundLocationPermission(context) || rootOk
+                val wifiOk = hasTarget && canReadBg
+                items.add(
+                    Item(
+                        key = "wifi_trigger",
+                        label = "公司 Wi-Fi 触发",
+                        ok = wifiOk,
+                        detail = when {
+                            !hasTarget -> "已开启但尚未记录公司 Wi-Fi，请到设置页连接后点击记录"
+                            !canReadBg -> "缺少「始终允许」后台定位权限且 Root 不可用，息屏后台可能无法识别公司 Wi-Fi"
+                            WifiTriggerStore.connected.value ->
+                                "已连接「$targetName」"
+                            else ->
+                                "已记录「$targetName」，等待连入公司网络"
+                        },
+                        canFix = !wifiOk,
                     )
                 )
             }

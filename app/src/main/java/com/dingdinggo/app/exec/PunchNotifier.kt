@@ -189,6 +189,136 @@ object PunchNotifier {
     /** 蓝牙触发相关的通知 id（与打卡结果区分开，互不覆盖） */
     private const val ID_BT_SKIPPED = 3004
 
+    /** 早上首次迟到确认通知 id */
+    private const val ID_LATE_CONFIRM = 3005
+
+    /** 迟到确认提示音与震动反馈（独立于通知渠道，避免渠道静音导致漏提醒） */
+    private fun playLateConfirmFeedback(context: Context) {
+        runCatching {
+            val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val vm = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE)
+                    as android.os.VibratorManager
+                vm.defaultVibrator
+            } else {
+                @Suppress("DEPRECATION")
+                context.getSystemService(Context.VIBRATOR_SERVICE) as android.os.Vibrator
+            }
+            if (vibrator.hasVibrator()) {
+                vibrator.vibrate(
+                    android.os.VibrationEffect.createWaveform(
+                        longArrayOf(0, 120, 80, 120, 80, 160),
+                        -1,
+                    ),
+                )
+            }
+        }
+        runCatching {
+            val tone = android.media.ToneGenerator(
+                android.media.AudioManager.STREAM_NOTIFICATION,
+                75,
+            )
+            tone.startTone(android.media.ToneGenerator.TONE_PROP_BEEP2, 220)
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(
+                { runCatching { tone.release() } },
+                320,
+            )
+        }
+    }
+
+    /** 发出早上首次触发迟到卡的高优先级确认通知 */
+    fun notifyLateConfirm(
+        context: Context,
+        plannedTargetAt: Long,
+        lateSeconds: Long,
+        source: String,
+    ) {
+        ensureChannels(context)
+        playLateConfirmFeedback(context)
+
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val sourceLabel = when (source) {
+            PunchForegroundService.SOURCE_WIFI -> "公司 Wi-Fi"
+            PunchForegroundService.SOURCE_BLUETOOTH -> "蓝牙考勤机"
+            else -> "定时上班闹钟"
+        }
+        val lateText = PunchSchedule.formatRemainSeconds(lateSeconds)
+        val body = "已超过计划上班时间 $lateText（$sourceLabel）。默认不会自动打迟到卡，请确认。"
+
+        val contentIntent = PendingIntent.getActivity(
+            context,
+            400,
+            Intent(context, MainActivity::class.java).apply {
+                putExtra(LateConfirmCoordinator.EXTRA_OPEN_LATE_CONFIRM, true)
+                addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                        Intent.FLAG_ACTIVITY_CLEAR_TOP,
+                )
+            },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+
+        val confirmPi = PendingIntent.getBroadcast(
+            context,
+            401,
+            Intent(context, LateConfirmReceiver::class.java).apply {
+                action = LateConfirmReceiver.ACTION_CONFIRM_LATE
+                putExtra(PunchAlarmReceiver.EXTRA_TARGET_AT, plannedTargetAt)
+            },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+
+        val declinePi = PendingIntent.getBroadcast(
+            context,
+            402,
+            Intent(context, LateConfirmReceiver::class.java).apply {
+                action = LateConfirmReceiver.ACTION_DECLINE_LATE
+                putExtra(PunchAlarmReceiver.EXTRA_TARGET_AT, plannedTargetAt)
+            },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(context, CHANNEL_FAILURE)
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(context)
+        }
+
+        builder
+            .setSmallIcon(android.R.drawable.stat_notify_error)
+            .setContentTitle("⏰ 上班已迟到，是否继续打卡？")
+            .setContentText(body)
+            .setStyle(
+                Notification.BigTextStyle().bigText(
+                    body + "\n\n点击「确认打迟到卡」将立即为您打卡；点「今天不打」则跳过今日上班打卡。",
+                ),
+            )
+            .setVisibility(Notification.VISIBILITY_PUBLIC)
+            .setAutoCancel(false)
+            .setContentIntent(contentIntent)
+            .setPriority(Notification.PRIORITY_HIGH)
+            .setColor(0xFFFF9F0A.toInt())
+            .addAction(
+                Notification.Action.Builder(null, "确认打迟到卡", confirmPi).build(),
+            )
+            .addAction(
+                Notification.Action.Builder(null, "今天不打", declinePi).build(),
+            )
+
+        runCatching { nm.notify(ID_LATE_CONFIRM, builder.build()) }
+            .onSuccess { android.util.Log.i(TAG, "已发送早上首次迟到确认通知 late=" + lateText) }
+            .onFailure { android.util.Log.e(TAG, "发送迟到确认通知失败", it) }
+    }
+
+    /** 取消早上迟到确认通知 */
+    fun cancelLateConfirm(context: Context) {
+        runCatching {
+            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.cancel(ID_LATE_CONFIRM)
+        }
+    }
+
     /**
      * 蓝牙触发"因安全阀主动放弃"时的通知。
      *

@@ -204,4 +204,43 @@ class SchedulerSelfHealTest {
             ),
         )
     }
+
+    @Test
+    fun prewarmFailsAfterFireTriggeredStillReusesRetryAndDoesNotReRegisterImmediateFire() {
+        // 真机复现场景（2026-11-17 18:30）：
+        // 18:28:45 PREWARM 正在等待，18:30:00 FIRE 触发写入 firedTargetAt 后因 running=true 退出；
+        // 18:30:11 PREWARM 执行失败，此时 18:32:00 的 RETRY 必须保留，且不能再立即补发 FIRE。
+        val dayStart = PunchSchedule.startOfDay(System.currentTimeMillis())
+        val targetAt = dayStart + (18 * 60 + 30) * 60_000L
+        val now = targetAt + 11_000L
+
+        assertTrue(
+            "FIRE 已触发过且处于补执行窗口内，reusePreviousAlarms 必须返回 true 以保留 18:32:00 RETRY",
+            reuse(
+                previousTargetAt = targetAt,
+                slotTargetAt = targetAt,
+                nowMillis = now,
+                firedTargetAt = targetAt,
+                firedKind = kind,
+            ),
+        )
+        assertFalse(
+            "FIRE 已触发过时，even 若发生重排也不能再立即注册 FIRE（交由 RETRY 兜底）",
+            AlarmScheduler.shouldRegisterImmediateFire(
+                slotTargetAt = targetAt,
+                nowMillis = now,
+                retryWindowSeconds = PunchSchedule.RETRY_WINDOW_SECONDS,
+                alreadyFired = true,
+            ),
+        )
+        assertTrue(
+            "若本班在补执行窗口内从未触发过 FIRE，才允许立即补发一次 FIRE",
+            AlarmScheduler.shouldRegisterImmediateFire(
+                slotTargetAt = targetAt,
+                nowMillis = now,
+                retryWindowSeconds = PunchSchedule.RETRY_WINDOW_SECONDS,
+                alreadyFired = false,
+            ),
+        )
+    }
 }

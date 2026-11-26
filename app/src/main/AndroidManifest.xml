@@ -152,6 +152,17 @@
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 
     <!--
+      后台定位权限：严格用于息屏/后台时的 BLE 考勤机广播投递（AOSP ScanController
+      会在未声明 neverForLocation 且位于后台时校验后台定位权限，缺失则静默丢弃扫描结果）
+      以及读取当前已连接公司 Wi-Fi 的 SSID。本应用绝不读取或上传任何 GPS 位置。
+    -->
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+
+    <!-- 公司 Wi-Fi 在场检测（连接公司 Wi-Fi 自动触发早到打卡） -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!--
       蓝牙适配器可用性。
       uses-feature required="false"：这台设备一定有蓝牙，但声明成非必需
       可以避免在极少数无蓝牙的构建变体上装不上。
@@ -218,6 +229,11 @@
         -->
         <receiver
             android:name=".ble.BleScanReceiver"
+            android:exported="false" />
+
+        <!-- 早上首次触发迟到确认通知动作接收器 -->
+        <receiver
+            android:name=".exec.LateConfirmReceiver"
             android:exported="false" />
 
         <!--

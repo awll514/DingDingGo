@@ -36,6 +36,10 @@ class PunchAccessibilityService : AccessibilityService() {
         fun get(): PunchAccessibilityService? = instance
     }
 
+    @Volatile
+    var lastClickDiagnostic: String = ""
+        private set
+
     /** 最近一次从钉钉界面读到的完整文本快照，用于结果判定 */
     private val _lastScreenText = MutableStateFlow("")
     val lastScreenText: StateFlow<String> = _lastScreenText.asStateFlow()
@@ -225,7 +229,7 @@ class PunchAccessibilityService : AccessibilityService() {
                 for (node in found) {
                     if (!hasRenderableBounds(node)) continue
                     val label = nodeOwnLabel(node)
-                    if (label == candidate || label.replace("\n", "") == candidate) {
+                    if (AccessibilityTextMatcher.matchesExactLabel(label, candidate)) {
                         clickableAncestorOrSelf(node)?.let { return it }
                     }
                 }
@@ -233,7 +237,7 @@ class PunchAccessibilityService : AccessibilityService() {
             for (node in allNodes) {
                 if (!hasRenderableBounds(node)) continue
                 val label = nodeOwnLabel(node)
-                if (label == candidate || label.replace("\n", "") == candidate) {
+                if (AccessibilityTextMatcher.matchesExactLabel(label, candidate)) {
                     clickableAncestorOrSelf(node)?.let { return it }
                 }
             }
@@ -249,7 +253,7 @@ class PunchAccessibilityService : AccessibilityService() {
                 for (node in found) {
                     if (!hasRenderableBounds(node)) continue
                     val text = nodeOwnLabel(node)
-                    if (!text.contains(candidate)) continue
+                    if (!AccessibilityTextMatcher.matchesContainsLabel(text, candidate)) continue
                     if (!isPlausibleTarget(text, candidate)) continue
                     clickableAncestorOrSelf(node)?.let { return it }
                 }
@@ -257,13 +261,13 @@ class PunchAccessibilityService : AccessibilityService() {
             for (node in allNodes) {
                 if (!hasRenderableBounds(node)) continue
                 val text = nodeOwnLabel(node)
-                if (!text.contains(candidate)) continue
+                if (!AccessibilityTextMatcher.matchesContainsLabel(text, candidate)) continue
                 if (!isPlausibleTarget(text, candidate)) continue
                 clickableAncestorOrSelf(node)?.let { return it }
             }
         }
 
-        // 第三轮：后序遍历可点击容器的子树聚合文本（应对 H5 把 "上班"+"打卡" 拆进多个子 span 的情况）
+        // 第三轮：后序遍历容器的子树聚合文本（应对 H5 把 "下班"+"打卡" 拆进多个子 span 或父节点 clickable=false 的情况）
         val postOrder = ArrayList<AccessibilityNodeInfo>()
         for (root in roots) {
             collectTreePostOrder(root, postOrder, depth = 0)
@@ -271,14 +275,16 @@ class PunchAccessibilityService : AccessibilityService() {
         for (candidate in candidates) {
             if (candidate.length < 4) continue
             for (node in postOrder) {
-                if (!node.isClickable || !hasRenderableBounds(node) || isOversizedContainer(node)) continue
+                val eligibleContainer = node.isClickable || node.childCount in 1..6
+                if (!eligibleContainer || !hasRenderableBounds(node) || isOversizedContainer(node)) continue
                 val combined = collectSubtreeLabel(node, maxLen = 64)
-                if (combined.contains(candidate) && isPlausibleTarget(combined, candidate)) {
-                    return node
+                if (AccessibilityTextMatcher.matchesContainsLabel(combined, candidate) && isPlausibleTarget(combined, candidate)) {
+                    clickableAncestorOrSelf(node)?.let { return it }
                 }
             }
         }
 
+        lastClickDiagnostic = "notFound(roots=" + roots.size + ",nodes=" + allNodes.size + ")"
         return null
     }
 
@@ -387,7 +393,7 @@ class PunchAccessibilityService : AccessibilityService() {
         out: MutableList<AccessibilityNodeInfo>,
         depth: Int,
     ) {
-        if (node == null || depth > 40 || out.size >= 1200) return
+        if (node == null || depth > 64 || out.size >= 3000) return
         out.add(node)
         for (i in 0 until node.childCount) {
             collectTreePreOrder(node.getChild(i), out, depth + 1)
@@ -399,7 +405,7 @@ class PunchAccessibilityService : AccessibilityService() {
         out: MutableList<AccessibilityNodeInfo>,
         depth: Int,
     ) {
-        if (node == null || depth > 40 || out.size >= 1200) return
+        if (node == null || depth > 64 || out.size >= 3000) return
         for (i in 0 until node.childCount) {
             collectTreePostOrder(node.getChild(i), out, depth + 1)
         }
@@ -453,7 +459,7 @@ class PunchAccessibilityService : AccessibilityService() {
         return node?.takeIf { hasRenderableBounds(it) }
     }
 
-    /** 点击节点；preferGesture=true 时优先按屏幕中心坐标派发手势点击（更适合 H5/UCWebView） */
+    /** 点击节点；preferGesture=true 时优先按屏幕中心坐标派发手势点击，失败自动回退 ACTION_CLICK */
     fun clickNode(node: AccessibilityNodeInfo, preferGesture: Boolean = false): Boolean {
         val rect = android.graphics.Rect()
         node.getBoundsInScreen(rect)
@@ -463,19 +469,37 @@ class PunchAccessibilityService : AccessibilityService() {
             val ok = runCatching {
                 node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
             }.getOrDefault(false)
-            if (ok) return true
+            if (ok) {
+                lastClickDiagnostic = "actionClick=true"
+                return true
+            }
         }
 
         if (hasBounds) {
             val cx = rect.centerX()
             val cy = rect.centerY()
-            return GestureExecutor.tap(cx, cy)
+            val dm = resources.displayMetrics
+            val inScreen = cx in 1 until dm.widthPixels && cy in 1 until dm.heightPixels
+            if (inScreen) {
+                val tapped = GestureExecutor.tap(cx, cy)
+                if (tapped) {
+                    lastClickDiagnostic = "gestureTap(" + cx + "," + cy + ")=true"
+                    return true
+                }
+                lastClickDiagnostic = "gestureTap(" + cx + "," + cy + ")=false"
+            } else {
+                lastClickDiagnostic = "outOfScreen(" + cx + "," + cy + ";bounds=" + rect.toShortString() + ")"
+            }
+        } else {
+            lastClickDiagnostic = "emptyBounds"
         }
 
-        if (preferGesture && node.isClickable) {
-            return runCatching {
+        if (node.isClickable) {
+            val fallbackOk = runCatching {
                 node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
             }.getOrDefault(false)
+            lastClickDiagnostic += ",fallbackActionClick=" + fallbackOk
+            return fallbackOk
         }
         return false
     }
@@ -519,7 +543,7 @@ class PunchAccessibilityService : AccessibilityService() {
      * 一个节点如果有子节点，就继续往下走；只有没有子节点的节点才贡献文本。
      */
     private fun collectLines(node: AccessibilityNodeInfo?, out: MutableList<String>, depth: Int) {
-        if (node == null || depth > 40) return
+        if (node == null || depth > 64) return
 
         if (node.childCount == 0) {
             val t = runCatching { node.text?.toString() }.getOrNull().orEmpty().trim()
@@ -540,7 +564,7 @@ class PunchAccessibilityService : AccessibilityService() {
     }
 
     private fun collectText(node: AccessibilityNodeInfo?, sb: StringBuilder, depth: Int) {
-        if (node == null || depth > 40) return
+        if (node == null || depth > 64) return
         node.text?.toString()?.let { if (it.isNotBlank()) sb.append(it).append(' ') }
         node.contentDescription?.toString()?.let { if (it.isNotBlank()) sb.append(it).append(' ') }
         for (i in 0 until node.childCount) {
@@ -560,4 +584,24 @@ class PunchAccessibilityService : AccessibilityService() {
     /** 返回键 */
     fun pressBack(): Boolean =
         runCatching { performGlobalAction(GLOBAL_ACTION_BACK) }.getOrDefault(false)
+}
+
+/** 纯 Kotlin 文本匹配辅助（供无障碍服务与 JVM 单元测试共用，不依赖 Android 类） */
+internal object AccessibilityTextMatcher {
+    private val WHITESPACE_REGEX = Regex("\\s+")
+
+    fun compactLabel(raw: String): String =
+        raw.replace(WHITESPACE_REGEX, "").trim()
+
+    fun matchesExactLabel(label: String, candidate: String): Boolean {
+        if (label == candidate) return true
+        val compactCandidate = compactLabel(candidate)
+        return compactCandidate.isNotEmpty() && compactLabel(label) == compactCandidate
+    }
+
+    fun matchesContainsLabel(label: String, candidate: String): Boolean {
+        if (label.contains(candidate)) return true
+        val compactCandidate = compactLabel(candidate)
+        return compactCandidate.isNotEmpty() && compactLabel(label).contains(compactCandidate)
+    }
 }

@@ -60,6 +60,8 @@ class BootReceiver : BroadcastReceiver() {
                 AppConfig.init(context)
                 AppConfig.reload()
                 com.dingdinggo.app.core.BtTriggerStore.init(context)
+                com.dingdinggo.app.core.WifiTriggerStore.init(context)
+                com.dingdinggo.app.core.LateConfirmStore.init(context)
 
                 runCatching {
                     AlarmScheduler.scheduleNext(context)
@@ -68,22 +70,12 @@ class BootReceiver : BroadcastReceiver() {
                     Log.e(TAG, "重排失败: " + it.javaClass.simpleName)
                 }
 
-                // 重启后也要恢复保活链路：
-                // - 前台服务（Android 15+ 对 BOOT 起的 FGS 有类型限制，所以只在后台起）
-                // - 心跳闹钟 + JobScheduler
-                // - 无障碍自愈（最慢，放最后，不挡住前面几项）
-                // 【蓝牙触发】重启后必须重注册 BLE 扫描。
-                //
-                // 这一条和闹钟重排同等重要，而且更容易被漏掉：
-                // PendingIntent 扫描注册只存在蓝牙栈进程的内存里，
-                // 重启后完全丢失，且**没有任何回调会告诉我们它没了**。
-                // 不在这里补一次的话，用户会以为"蓝牙触发还开着"，
-                // 实际上它从重启那一刻起就已经死了。
+                // 【蓝牙触发】重启后按当前时间窗状态恢复 BLE 扫描续期链
                 runCatching {
                     com.dingdinggo.app.core.BtTriggerStore.init(context)
                     if (com.dingdinggo.app.core.BtTriggerStore.enabled.value) {
-                        val ok = com.dingdinggo.app.ble.BtScanner.ensureRegistered(context)
-                        Log.i(TAG, "BLE 扫描" + if (ok) "已重注册" else "重注册失败（可能缺权限）")
+                        com.dingdinggo.app.ble.BtScanner.renewAndReschedule(context)
+                        Log.i(TAG, "BLE 扫描续期链已按窗口恢复")
                     }
                 }.onFailure { Log.w(TAG, "BLE 扫描重注册异常: " + it.javaClass.simpleName) }
 

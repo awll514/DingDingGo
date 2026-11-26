@@ -95,6 +95,11 @@ fun SettingsScreen(
     onBtLearn: ((Boolean, String) -> Unit) -> Unit = {},
     onBtClearDevice: () -> Unit = {},
     onBtResetToday: () -> Unit = {},
+    // ---- 公司 Wi-Fi 触发 ----
+    onWifiToggle: (Boolean) -> Unit = {},
+    onRequestWifiPermission: () -> Unit = {},
+    onWifiLearn: ((Boolean, String) -> Unit) -> Unit = {},
+    onWifiClear: () -> Unit = {},
     /**
      * 外部请求把「锁屏密码」编辑器展开（健康度卡片的「修复」按钮用）。
      *
@@ -105,12 +110,15 @@ fun SettingsScreen(
     focusPasswordSignal: Int = 0,
     /** 外部请求把「打卡时间」滚动到视野内（上下班时间顺序异常时「修复」按钮用） */
     focusScheduleSignal: Int = 0,
+    /** 外部请求把「公司 Wi-Fi 自动打卡」滚动到视野内 */
+    focusWifiSignal: Int = 0,
     modifier: Modifier = Modifier,
 ) {
     var timeEditor by remember { mutableStateOf<String?>(null) }
     var showPasswordEditor by remember { mutableStateOf(false) }
     val securityBringIntoView = remember { BringIntoViewRequester() }
     val scheduleBringIntoView = remember { BringIntoViewRequester() }
+    val wifiBringIntoView = remember { BringIntoViewRequester() }
     val storageDegraded by AppConfig.secureStorageDegraded.collectAsState()
 
     // 收到外部信号就展开密码编辑区并滚动至视野内
@@ -126,6 +134,12 @@ fun SettingsScreen(
         if (focusScheduleSignal > 0) {
             delay(100)
             runCatching { scheduleBringIntoView.bringIntoView() }
+        }
+    }
+    androidx.compose.runtime.LaunchedEffect(focusWifiSignal) {
+        if (focusWifiSignal > 0) {
+            delay(100)
+            runCatching { wifiBringIntoView.bringIntoView() }
         }
     }
     var showLogs by remember { mutableStateOf(false) }
@@ -292,6 +306,25 @@ fun SettingsScreen(
             onClearDevice = onBtClearDevice,
             onResetToday = onBtResetToday,
             onRequestPermission = onRequestBtPermission,
+        )
+
+        Spacer(Modifier.height(18.dp))
+
+        // ---------- 公司 Wi-Fi 自动打卡 ----------
+        val wifiHealthFailed = state.health?.items?.any { it.key == "wifi_trigger" && !it.ok } == true
+        val missingWifiLoc = androidx.core.content.ContextCompat.checkSelfPermission(
+            context,
+            android.Manifest.permission.ACCESS_FINE_LOCATION,
+        ) != android.content.pm.PackageManager.PERMISSION_GRANTED ||
+            com.dingdinggo.app.ble.BtScanner.needsBackgroundLocation(context)
+        WifiSettingsGroup(
+            wifi = state.wifi,
+            needsPermission = wifiHealthFailed && missingWifiLoc,
+            onToggle = onWifiToggle,
+            onLearn = onWifiLearn,
+            onClear = onWifiClear,
+            onRequestPermission = onRequestWifiPermission,
+            modifier = Modifier.bringIntoViewRequester(wifiBringIntoView),
         )
 
         Spacer(Modifier.height(18.dp))
@@ -630,6 +663,22 @@ fun SettingsScreen(
                 onClick = {
                     if (canOverlay) {
                         com.dingdinggo.app.exec.ControlHudOverlay.showForTest(context)
+                    } else {
+                        com.dingdinggo.app.core.HealthCheck.openOverlaySettings(context)
+                    }
+                },
+            )
+            SettingsDivider()
+            SettingsRow(
+                title = "预览迟到确认弹窗",
+                subtitle = if (canOverlay) {
+                    "弹出 60 秒自动关闭的安全预览确认窗（不会真打卡）"
+                } else {
+                    "需要「显示在其他应用上层」权限，点此前往授权"
+                },
+                onClick = {
+                    if (canOverlay) {
+                        com.dingdinggo.app.exec.LateConfirmOverlay.showPreview(context)
                     } else {
                         com.dingdinggo.app.core.HealthCheck.openOverlaySettings(context)
                     }
@@ -985,8 +1034,8 @@ private fun BtSettingsGroup(
                 )
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    text = "只放宽「早到」。迟到 60 秒以后、以及下班时间之前，" +
-                        "一律不会自动打卡 —— 避免产生迟到或早退记录。",
+                    text = "只放宽「早到」。超过上班时间 55 秒后的首次触发会弹出确认框与高优先级通知" +
+                        "（默认不打迟到卡）；下班时间之前一律不自动打卡 —— 避免产生误卡记录。",
                     color = GlassTheme.colors.textTertiary,
                     fontSize = 10.sp,
                     lineHeight = 14.sp,

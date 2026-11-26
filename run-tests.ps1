@@ -41,7 +41,8 @@ $tests = @(
     "PunchWindowTest", "TooEarlyGateTest", "SafetyGateTest", "SchedulerGuardTest",
     "TargetDoneTest", "PunchResultJudgeTest", "UiHierarchyTest", "BtPunchRuleTest",
     "SchedulerSelfHealTest", "RetryTargetTest", "ScanWindowTest", "ScanRenewalWindowTransitionTest", "GuardGapTest",
-    "ActualPunchTimeTest", "DingMascotMoodTest", "ControlHudCopyTest"
+    "ActualPunchTimeTest", "DingMascotMoodTest", "ControlHudCopyTest", "AccessibilityLabelMatchTest",
+    "LateConfirmRuleTest", "WifiTriggerRuleTest"
 )
 
 Write-Host ("[2/2] Running {0} test classes..." -f $tests.Count) -ForegroundColor Cyan
